@@ -953,7 +953,7 @@ app.get("/api/plex/dash/manifest.mpd", async (req, res) => {
   }
 });
 
-app.use("/api/plex/dash/*", (req, res) => {
+app.use("/api/plex/dash/*path", (req, res) => {
   // Rewrite path back to Plex's original URL structure
   const plexPath = req.originalUrl.replace("/api/plex/dash/", "/video/:/transcode/universal/");
   req.url = `${plexPath}${plexPath.includes("?") ? "&" : "?"}X-Plex-Token=${PLEX_TOKEN}`;

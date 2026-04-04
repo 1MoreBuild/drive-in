@@ -18,7 +18,7 @@
     "dev": "SERVE_SOURCE=1 node --watch index.js"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "express": "^5.2.1",
     "http-proxy": "^1.18.1",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",
