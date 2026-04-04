@@ -1,0 +1,38 @@
+name: Site / Extraction Issue
+description: A video URL that fails to play or extract
+labels: ["bug", "extraction"]
+body:
+  - type: textarea
+    id: url
+    attributes:
+      label: Video URL or site
+      description: The URL that fails (or describe the site if the URL is private)
+    validations:
+      required: true
+  - type: dropdown
+    id: stream_type
+    attributes:
+      label: Stream type (if known)
+      options:
+        - HLS
+        - DASH
+        - Direct (mp4)
+        - Plex
+        - Unknown
+  - type: textarea
+    id: ytdlp_output
+    attributes:
+      label: yt-dlp output
+      description: "Run `yt-dlp -j <url>` and paste the error or output"
+      render: shell
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: yt-dlp version, region, Node.js version
+      placeholder: |
+        yt-dlp: 2025.03.31
+        Region: US
+        Node: v22.0.0
+    validations:
+      required: true

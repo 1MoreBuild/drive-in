@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.hls-cache/
+.media-cache/
+.logs/
+.subs-cache/
+.env
+.play-history.json
+.DS_Store
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variants
+.env.local
+.env.*.local
+
+# Build artifacts
+.eslintcache
+coverage/

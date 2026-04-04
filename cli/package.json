@@ -1,0 +1,22 @@
+{
+  "name": "@drive-in/cli",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1MoreBuild/drive-in.git",
+    "directory": "cli"
+  },
+  "keywords": ["tesla", "media-player", "cli", "yt-dlp", "plex"],
+  "bin": {
+    "drivein": "./bin/drivein.js"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  }
+}

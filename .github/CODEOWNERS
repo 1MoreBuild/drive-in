@@ -1,0 +1,7 @@
+# Default owner for everything
+* @1MoreBuild
+
+# Workspace-specific ownership
+/server/ @1MoreBuild
+/player/ @1MoreBuild
+/cli/ @1MoreBuild

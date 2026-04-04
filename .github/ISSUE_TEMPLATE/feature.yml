@@ -1,0 +1,28 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What feature would you like and why?
+    validations:
+      required: true
+  - type: dropdown
+    id: workspace
+    attributes:
+      label: Affected workspace
+      options:
+        - server
+        - player
+        - cli
+        - multiple
+        - unsure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you tried any workarounds?

@@ -1,0 +1,18 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Explicitly declare text files
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
+*.wasm binary

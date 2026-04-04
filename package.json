@@ -1,0 +1,35 @@
+{
+  "name": "drive-in",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "In-car media player for Tesla — controlled via CLI, Discord, or phone",
+  "author": "1MoreBuild",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/1MoreBuild/drive-in.git"
+  },
+  "homepage": "https://github.com/1MoreBuild/drive-in",
+  "bugs": "https://github.com/1MoreBuild/drive-in/issues",
+  "keywords": ["tesla", "media-player", "wasm", "webgl", "hls", "dash", "plex", "cli", "yt-dlp"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n server,vite,tunnel -c blue,green,magenta \"npm:dev:server\" \"npm:dev:vite\" \"npm:dev:tunnel\"",
+    "dev:server": "npm run dev -w server",
+    "dev:vite": "npm run dev -w player",
+    "dev:tunnel": "wait-on tcp:5173 && cloudflared tunnel --url http://localhost:5173",
+    "build": "npm run build -w player",
+    "start": "npm run build && (lsof -i :9090 -t | xargs kill 2>/dev/null; node server/index.js & cloudflared tunnel run & wait)"
+  },
+  "workspaces": [
+    "server",
+    "player",
+    "cli"
+  ],
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "wait-on": "^9.0.4"
+  }
+}

@@ -1,0 +1,994 @@
+/* Global utility */
+.hidden { display: none !important; }
+
+:root {
+  /* Tesla-tinted dark palette — cool undertone */
+  --surface-base: oklch(8% 0.008 250);
+  --surface-raised: oklch(14% 0.006 250);
+  --text-primary: oklch(93% 0.008 250);
+  --text-secondary: oklch(52% 0.008 250);
+  --text-tertiary: oklch(35% 0.006 250);
+  --accent: oklch(93% 0.008 250);
+  --track: oklch(22% 0.005 250);
+
+  /* Motion — exponential deceleration, never bounce */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+
+  /* Progress bar */
+  --bar-h: 3px;
+  --bar-h-active: 6px;
+  --scrubber: 16px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--surface-base);
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+  color: var(--text-primary);
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- App shell ------------------------------------------------------ */
+
+#app {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  cursor: none;
+}
+
+#app.controls-visible {
+  cursor: default;
+}
+
+/* --- Canvas --------------------------------------------------------- */
+
+#player-container {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  inset: 0;
+}
+
+#player-container canvas,
+#player-container video,
+#player-container audio {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain;
+}
+
+/* --- Subtitle overlay ------------------------------------------------ */
+
+#subtitle-overlay {
+  position: absolute;
+  bottom: 80px;
+  left: 10%;
+  right: 10%;
+  z-index: 12;
+  text-align: center;
+  pointer-events: none;
+}
+
+#subtitle-overlay:empty {
+  display: none;
+}
+
+#subtitle-overlay span {
+  display: inline;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 1.6rem;
+  font-weight: 500;
+  line-height: 2;
+  padding: 4px 10px;
+  border-radius: 4px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* --- Center play/pause button ---------------------------------------- */
+
+#btn-center-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 22;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 250ms var(--ease-out-quart), background-color 150ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app.controls-visible #btn-center-play,
+#btn-center-play.buffering {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#btn-center-play:active {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Show play icon when paused, pause icon when playing, spinner when buffering */
+#btn-center-play #center-play { display: none; }
+#btn-center-play #center-pause { display: block; }
+#btn-center-play.paused #center-play { display: block; }
+#btn-center-play.paused #center-pause { display: none; }
+#btn-center-play.buffering #center-play { display: none; }
+#btn-center-play.buffering #center-pause { display: none; }
+#btn-center-play.buffering #center-spinner { display: block; }
+
+/* --- Seek indicators (left / right) ---------------------------------- */
+
+#seek-indicator-left,
+#seek-indicator-right {
+  position: absolute;
+  top: 50%;
+  z-index: 15;
+  opacity: 0;
+  pointer-events: none;
+  font-size: 1.4rem;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 12px 20px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+#seek-indicator-left {
+  left: 20%;
+  transform: translate(-50%, -50%);
+}
+
+#seek-indicator-right {
+  right: 20%;
+  transform: translate(50%, -50%);
+}
+
+#seek-indicator-left.flash {
+  animation: seek-flash-left 2s var(--ease-out-expo) forwards;
+}
+
+#seek-indicator-right.flash {
+  animation: seek-flash-right 2s var(--ease-out-expo) forwards;
+}
+
+@keyframes seek-flash-left {
+  0%   { opacity: 0;    transform: translate(-50%, -50%) scale(1.3); }
+  10%  { opacity: 0.95; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0;    transform: translate(-50%, -50%) scale(0.9); }
+}
+
+@keyframes seek-flash-right {
+  0%   { opacity: 0;    transform: translate(50%, -50%) scale(1.3); }
+  10%  { opacity: 0.95; transform: translate(50%, -50%) scale(1); }
+  100% { opacity: 0;    transform: translate(50%, -50%) scale(0.9); }
+}
+
+/* --- Controls (auto-hide layer) -------------------------------------- */
+
+#controls {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 250ms var(--ease-out-quart);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+#app.controls-visible #controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* --- Top bar --------------------------------------------------------- */
+
+#controls-top {
+  padding: 28px 40px 56px;
+  background: linear-gradient(
+    to bottom,
+    oklch(0% 0 0 / 0.55) 0%,
+    oklch(0% 0 0 / 0.2) 50%,
+    transparent 100%
+  );
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#btn-back {
+  appearance: none;
+  background: rgba(0, 0, 0, 0.5);
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  min-height: 40px;
+  transition: background-color 150ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#btn-back:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+
+#btn-back:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+#media-title {
+  font-size: 0.9375rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+
+/* --- Bottom bar ------------------------------------------------------ */
+
+#controls-bottom {
+  padding: 40px 24px 16px;
+  background: linear-gradient(
+    to top,
+    oklch(0% 0 0 / 0.6) 0%,
+    oklch(0% 0 0 / 0.2) 60%,
+    transparent 100%
+  );
+}
+
+/* --- Progress bar ---------------------------------------------------- */
+
+#progress-wrap {
+  position: relative;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+
+#progress-bar {
+  width: 100%;
+  height: var(--bar-h);
+  background: var(--track);
+  position: relative;
+  overflow: hidden;
+  transition: height 150ms var(--ease-out-quart);
+}
+
+#progress-wrap:hover #progress-bar,
+#progress-wrap.dragging #progress-bar {
+  height: var(--bar-h-active);
+}
+
+#progress-played {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: var(--accent);
+}
+
+/* --- Scrubber -------------------------------------------------------- */
+
+#progress-scrubber {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  width: var(--scrubber);
+  height: var(--scrubber);
+  background: var(--text-primary);
+  border-radius: 50%;
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 120ms var(--ease-out-quart);
+  pointer-events: none;
+}
+
+#progress-wrap:hover #progress-scrubber,
+#progress-wrap.dragging #progress-scrubber {
+  transform: translate(-50%, -50%) scale(1);
+}
+
+/* --- Controls row ---------------------------------------------------- */
+
+#controls-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+#controls-row button {
+  appearance: none;
+  background: rgba(0, 0, 0, 0.35);
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 150ms;
+  min-width: 40px;
+  min-height: 40px;
+}
+
+#controls-row button:hover {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+#controls-row button:active {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+#controls-row button svg {
+  display: block;
+}
+
+/* (Play/pause button moved to center — #btn-center-play) */
+
+/* Volume icon toggle */
+#btn-volume #icon-vol-off,
+#btn-volume.muted #icon-vol-on {
+  display: none;
+}
+#btn-volume.muted #icon-vol-off {
+  display: block;
+}
+
+/* --- Time display ---------------------------------------------------- */
+
+#time-display {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0 14px;
+  border-radius: 20px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+#time-current {
+  color: var(--text-primary);
+}
+
+#time-sep {
+  color: var(--text-primary);
+  margin: 0 2px;
+}
+
+#time-duration {
+  color: var(--text-primary);
+}
+
+#controls-spacer {
+  flex: 1;
+}
+
+/* --- Subtitle panel -------------------------------------------------- */
+
+
+#btn-subs.active {
+  color: var(--accent);
+}
+
+#subs-panel {
+  position: absolute;
+  bottom: 88px;
+  right: 40px;
+  background: oklch(0% 0 0 / 0.85);
+  border-radius: 12px;
+  min-width: 200px;
+  max-height: 380px;
+  overflow: hidden auto;
+  z-index: 25;
+  padding: 8px 0;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+#subs-panel::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+
+#subs-list button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  width: 100%;
+  appearance: none;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: oklch(70% 0.005 250);
+  font-size: 0.875rem;
+  font-family: inherit;
+  text-align: left;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background-color 100ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#subs-list button::before {
+  content: "";
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+#subs-list button:hover {
+  background: oklch(100% 0 0 / 0.1);
+}
+
+#subs-list button:active {
+  background: oklch(100% 0 0 / 0.15);
+}
+
+#subs-list button.active {
+  color: var(--text-primary);
+}
+
+#subs-list button.active::before {
+  content: "✓";
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#subs-list button span {
+  display: block;
+}
+
+#subs-list button small {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+/* --- Audio panel (same structure as subs) ----------------------------- */
+
+#audio-panel {
+  position: absolute;
+  bottom: 88px;
+  right: 80px;
+  background: oklch(0% 0 0 / 0.85);
+  border-radius: 12px;
+  min-width: 200px;
+  max-height: 380px;
+  overflow: hidden auto;
+  z-index: 25;
+  padding: 8px 0;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+#audio-panel::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+#audio-list button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  width: 100%;
+  appearance: none;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: oklch(70% 0.005 250);
+  font-size: 0.875rem;
+  font-family: inherit;
+  text-align: left;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background-color 100ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#audio-list button::before { content: ""; width: 18px; height: 18px; flex-shrink: 0; }
+#audio-list button:hover { background: oklch(100% 0 0 / 0.1); }
+#audio-list button:active { background: oklch(100% 0 0 / 0.15); }
+#audio-list button.active { color: var(--text-primary); }
+#audio-list button.active::before {
+  content: "\2713"; font-size: 0.875rem; color: var(--text-primary);
+  display: flex; align-items: center; justify-content: center;
+}
+#audio-list button span { display: block; }
+#audio-list button small { display: block; font-size: 0.75rem; color: var(--text-tertiary); margin-top: 2px; }
+
+/* --- Buffering spinner (inside center button) ------------------------ */
+
+#center-spinner {
+  display: none;
+  width: 36px;
+  height: 36px;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: rgba(255, 255, 255, 0.8);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* --- Initial overlay ------------------------------------------------- */
+
+#overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-base);
+  transition: opacity 350ms var(--ease-out-quart);
+  z-index: 30;
+}
+
+#overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#status-screen {
+  text-align: center;
+}
+
+#status-screen h1 {
+  font-size: 2rem;
+  font-weight: 300;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 1rem;
+  color: var(--text-primary);
+}
+
+#status-text {
+  font-size: 0.9375rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
+
+/* --- Browse screen --------------------------------------------------- */
+
+#browse-screen {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: oklch(30% 0 0) transparent;
+}
+
+#browse-screen::-webkit-scrollbar {
+  width: 4px;
+}
+
+#browse-screen::-webkit-scrollbar-thumb {
+  background: oklch(30% 0 0);
+  border-radius: 4px;
+}
+
+#browse-screen.hidden {
+  display: none;
+}
+
+.browse-section {
+  margin-bottom: 16px;
+}
+
+.browse-section:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.browse-section:first-child {
+  padding-top: 20px;
+}
+
+.browse-section.hidden {
+  display: none;
+}
+
+.browse-header {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+  padding: 0 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#episodes-section > .browse-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--surface-base);
+  padding: 12px 32px 6px;
+  margin-bottom: 0;
+}
+
+#episodes-section .season-header {
+  top: 42px;
+}
+
+.browse-header button {
+  appearance: none;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 6px;
+  margin: -6px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  min-width: 36px;
+  min-height: 36px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.browse-header button:active {
+  background: oklch(100% 0 0 / 0.08);
+}
+
+.browse-row-wrap {
+  position: relative;
+  padding: 0 32px;
+}
+
+.browse-row {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+  scroll-behavior: smooth;
+  padding-bottom: 8px;
+}
+
+.browse-row::-webkit-scrollbar {
+  display: none;
+}
+
+/* Scroll arrows */
+.browse-arrow {
+  position: absolute;
+  top: 0;
+  bottom: 24px;
+  width: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 200ms;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.browse-row-wrap:hover .browse-arrow {
+  opacity: 1;
+}
+
+.browse-arrow:active {
+  opacity: 1;
+}
+
+.browse-arrow.left {
+  left: 0;
+  background: linear-gradient(to right, var(--surface-base) 50%, transparent);
+  padding-left: 8px;
+}
+
+.browse-arrow.right {
+  right: 0;
+  background: linear-gradient(to left, var(--surface-base) 50%, transparent);
+  padding-right: 8px;
+}
+
+.browse-arrow svg {
+  filter: drop-shadow(0 0 4px oklch(0% 0 0 / 0.5));
+}
+
+.browse-card {
+  position: relative;
+  flex-shrink: 0;
+  width: 200px;
+  cursor: pointer;
+  transition: opacity 150ms;
+  -webkit-tap-highlight-color: transparent;
+  scroll-snap-align: start;
+}
+
+.browse-card:active {
+  opacity: 0.7;
+}
+
+.browse-card-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: oklch(14% 0.006 250);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.browse-card-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.browse-card-thumb-empty {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.browse-card-thumb-empty svg {
+  opacity: 0.15;
+}
+
+.browse-card-title {
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--text-primary);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browse-card-meta {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 3px;
+  letter-spacing: 0.01em;
+}
+
+/* --- History edit mode (delete badges) -------------------------------- */
+
+.browse-card-delete {
+  display: none;
+  position: absolute;
+  top: -7px;
+  left: -7px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: oklch(0% 0 0 / 0.6);
+  color: #fff;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+}
+
+.browse-card-delete svg {
+  width: 14px;
+  height: 14px;
+}
+
+.edit-mode .browse-card-delete {
+  display: flex;
+}
+
+.browse-card.deleted {
+  opacity: 0.3;
+}
+
+.browse-card.deleted .browse-card-delete {
+  display: none;
+}
+
+.browse-card-undo {
+  display: none;
+  position: absolute;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  z-index: 6;
+  cursor: pointer;
+}
+
+.browse-card.deleted .browse-card-undo {
+  display: flex;
+  pointer-events: auto;
+}
+
+.browse-card-undo svg {
+  width: 22px;
+  height: 22px;
+  fill: #fff;
+  opacity: 0.7;
+  filter: drop-shadow(0 1px 3px oklch(0% 0 0 / 0.5));
+}
+
+/* Poster-style cards for movies/shows library */
+.browse-card.poster {
+  width: 130px;
+}
+
+.browse-card.poster .browse-card-thumb {
+  aspect-ratio: 2 / 3;
+}
+
+/* --- Watched badge --------------------------------------------------- */
+
+.watched-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  background: oklch(0% 0 0 / 0.6);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.watched-badge svg {
+  width: 14px;
+  height: 14px;
+  fill: #fff;
+}
+
+/* Partial progress bar on card thumbnail */
+.browse-card-progress-track {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: oklch(0% 0 0 / 0.5);
+}
+
+.browse-card-progress {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  background: var(--text-primary);
+}
+
+/* --- Episodes grid --------------------------------------------------- */
+
+.episodes-grid {
+  padding: 0 32px;
+}
+
+.season-header {
+  position: sticky;
+  z-index: 2;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: var(--surface-base);
+  padding: 10px 0 8px;
+}
+
+.season-header:first-child {
+  padding-top: 6px;
+}
+
+.season-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 20px 16px;
+}
+
+.episode-card {
+  cursor: pointer;
+  transition: opacity 150ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.episode-card:active {
+  opacity: 0.7;
+}
+
+.episode-card-thumb {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: oklch(14% 0.006 250);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.episode-card-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+
+
+.episode-card-title {
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--text-primary);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.episode-card-meta {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 3px;
+}
+
+/* --- Reduced motion -------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
