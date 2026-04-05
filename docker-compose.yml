@@ -1,0 +1,21 @@
+services:
+  drive-in:
+    build: .
+    ports:
+      - "9090:9090"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # Optional: Cloudflare Tunnel for remote access from Tesla
+  # Uncomment and set your tunnel token in .env:
+  #   TUNNEL_TOKEN=your-cloudflare-tunnel-token
+  #
+  # tunnel:
+  #   image: cloudflare/cloudflared:latest
+  #   command: tunnel run
+  #   environment:
+  #     - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+  #   depends_on:
+  #     - drive-in
+  #   restart: unless-stopped

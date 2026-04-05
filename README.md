@@ -83,6 +83,21 @@ npm run start                  # build player + start server + Cloudflare Tunnel
 npm run start -w server        # start server only (no tunnel, no build)
 ```
 
+## Docker
+
+```bash
+docker build -t drive-in .
+docker run -p 9090:9090 --env-file .env drive-in
+```
+
+Or with Docker Compose:
+
+```bash
+docker compose up
+```
+
+The image includes Node.js, yt-dlp, ffmpeg, and Deno. See [`docker-compose.yml`](docker-compose.yml) for optional Cloudflare Tunnel configuration.
+
 ## CLI Usage
 
 ```bash
