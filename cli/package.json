@@ -1,6 +1,6 @@
 {
   "name": "@drive-in/cli",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CLI for Drive-In — control your Tesla in-car media player from the terminal",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,14 @@
   },
   "homepage": "https://github.com/1MoreBuild/drive-in",
   "bugs": "https://github.com/1MoreBuild/drive-in/issues",
-  "keywords": ["tesla", "media-player", "cli", "yt-dlp", "plex", "drivein"],
+  "keywords": [
+    "tesla",
+    "media-player",
+    "cli",
+    "yt-dlp",
+    "plex",
+    "drivein"
+  ],
   "files": [
     "bin/"
   ],
