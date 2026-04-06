@@ -64,4 +64,4 @@ jobs:
         run: npm ci
 
       - name: Publish to npm (OIDC)
-        run: npm publish --access public -w cli
+        run: npm publish --access public --provenance -w cli
