@@ -48,9 +48,6 @@ jobs:
             exit 1
           fi
 
-      - name: Upgrade npm CLI for trusted publishing
-        run: npm install -g npm@latest
-
       - name: Validate tag matches package version
         run: |
           TAG="${{ github.event.release.tag_name }}"
