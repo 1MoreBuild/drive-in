@@ -27,14 +27,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 22.22.0
           registry-url: https://registry.npmjs.org
           cache: npm
 
-      - name: Upgrade npm for trusted publishing
-        run: corepack enable npm && npm install -g npm@latest
-        env:
-          COREPACK_ENABLE_STRICT: "0"
+      - name: Upgrade npm CLI for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Ensure release tag commit is on main
         run: |
