@@ -3,12 +3,14 @@ import { program } from "commander";
 
 // --- Exit codes (semantic) -------------------------------------------
 
-const EXIT = { OK: 0, FAIL: 1, USAGE: 2, EMPTY: 3, CONN: 8 };
+const EXIT = { OK: 0, FAIL: 1, USAGE: 2, EMPTY: 3, AUTH: 4, NOT_FOUND: 5, FORBIDDEN: 6, RATE_LIMIT: 7, CONN: 8 };
 
 // --- Globals ---------------------------------------------------------
 
 let serverUrl;
 let jsonMode = false;
+let quietMode = false;
+let noColor = false;
 
 program
   .name("drivein")
@@ -16,10 +18,14 @@ program
   .version("0.1.0")
   .option("-s, --server <url>", "Server URL", process.env.DRIVEIN_SERVER || "http://localhost:9090")
   .option("--json", "Output as JSON")
+  .option("-q, --quiet", "Suppress output (errors only)")
+  .option("--no-color", "Disable colored output")
   .hook("preAction", (cmd) => {
     const opts = cmd.opts();
     serverUrl = opts.server;
     jsonMode = opts.json;
+    quietMode = opts.quiet;
+    noColor = opts.color === false || !!process.env.NO_COLOR || process.env.TERM === "dumb";
   });
 
 // --- Output helpers --------------------------------------------------
@@ -27,6 +33,7 @@ program
 const isTTY = process.stdout.isTTY;
 
 function out(data) {
+  if (quietMode) return;
   if (jsonMode) {
     console.log(JSON.stringify(data, null, 2));
   } else if (Array.isArray(data)) {
@@ -50,8 +57,8 @@ function pad(str, len) {
   return String(str).padEnd(len);
 }
 
-function dim(s) { return isTTY ? `\x1b[2m${s}\x1b[0m` : s; }
-function bold(s) { return isTTY ? `\x1b[1m${s}\x1b[0m` : s; }
+function dim(s) { return isTTY && !noColor ? `\x1b[2m${s}\x1b[0m` : s; }
+function bold(s) { return isTTY && !noColor ? `\x1b[1m${s}\x1b[0m` : s; }
 function formatTime(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
   return h > 0 ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}` : `${m}:${String(s).padStart(2,"0")}`;
@@ -74,7 +81,11 @@ async function api(method, path, body) {
   }
 
   const data = await res.json();
-  if (!res.ok) die(data.error || res.statusText);
+  if (!res.ok) {
+    const msg = data.error || res.statusText;
+    const code = { 401: EXIT.AUTH, 403: EXIT.FORBIDDEN, 404: EXIT.NOT_FOUND, 429: EXIT.RATE_LIMIT }[res.status] || EXIT.FAIL;
+    die(msg, null, code);
+  }
   return data;
 }
 
@@ -119,6 +130,7 @@ program
   .action(async () => {
     const s = await api("GET", "/api/status");
     if (jsonMode) return out(s);
+    if (quietMode) return;
     console.log(`${pad("Status:", 10)} ${s.status}`);
     console.log(`${pad("Player:", 10)} ${s.playerConnected ? "connected" : "not connected"}`);
     if (s.title) console.log(`${pad("Title:", 10)} ${s.title}`);
