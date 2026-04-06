@@ -1,6 +1,6 @@
 {
   "name": "@drive-in/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CLI for Drive-In — control your Tesla in-car media player from the terminal",
   "license": "MIT",
   "type": "module",

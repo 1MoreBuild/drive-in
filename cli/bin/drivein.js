@@ -1,9 +1,28 @@
 #!/usr/bin/env node
 import { program } from "commander";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 // --- Exit codes (semantic) -------------------------------------------
 
 const EXIT = { OK: 0, FAIL: 1, USAGE: 2, EMPTY: 3, AUTH: 4, NOT_FOUND: 5, FORBIDDEN: 6, RATE_LIMIT: 7, CONN: 8 };
+
+// --- Config ----------------------------------------------------------
+
+const configDir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "drivein");
+const configPath = join(configDir, "config.json");
+
+function loadConfig() {
+  try { return JSON.parse(readFileSync(configPath, "utf8")); } catch { return {}; }
+}
+
+function saveConfig(cfg) {
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+}
+
+const config = loadConfig();
 
 // --- Globals ---------------------------------------------------------
 
@@ -12,11 +31,14 @@ let jsonMode = false;
 let quietMode = false;
 let noColor = false;
 
+// Precedence: --server flag > DRIVEIN_SERVER env > config file > default
+const defaultServer = process.env.DRIVEIN_SERVER || config.server || "http://localhost:9090";
+
 program
   .name("drivein")
   .description("Drive-In: in-car media player for Tesla")
   .version("0.1.0")
-  .option("-s, --server <url>", "Server URL", process.env.DRIVEIN_SERVER || "http://localhost:9090")
+  .option("-s, --server <url>", "Server URL", defaultServer)
   .option("--json", "Output as JSON")
   .option("-q, --quiet", "Suppress output (errors only)")
   .option("--no-color", "Disable colored output")
@@ -363,5 +385,50 @@ program.command("search <query>", { hidden: true }).description("Shortcut for: p
 
 program.command("eps <showId>", { hidden: true }).description("Shortcut for: plex episodes")
   .action((showId) => plex.commands.find((c) => c.name() === "episodes").parseAsync([showId], { from: "user" }));
+
+// --- Config command --------------------------------------------------
+
+const configCmd = program
+  .command("config")
+  .description("Manage CLI configuration (~/.config/drivein/config.json)");
+
+configCmd
+  .command("set <key> <value>")
+  .description("Set a config value (e.g. drivein config set server http://host:9090)")
+  .action((key, value) => {
+    const cfg = loadConfig();
+    cfg[key] = value;
+    saveConfig(cfg);
+    out(jsonMode ? cfg : `${key} = ${value}`);
+  });
+
+configCmd
+  .command("get [key]")
+  .description("Get a config value, or show all config")
+  .action((key) => {
+    const cfg = loadConfig();
+    if (key) {
+      if (!(key in cfg)) die(`No config value for "${key}"`, `drivein config set ${key} <value>`);
+      out(jsonMode ? { [key]: cfg[key] } : cfg[key]);
+    } else {
+      out(jsonMode ? cfg : Object.entries(cfg).map(([k, v]) => `${k} = ${v}`));
+    }
+  });
+
+configCmd
+  .command("delete <key>")
+  .alias("rm")
+  .description("Delete a config value")
+  .action((key) => {
+    const cfg = loadConfig();
+    delete cfg[key];
+    saveConfig(cfg);
+    out(jsonMode ? cfg : `Deleted: ${key}`);
+  });
+
+configCmd
+  .command("path")
+  .description("Show config file path")
+  .action(() => out(configPath));
 
 program.parse();
