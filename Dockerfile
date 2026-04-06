@@ -33,7 +33,6 @@ COPY cli/package.json cli/
 RUN npm ci --omit=dev
 
 COPY server/ server/
-COPY cli/ cli/
 COPY player/index.html player/
 COPY --from=build /app/player/dist/ player/dist/
 
