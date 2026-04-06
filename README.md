@@ -98,7 +98,27 @@ docker compose up
 
 The image includes Node.js, yt-dlp, ffmpeg, and Deno. See [`docker-compose.yml`](docker-compose.yml) for optional Cloudflare Tunnel configuration.
 
-## CLI Usage
+## CLI
+
+The CLI is published as [`@drive-in/cli`](https://www.npmjs.com/package/@drive-in/cli) on npm. Use it to control a running Drive-In server from anywhere.
+
+```bash
+# Install globally, or use npx
+npx @drive-in/cli status
+
+# Or if you cloned the repo, just use:
+npx drivein status
+```
+
+### Configure server URL (once)
+
+```bash
+npx drivein config set server http://your-server:9090
+```
+
+Precedence: `--server` flag > `DRIVEIN_SERVER` env > config file > default (`localhost:9090`)
+
+### Commands
 
 ```bash
 npx drivein play <url>          # play a video (YouTube, Bilibili, HLS, mp4)
@@ -116,9 +136,12 @@ npx drivein plex movies         # list Plex movies
 npx drivein plex shows          # list Plex TV shows
 npx drivein plex search <query> # search Plex library
 npx drivein plex play <id>      # play a Plex item by rating key
-```
 
-Set `DRIVEIN_SERVER` environment variable to point the CLI at a remote server.
+# Output modes
+npx drivein --json status       # JSON output for scripting
+npx drivein --quiet play <url>  # suppress output (errors only)
+npx drivein --no-color status   # disable colored output
+```
 
 ## Plex Setup
 

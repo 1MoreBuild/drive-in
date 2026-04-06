@@ -148,6 +148,35 @@ curl http://localhost:9090/api/status
 curl http://localhost:9090/api/plex/libraries
 ```
 
+## CLI package
+
+The CLI is published as [`@drive-in/cli`](https://www.npmjs.com/package/@drive-in/cli) on npm. It's a standalone HTTP client — no server dependencies, just sends requests to a running Drive-In server.
+
+- **Package**: `@drive-in/cli` (npm, scoped under `@drive-in` org)
+- **Binary name**: `drivein`
+- **Config**: `~/.config/drivein/config.json` (persistent server URL via `drivein config set server <url>`)
+- **Output modes**: `--json`, `--quiet`, `--no-color` (respects `NO_COLOR` env)
+- **Exit codes**: 0=success, 1=failure, 2=usage, 3=empty, 4=auth, 5=not-found, 6=forbidden, 7=rate-limit, 8=connection
+
+## Releasing
+
+See [RELEASING.md](RELEASING.md) for full details. Summary:
+
+```bash
+npm version patch -w cli        # bump version in cli/package.json
+git push && git push --tags     # push commit + tag
+gh release create v<version> --generate-notes  # triggers npm publish via OIDC
+```
+
+The `release-cli.yml` GitHub Actions workflow publishes to npm automatically using OIDC trusted publishing (no `NPM_TOKEN` secret needed).
+
+## CI/CD
+
+- **CI** (`ci.yml`): runs on push/PR — `npm ci`, build player, smoke test server + CLI. Node 20 + 22.
+- **Release** (`release-cli.yml`): triggered by GitHub Release — validates tag matches `cli/package.json` version, publishes to npm with OIDC + provenance.
+- **Claude Code** (`claude.yml`, `claude-code-review.yml`): AI-assisted PR review and issue triage.
+- **Dependabot** (`dependabot.yml`): weekly npm + GitHub Actions dependency updates.
+
 ## Security considerations
 
 - WebSocket `updateState` only accepts the `status` field from player clients (sanitized).

@@ -16,7 +16,28 @@ tags:
 
 # drive-in
 
-Control video playback on Tesla via CLI.
+Control video playback on Tesla via CLI. Published as [`@drive-in/cli`](https://www.npmjs.com/package/@drive-in/cli) on npm.
+
+## Setup
+
+```bash
+# Install globally
+npm install -g @drive-in/cli
+
+# Or use directly via npx
+npx @drive-in/cli status
+
+# Or if working in the cloned repo
+npx drivein status
+```
+
+### Configure server (once)
+
+```bash
+drivein config set server http://your-server:9090
+```
+
+Config is stored at `~/.config/drivein/config.json`. Precedence: `--server` flag > `DRIVEIN_SERVER` env > config file > `http://localhost:9090`.
 
 ## When to use
 
@@ -177,8 +198,19 @@ Fallback when the CLI doesn't cover a use case. Base URL from `$DRIVEIN_SERVER`.
 | Flag | Description |
 |------|-------------|
 | `--json` | Structured JSON output. Always use when parsing programmatically. |
-| `-s, --server <url>` | Server URL (default: `$DRIVEIN_SERVER` or `http://localhost:9090`) |
+| `-s, --server <url>` | Server URL (default: config file > `$DRIVEIN_SERVER` > `http://localhost:9090`) |
+| `-q, --quiet` | Suppress output (errors only) |
+| `--no-color` | Disable colored output (also respects `NO_COLOR` env) |
 | `-n, --limit <n>` | Max items to return for list commands (default: 20) |
+
+## Config commands
+
+```bash
+drivein config set <key> <value>   # set a config value
+drivein config get [key]           # get a value or show all config
+drivein config delete <key>        # delete a config value
+drivein config path                # show config file path
+```
 
 ## Exit codes
 
@@ -188,4 +220,8 @@ Fallback when the CLI doesn't cover a use case. Base URL from `$DRIVEIN_SERVER`.
 | 1 | Generic failure |
 | 2 | Invalid usage |
 | 3 | Empty results (query matched nothing) |
+| 4 | Auth required |
+| 5 | Not found |
+| 6 | Permission denied |
+| 7 | Rate limited |
 | 8 | Connection error (retryable — server may be down) |

@@ -23,9 +23,11 @@ Workflow file: `.github/workflows/release-cli.yml`
   - `id-token: write`
 - Steps:
   - install dependencies
-  - publish with `npm publish --access public -w cli`
+  - upgrade npm for OIDC support
+  - publish with `npm publish --access public --provenance -w cli`
 - Safety check: release tag must equal `v${cli/package.json version}`.
 - Safety check: release tag commit must be on `main` branch history.
+- Uses pinned Node 22.22.0 (newer patch versions have npm upgrade bugs).
 
 ## Release steps
 
