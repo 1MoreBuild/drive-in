@@ -1197,7 +1197,7 @@ app.get("/api/thumb", async (req, res) => {
   if (existsSync(cacheFile)) {
     res.set("Content-Type", ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg");
     res.set("Cache-Control", "public, max-age=604800");
-    return res.sendFile(cacheFile);
+    return res.sendFile(cacheFile, { dotfiles: "allow" });
   }
 
   try {

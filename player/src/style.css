@@ -713,6 +713,7 @@ html, body {
   cursor: pointer;
   z-index: 2;
   opacity: 0;
+  pointer-events: none;
   transition: opacity 200ms;
   border: none;
   background: none;
@@ -722,6 +723,7 @@ html, body {
 
 .browse-row-wrap:hover .browse-arrow {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .browse-arrow:active {
