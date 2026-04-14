@@ -137,9 +137,9 @@ function updateState(patch) {
 
 // --- yt-dlp resolver -------------------------------------------------
 
-// Prefer H.264 video + AAC audio for MPEG-TS compatibility
-// Prefer 720p30 H.264 + AAC — 1080p too heavy for Tesla WASM decoding.
-const FORMAT_SELECTOR = "bv[vcodec^=avc1][height<=720][fps<=30]+ba[acodec^=mp4a]/bv[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/bv[height<=720][fps<=30]+ba*/bv[height<=720]+ba*/b*";
+// Cap total bitrate at 4800k — allows 1080p30 (~4500k) and 720p60 (~3400k),
+// blocks 1080p60 (~5800k) which is too heavy for Tesla WASM decoding.
+const FORMAT_SELECTOR = "bv[vcodec^=avc1][tbr<=4800]+ba[acodec^=mp4a]/bv[vcodec^=avc1][tbr<=4800]+ba*/bv[tbr<=4800]+ba*/b*";
 
 // Common yt-dlp flags — use browser cookies to avoid 429 rate limiting
 const YTDLP_COMMON = ["--cookies-from-browser", "chrome"];
@@ -829,6 +829,9 @@ app.get("/api/proxy/range", async (req, res) => {
   }
 });
 
+// Max bitrate for HLS variant filtering (matches FORMAT_SELECTOR cap)
+const HLS_MAX_BANDWIDTH = 4800_000;
+
 // HLS proxy — fetch m3u8 and rewrite all URLs to go through our proxy
 app.get("/api/proxy/hls", async (req, res) => {
   const entry = proxyMap.get(req.query.id);
@@ -838,6 +841,27 @@ app.get("/api/proxy/hls", async (req, res) => {
     const upstream = await fetch(entry.url, { headers: proxyHeaders(entry), redirect: "follow" });
     let body = await upstream.text();
     const baseUrl = new URL(entry.url);
+
+    // Filter master playlist — drop variants above bitrate cap
+    const isMaster = body.includes("#EXT-X-STREAM-INF");
+    if (isMaster) {
+      const lines = body.split("\n");
+      const filtered = [];
+      let skip = false;
+      for (const line of lines) {
+        if (line.startsWith("#EXT-X-STREAM-INF")) {
+          const bwMatch = line.match(/BANDWIDTH=(\d+)/);
+          skip = bwMatch && Number(bwMatch[1]) > HLS_MAX_BANDWIDTH;
+        }
+        if (skip && !line.startsWith("#")) {
+          skip = false; // skip the URL line following the dropped #EXT-X-STREAM-INF
+          continue;
+        }
+        if (!skip) filtered.push(line);
+        else skip = line.startsWith("#"); // keep skipping consecutive tags for same variant
+      }
+      body = filtered.join("\n");
+    }
 
     // Rewrite each non-comment, non-empty line
     body = body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
