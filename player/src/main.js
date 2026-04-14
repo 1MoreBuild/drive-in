@@ -5,6 +5,10 @@ import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, 
 import { loadBrowseScreen, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 
+const btnAudio = document.getElementById("btn-audio");
+const audioPanel = document.getElementById("audio-panel");
+let reconnectTimer = null;
+
 // --- Player callbacks (break circular dep player↔browse) -------------
 
 setPlayerCallbacks({ updateSubsUI, updateAudioUI });
@@ -68,23 +72,32 @@ function connect() {
 
   state.ws.onopen = () => {
     console.log("[ws] Connected");
-    // Navigate based on current URL
-    const route = parseRoute();
-    if (route.view === "browse") loadBrowseScreen();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    // On initial load (no active player), redirect /play to browse since playback context is lost on refresh.
+    // On reconnect during active playback, stay on the current view.
+    if (!state.player && !state.isPlaying) {
+      const route = parseRoute();
+      if (route.view === "player") navigate("/", true);
+      loadBrowseScreen();
+    }
   };
 
   state.ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      console.log("[ws] Received:", msg.type);
 
       if (msg.type === "ping") {
-        state.ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
+        if (state.ws?.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
+        }
         return;
       }
 
-      const btnAudio = document.getElementById("btn-audio");
-      const audioPanel = document.getElementById("audio-panel");
+      // Skip per-message DOM lookups and noisy ping logs to reduce steady-state GC churn on Tesla.
+      console.log("[ws] Received:", msg.type);
 
       switch (msg.type) {
         case "play":
@@ -171,7 +184,13 @@ function connect() {
   state.ws.onclose = () => {
     console.log("[ws] Disconnected, reconnecting in 3s...");
     showStatus("Disconnected. Reconnecting...");
-    setTimeout(connect, 3000);
+    // Keep only one reconnect timer alive so repeated close/error events do not stack work.
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, 3000);
+    }
   };
 
   state.ws.onerror = () => {

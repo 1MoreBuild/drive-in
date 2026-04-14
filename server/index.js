@@ -138,8 +138,8 @@ function updateState(patch) {
 // --- yt-dlp resolver -------------------------------------------------
 
 // Prefer H.264 video + AAC audio for MPEG-TS compatibility
-// Prefer 1080p30 H.264 + AAC — 60fps too heavy for Tesla WASM decoding.
-const FORMAT_SELECTOR = "bv[vcodec^=avc1][height<=1080][fps<=30]+ba[acodec^=mp4a]/bv[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/bv[height<=1080][fps<=30]+ba*/bv[height<=1080]+ba*/b*";
+// Prefer 720p30 H.264 + AAC — 1080p too heavy for Tesla WASM decoding.
+const FORMAT_SELECTOR = "bv[vcodec^=avc1][height<=720][fps<=30]+ba[acodec^=mp4a]/bv[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/bv[height<=720][fps<=30]+ba*/bv[height<=720]+ba*/b*";
 
 // Common yt-dlp flags — use browser cookies to avoid 429 rate limiting
 const YTDLP_COMMON = ["--cookies-from-browser", "chrome"];
@@ -1168,16 +1168,37 @@ app.post("/api/plex/progress", async (req, res) => {
   } catch { res.json({ ok: true }); }
 });
 
-// Proxy Plex thumbnails (so browser doesn't need token)
+// Proxy Plex thumbnails — cached to disk (so browser doesn't need token)
 app.get("/api/plex/thumb", async (req, res) => {
   const path = req.query.path;
   if (!path || !PLEX_TOKEN) return res.status(400).end();
+
+  // Stable cache key from path
+  let h = 0;
+  for (let i = 0; i < path.length; i++) h = ((h << 5) - h + path.charCodeAt(i)) | 0;
+  const cacheBase = resolve(THUMB_CACHE_DIR, `plex_${Math.abs(h).toString(36)}`);
+  const metaFile = cacheBase + ".meta";
+  const dataFile = cacheBase + ".dat";
+
+  // Serve from cache (data + MIME stored separately)
+  if (existsSync(dataFile) && existsSync(metaFile)) {
+    try {
+      const mime = readFileSync(metaFile, "utf8").trim();
+      res.set("Content-Type", mime);
+      res.set("Cache-Control", "public, max-age=604800");
+      return res.sendFile(dataFile, { dotfiles: "allow" });
+    } catch {}
+  }
+
   try {
     const upstream = await fetch(`${PLEX_URL}${path}?X-Plex-Token=${PLEX_TOKEN}`);
     if (!upstream.ok) return res.status(upstream.status).end();
-    res.set("Content-Type", upstream.headers.get("content-type") || "image/jpeg");
-    res.set("Cache-Control", "public, max-age=86400");
+    const mime = upstream.headers.get("content-type") || "image/jpeg";
     const buf = Buffer.from(await upstream.arrayBuffer());
+    writeFileSync(dataFile, buf);
+    writeFileSync(metaFile, mime);
+    res.set("Content-Type", mime);
+    res.set("Cache-Control", "public, max-age=604800");
     res.send(buf);
   } catch { res.status(502).end(); }
 });
@@ -1227,27 +1248,40 @@ app.delete("/api/history", (req, res) => {
 
 app.get("/api/history", async (_req, res) => {
   const history = loadHistory();
-  if (!PLEX_TOKEN) return res.json(history);
+
+  // Fix non-proxied external thumbnail URLs in history
+  const fixed = history.map((h) => {
+    if (h.thumbnail && h.thumbnail.startsWith("http")) {
+      return { ...h, thumbnail: `/api/thumb?url=${encodeURIComponent(h.thumbnail)}` };
+    }
+    return h;
+  });
+
+  if (!PLEX_TOKEN) return res.json(fixed);
 
   // Enrich Plex items with current viewOffset from Plex
-  const plexKeys = history.filter((h) => h.plex?.ratingKey).map((h) => h.plex.ratingKey);
-  if (!plexKeys.length) return res.json(history);
+  const plexKeys = fixed.filter((h) => h.plex?.ratingKey).map((h) => h.plex.ratingKey);
+  if (!plexKeys.length) return res.json(fixed);
 
   try {
     const data = await plexApi(`/library/metadata/${plexKeys.join(",")}`);
     const metaMap = {};
     for (const m of data.MediaContainer?.Metadata || []) {
-      metaMap[m.ratingKey] = { viewOffset: m.viewOffset || 0, viewCount: m.viewCount || 0 };
+      const thumb = m.art
+        ? `/api/plex/thumb?path=${encodeURIComponent(m.art)}`
+        : m.thumb ? `/api/plex/thumb?path=${encodeURIComponent(m.thumb)}` : null;
+      metaMap[m.ratingKey] = { viewOffset: m.viewOffset || 0, viewCount: m.viewCount || 0, thumbnail: thumb };
     }
-    const enriched = history.map((h) => {
+    const enriched = fixed.map((h) => {
       if (h.plex?.ratingKey && metaMap[h.plex.ratingKey]) {
-        return { ...h, ...metaMap[h.plex.ratingKey] };
+        const fresh = metaMap[h.plex.ratingKey];
+        return { ...h, viewOffset: fresh.viewOffset, viewCount: fresh.viewCount, thumbnail: fresh.thumbnail || h.thumbnail };
       }
       return h;
     });
     res.json(enriched);
   } catch {
-    res.json(history);
+    res.json(fixed);
   }
 });
 
@@ -1548,6 +1582,7 @@ app.get("/api/health", (_req, res) => {
     player: { connected: !!(playerWs?.readyState === 1), status: state.status },
   });
 });
+
 
 // --- Start -----------------------------------------------------------
 

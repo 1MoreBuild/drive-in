@@ -240,7 +240,7 @@ function renderCardRow(container, items, { type }) {
     else if (item.thumb) thumbUrl = `/api/plex/thumb?path=${encodeURIComponent(item.thumb)}`;
 
     const thumbHtml = thumbUrl
-      ? `<img src="${thumbUrl}" alt="" loading="lazy">`
+      ? `<img src="${thumbUrl}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'28\\' height=\\'28\\'><path d=\\'M8 5v14l11-7z\\'/></svg>'}))">`
       : `<div class="browse-card-thumb-empty"><svg viewBox="0 0 24 24" fill="white" width="28" height="28"><path d="M8 5v14l11-7z"/></svg></div>`;
 
     let meta = "";
@@ -426,7 +426,7 @@ export async function openEpisodes(show) {
 
         const thumbUrl = ep.thumb ? `/api/plex/thumb?path=${encodeURIComponent(ep.thumb)}` : "";
         const thumbHtml = thumbUrl
-          ? `<img src="${thumbUrl}" alt="" loading="lazy">`
+          ? `<img src="${thumbUrl}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'24\\' height=\\'24\\'><path d=\\'M8 5v14l11-7z\\'/></svg>'}))">`
           : `<div class="browse-card-thumb-empty"><svg viewBox="0 0 24 24" fill="white" width="24" height="24"><path d="M8 5v14l11-7z"/></svg></div>`;
         const epWatched = ep.viewCount > 0;
         const epBadge = epWatched

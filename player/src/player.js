@@ -21,6 +21,11 @@ export function setPlayerCallbacks({ updateSubsUI, updateAudioUI }) {
 
 let AVPlayerClass = null;
 let AVPlayerEvents = null;
+let currentPlayerBindings = null;
+let lastUiPaintAt = 0;
+
+const IS_TESLA_BROWSER = /\bTesla\b/i.test(navigator.userAgent);
+const UI_PAINT_INTERVAL_MS = 250;
 
 async function loadAVPlayerClass() {
   if (AVPlayerClass) return;
@@ -96,6 +101,22 @@ export function reportProgress() {
   }
 }
 
+function unbindPlayerEvents(player) {
+  if (!player || !AVPlayerEvents || !currentPlayerBindings) return;
+  for (const [event, handler] of currentPlayerBindings) {
+    player.off(event, handler);
+  }
+  currentPlayerBindings = null;
+}
+
+async function disposePlayer(player) {
+  if (!player) return;
+  // Fully destroy old AVPlayer instances so canvases, audio nodes, and worker state do not leak across plays.
+  unbindPlayerEvents(player);
+  try { await player.stop(true); } catch {}
+  try { await player.destroy(); } catch {}
+}
+
 function startProgressReporting() {
   stopProgressReporting();
   state.progressInterval = setInterval(() => reportProgress(), 10000);
@@ -146,54 +167,73 @@ export async function togglePlayPause() {
 function bindPlayerEvents(p) {
   if (!AVPlayerEvents) return;
 
-  p.on(AVPlayerEvents.LOADING, () => showBuffering());
-  p.on(AVPlayerEvents.LOADED, () => hideBuffering());
-  p.on(AVPlayerEvents.FIRST_VIDEO_RENDERED, () => hideBuffering());
-  p.on(AVPlayerEvents.SEEKING, () => showBuffering());
-  p.on(AVPlayerEvents.SEEKED, () => hideBuffering());
-
-  p.on(AVPlayerEvents.TIME, (pts) => {
+  const onLoading = () => showBuffering();
+  const onLoaded = () => hideBuffering();
+  const onFirstVideoRendered = () => hideBuffering();
+  const onSeeking = () => showBuffering();
+  const onSeeked = () => hideBuffering();
+  const onTime = (pts) => {
     if (isDraggingProgress()) return;
     state.currentTime = Number(pts) / 1000;
     if (state.duration > 0) state.currentTime = Math.min(state.currentTime, state.duration);
-    if (state.duration > 0) {
-      updateProgress(state.currentTime / state.duration);
+
+    const now = performance.now();
+    if (now - lastUiPaintAt >= UI_PAINT_INTERVAL_MS) {
+      // Throttle control repaint work so the TIME event does not force DOM writes on every decoded frame.
+      if (state.duration > 0) {
+        updateProgress(state.currentTime / state.duration);
+      }
+      updateTimeDisplay();
+      lastUiPaintAt = now;
     }
-    updateTimeDisplay();
+
     renderSubtitle(state.currentTime);
     if (state.isBuffering) hideBuffering();
-  });
-
-  p.on(AVPlayerEvents.PLAYING, () => {
+  };
+  const onPlaying = () => {
     state.isPlaying = true;
     updatePlayButton();
     updateMediaSession();
     hideBuffering();
-  });
-
-  p.on(AVPlayerEvents.PAUSED, () => {
+  };
+  const onPaused = () => {
     state.isPlaying = false;
     updatePlayButton();
     updateMediaSession();
-  });
-
-  p.on(AVPlayerEvents.ENDED, () => {
+  };
+  const onEnded = () => {
     state.isPlaying = false;
     state.currentTime = 0;
     reportProgress();
     updatePlayButton();
     updateMediaSession();
     showControls();
-  });
-
-  p.on(AVPlayerEvents.ERROR, (err) => {
+  };
+  const onError = (err) => {
     console.error("[player] Error event:", err);
     hideBuffering();
-  });
-
-  p.on(AVPlayerEvents.TIMEOUT, () => {
+  };
+  const onTimeout = () => {
     console.warn("[player] Timeout — network may be slow");
-  });
+  };
+
+  currentPlayerBindings = [
+    [AVPlayerEvents.LOADING, onLoading],
+    [AVPlayerEvents.LOADED, onLoaded],
+    [AVPlayerEvents.FIRST_VIDEO_RENDERED, onFirstVideoRendered],
+    [AVPlayerEvents.SEEKING, onSeeking],
+    [AVPlayerEvents.SEEKED, onSeeked],
+    [AVPlayerEvents.TIME, onTime],
+    [AVPlayerEvents.PLAYING, onPlaying],
+    [AVPlayerEvents.PAUSED, onPaused],
+    [AVPlayerEvents.ENDED, onEnded],
+    [AVPlayerEvents.ERROR, onError],
+    [AVPlayerEvents.TIMEOUT, onTimeout],
+  ];
+
+  for (const [event, handler] of currentPlayerBindings) {
+    p.on(event, handler);
+  }
 }
 
 // --- Play / Stop -----------------------------------------------------
@@ -218,7 +258,7 @@ export async function play(url, title, meta = {}) {
     await loadAVPlayerClass();
 
     if (state.player) {
-      try { await state.player.stop(); } catch {}
+      await disposePlayer(state.player);
       state.player = null;
     }
 
@@ -227,8 +267,9 @@ export async function play(url, title, meta = {}) {
     state.currentTime = meta.startTime || 0;
     state.duration = meta.duration || 0;
     state.plexInfo = meta.plex || null;
+    lastUiPaintAt = 0;
     updateTimeDisplay();
-    updateProgress(0);
+    updateProgress(state.duration > 0 ? state.currentTime / state.duration : 0);
     onUpdateSubsUI();
     onUpdateAudioUI();
     subsPanel.classList.add("hidden");
@@ -244,8 +285,12 @@ export async function play(url, title, meta = {}) {
       enableHardware: true,
       enableWebGPU: false,
       enableWebCodecs: true,
-      enableWorker: false,
-      preLoadTime: 600,
+      // Move decode/render work off the main thread on Tesla-class browsers when libmedia falls back to worker mode.
+      enableWorker: IS_TESLA_BROWSER,
+      // Keep the VOD preload window small so libmedia does not queue minutes of media into memory.
+      preLoadTime: IS_TESLA_BROWSER ? 20 : 45,
+      // Give the audio worklet a slightly deeper buffer on Tesla to reduce underruns under GC pressure.
+      ...(IS_TESLA_BROWSER ? { audioWorkletBufferLength: 24 } : {}),
     });
 
     bindPlayerEvents(state.player);
@@ -286,6 +331,10 @@ export async function play(url, title, meta = {}) {
   } catch (e) {
     console.error("[player] Playback error:", e);
     stopProgressReporting();
+    // Tear down partially initialized players on failure so retry loops do not retain wasm/render resources.
+    const failedPlayer = state.player;
+    state.player = null;
+    await disposePlayer(failedPlayer);
     showStatus(`Error: ${e.message}`);
   } finally {
     state.playLock = false;
@@ -295,8 +344,9 @@ export async function play(url, title, meta = {}) {
 export async function stop() {
   reportProgress();
   stopProgressReporting();
-  try { await state.player?.stop(); } catch {}
+  const player = state.player;
   state.player = null;
+  await disposePlayer(player);
   container.innerHTML = "";
   state.isPlaying = false;
   if (mediaSessionAudio) mediaSessionAudio.pause();
@@ -304,6 +354,9 @@ export async function stop() {
   state.duration = 0;
   state.externalSubs = [];
   state.activeExternalSubs.clear();
+  // Clear subtitle cues on stop so large parsed VTT arrays are released as soon as playback ends.
+  disableExternalSubtitle();
+  lastUiPaintAt = 0;
   updatePlayButton();
   updateTimeDisplay();
   updateProgress(0);
