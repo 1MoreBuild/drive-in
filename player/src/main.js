@@ -76,13 +76,28 @@ function connect() {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    // On initial load (no active player), redirect /play to browse since playback context is lost on refresh.
     // On reconnect during active playback, stay on the current view.
-    if (!state.player && !state.isPlaying) {
-      const route = parseRoute();
-      if (route.view === "player") navigate("/", true);
-      loadBrowseScreen();
+    if (state.player || state.isPlaying) return;
+
+    const route = parseRoute();
+    // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
+    if (route.view === "player" && (route.url || route.plex)) {
+      showStatus("Resuming playback...");
+      const endpoint = route.plex ? "/api/plex/play" : "/api/play";
+      const body = route.plex ? { ratingKey: route.plex } : { url: route.url };
+      fetch(`${location.origin}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).catch(() => {
+        navigate("/", true);
+        loadBrowseScreen();
+      });
+      return;
     }
+    // No playback context — go to browse
+    if (route.view === "player") navigate("/", true);
+    loadBrowseScreen();
   };
 
   state.ws.onmessage = (e) => {
@@ -132,6 +147,7 @@ function connect() {
             duration: msg.duration || 0,
             plex: msg.plex || null,
             startTime: msg.startTime || 0,
+            sourceUrl: msg.sourceUrl || null,
           });
           break;
         case "pause":

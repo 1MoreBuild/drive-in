@@ -267,6 +267,7 @@ export async function play(url, title, meta = {}) {
     state.currentTime = meta.startTime || 0;
     state.duration = meta.duration || 0;
     state.plexInfo = meta.plex || null;
+    state.sourceUrl = meta.sourceUrl || null;
     lastUiPaintAt = 0;
     updateTimeDisplay();
     updateProgress(state.duration > 0 ? state.currentTime / state.duration : 0);
@@ -278,7 +279,13 @@ export async function play(url, title, meta = {}) {
 
     overlay.classList.add("hidden");
     showBuffering();
-    navigate("/play", true);
+    // Include source in URL so page refresh can resume playback
+    const playPath = meta.plex?.ratingKey
+      ? `/play?plex=${encodeURIComponent(meta.plex.ratingKey)}`
+      : meta.sourceUrl
+        ? `/play?url=${encodeURIComponent(meta.sourceUrl)}`
+        : "/play";
+    navigate(playPath, true);
 
     state.player = new AVPlayerClass({
       container,
@@ -349,6 +356,7 @@ export async function stop() {
   await disposePlayer(player);
   container.innerHTML = "";
   state.isPlaying = false;
+  state.sourceUrl = null;
   if (mediaSessionAudio) mediaSessionAudio.pause();
   state.currentTime = 0;
   state.duration = 0;

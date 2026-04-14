@@ -1405,6 +1405,7 @@ app.post("/api/play", async (req, res) => {
     broadcast({
       type: "play",
       url: playerUrl,
+      sourceUrl: url,
       title: resolved.title,
       isLive: resolved.isLive,
       thumbnail: thumbUrl,
@@ -1583,6 +1584,13 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+
+// SPA fallback — serve index.html for client-side routes (/play, /show/:id)
+const spaIndexPath = resolve(serveDist ? playerDist : playerSrc, "index.html");
+app.get(/^\/(play|show\/\d+)/, (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.sendFile(spaIndexPath);
+});
 
 // --- Start -----------------------------------------------------------
 

@@ -13,12 +13,15 @@ export function parseRoute() {
   const path = location.pathname;
   const showMatch = path.match(/^\/show\/(\d+)$/);
   if (showMatch) return { view: "show", ratingKey: showMatch[1] };
-  if (path === "/play") return { view: "player" };
+  if (path === "/play") {
+    const params = new URLSearchParams(location.search);
+    return { view: "player", url: params.get("url"), plex: params.get("plex") };
+  }
   return { view: "browse" };
 }
 
 export function navigate(path, replace = false) {
-  if (location.pathname === path) return;
+  if (location.pathname + location.search === path) return;
   if (replace) {
     history.replaceState(null, "", path);
   } else {
