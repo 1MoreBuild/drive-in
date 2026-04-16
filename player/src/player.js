@@ -24,8 +24,328 @@ let AVPlayerEvents = null;
 let currentPlayerBindings = null;
 let lastUiPaintAt = 0;
 
-const IS_TESLA_BROWSER = /\bTesla\b/i.test(navigator.userAgent);
 const UI_PAINT_INTERVAL_MS = 250;
+// Minimal WASM module using a v128.const SIMD instruction.
+// Compiling this module will fail at runtime when SIMD is disabled (e.g. Tesla
+// browser), whereas WebAssembly.validate() may still accept the bytecode.
+const WASM_SIMD_MODULE = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,  // magic + version
+  0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,          // type section: () -> v128
+  0x03, 0x02, 0x01, 0x00,                              // function section
+  0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00,            // code section
+  0xfd, 0x0f, 0xfd, 0x0c, 0x0b,                        // v128.const + end
+]);
+const CAPABILITY_PROFILE = detectCapabilityProfile();
+const PROGRESS_REPORT_INTERVAL_MS = 10_000;
+const playerMetricsState = createPlayerMetricsState();
+
+function defaultDecodePath() {
+  return CAPABILITY_PROFILE.hasVideoDecoder
+    ? "prefer-webcodecs-hardware"
+    : CAPABILITY_PROFILE.hasWebCodecs
+      ? "prefer-webcodecs"
+      : "wasm-fallback";
+}
+
+function createPlayerMetricsState() {
+  return {
+    stallCount: 0,
+    totalStallDurationMs: 0,
+    stallStartedAt: 0,
+    decodePath: defaultDecodePath(),
+  };
+}
+
+function resetPlayerMetrics() {
+  playerMetricsState.stallCount = 0;
+  playerMetricsState.totalStallDurationMs = 0;
+  playerMetricsState.stallStartedAt = 0;
+  playerMetricsState.decodePath = defaultDecodePath();
+}
+
+function beginStall() {
+  if (playerMetricsState.stallStartedAt) return;
+  playerMetricsState.stallCount += 1;
+  playerMetricsState.stallStartedAt = performance.now();
+}
+
+function endStall() {
+  if (!playerMetricsState.stallStartedAt) return;
+  playerMetricsState.totalStallDurationMs += performance.now() - playerMetricsState.stallStartedAt;
+  playerMetricsState.stallStartedAt = 0;
+}
+
+function getPlaybackState() {
+  if (!state.player) return "idle";
+  if (state.isBuffering) return "buffering";
+  return state.isPlaying ? "playing" : "paused";
+}
+
+function toMetricSeconds(value) {
+  if (typeof value === "bigint") return Number(value) / 1000;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const maxKnownSeconds = Math.max(state.duration || 0, state.currentTime || 0);
+  return value > maxKnownSeconds + 120 ? value / 1000 : value;
+}
+
+function normalizeBufferedSeconds(value) {
+  if (value == null) return null;
+
+  if (typeof value === "number" || typeof value === "bigint") {
+    const endSeconds = toMetricSeconds(value);
+    return endSeconds == null ? null : Math.max(0, endSeconds - state.currentTime);
+  }
+
+  if (Array.isArray(value)) {
+    for (const range of value) {
+      const normalized = normalizeBufferedSeconds(range);
+      if (normalized != null) return normalized;
+    }
+    return null;
+  }
+
+  if (typeof value.length === "number" && typeof value.start === "function" && typeof value.end === "function") {
+    for (let i = 0; i < value.length; i++) {
+      const start = toMetricSeconds(value.start(i));
+      const end = toMetricSeconds(value.end(i));
+      if (start == null || end == null) continue;
+      if (end >= state.currentTime && (start == null || start <= state.currentTime + 1)) {
+        return Math.max(0, end - state.currentTime);
+      }
+    }
+    return null;
+  }
+
+  if (typeof value === "object") {
+    if ("bufferHealthSeconds" in value) return normalizeBufferedSeconds(value.bufferHealthSeconds);
+    if ("bufferedSeconds" in value) return normalizeBufferedSeconds(value.bufferedSeconds);
+    if ("bufferedDuration" in value) return normalizeBufferedSeconds(value.bufferedDuration);
+    if ("seconds" in value) return normalizeBufferedSeconds(value.seconds);
+    if ("end" in value) {
+      const end = toMetricSeconds(value.end);
+      const start = "start" in value ? toMetricSeconds(value.start) : state.currentTime;
+      if (end == null) return null;
+      return Math.max(0, end - Math.max(start ?? state.currentTime, state.currentTime));
+    }
+  }
+
+  return null;
+}
+
+function readBufferHealthSeconds(player) {
+  const readers = [
+    () => player?.getBuffered?.(),
+    () => player?.getBufferedEnd?.(),
+    () => player?.getBufferRange?.(),
+    () => player?.getStats?.(),
+    () => player?.buffered,
+    () => player?.video?.buffered,
+    () => player?.videoElement?.buffered,
+  ];
+
+  for (const read of readers) {
+    try {
+      const bufferedSeconds = normalizeBufferedSeconds(read());
+      if (bufferedSeconds != null) return bufferedSeconds;
+    } catch {}
+  }
+
+  return null;
+}
+
+function normalizeDroppedFrames(value) {
+  if (value == null) return null;
+  if (typeof value === "bigint") return Number(value);
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === "object") {
+    for (const key of ["droppedFrames", "droppedVideoFrames", "dropped", "droppedCount"]) {
+      if (key in value) return normalizeDroppedFrames(value[key]);
+    }
+  }
+  return null;
+}
+
+function readDroppedFrames(player) {
+  const readers = [
+    () => player?.getDroppedFrames?.(),
+    () => player?.getStats?.(),
+    () => player?.getVideoPlaybackQuality?.(),
+    () => player?.video?.getVideoPlaybackQuality?.(),
+    () => player?.videoElement?.getVideoPlaybackQuality?.(),
+  ];
+
+  for (const read of readers) {
+    try {
+      const droppedFrames = normalizeDroppedFrames(read());
+      if (droppedFrames != null) return droppedFrames;
+    } catch {}
+  }
+
+  return null;
+}
+
+function reportPlayerMetrics() {
+  const activeStallDurationMs = playerMetricsState.stallStartedAt
+    ? performance.now() - playerMetricsState.stallStartedAt
+    : 0;
+  const bufferHealthSeconds = readBufferHealthSeconds(state.player);
+  const droppedFrames = readDroppedFrames(state.player);
+
+  fetch("/api/metrics/player", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      currentTime: state.currentTime,
+      duration: state.duration,
+      isPlaying: state.isPlaying,
+      isMuted: state.isMuted,
+      bufferHealthSeconds,
+      stallCount: playerMetricsState.stallCount,
+      totalStallDurationMs: Math.round(playerMetricsState.totalStallDurationMs + activeStallDurationMs),
+      decodePath: playerMetricsState.decodePath,
+      droppedFrames,
+      playbackState: getPlaybackState(),
+      capabilityProfile: {
+        hasWebCodecs: CAPABILITY_PROFILE.hasWebCodecs,
+        hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
+        enableWorker: CAPABILITY_PROFILE.enableWorker,
+        hasAudioWorklet: CAPABILITY_PROFILE.hasAudioWorklet,
+        teslaLikeEnv: CAPABILITY_PROFILE.teslaLikeEnv,
+      },
+    }),
+  }).catch(() => {});
+}
+
+function detectWasmSIMD() {
+  try {
+    // Actually compile a SIMD module rather than just validating bytecode.
+    // WebAssembly.validate() can return true even when the engine disables SIMD
+    // at runtime (observed on Tesla's Chromium 136 browser).
+    return !!new WebAssembly.Module(WASM_SIMD_MODULE);
+  } catch {
+    return false;
+  }
+}
+
+function detectWasmThreads() {
+  try {
+    if (typeof SharedArrayBuffer === "undefined" || typeof WebAssembly?.Memory !== "function") {
+      return false;
+    }
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+    return memory.buffer instanceof SharedArrayBuffer;
+  } catch {
+    return false;
+  }
+}
+
+function detectCapabilityProfile() {
+  const userAgent = navigator.userAgent || "";
+  const platform = navigator.userAgentData?.platform || navigator.platform || "";
+  const platformText = `${platform} ${userAgent}`;
+  const isLinuxX64 = /linux/i.test(platformText) && /(x86_64|x64|amd64)/i.test(platformText);
+  const hasVideoDecoder = typeof globalThis.VideoDecoder === "function";
+  const hasAudioDecoder = typeof globalThis.AudioDecoder === "function";
+  const hasWebCodecs = hasVideoDecoder || hasAudioDecoder;
+  const hasAudioContext = typeof (globalThis.AudioContext || globalThis.webkitAudioContext) === "function";
+  const hasAudioWorklet = hasAudioContext && typeof globalThis.AudioWorkletNode === "function";
+  const hasWorkers = typeof globalThis.Worker === "function";
+  const hasOffscreenCanvas = typeof globalThis.OffscreenCanvas === "function";
+  const hasWasmSIMD = detectWasmSIMD();
+  const hasWasmThreads = detectWasmThreads();
+  const constrainedWebCodecsEnv = hasWebCodecs && !hasWasmSIMD;
+
+  return {
+    platform,
+    userAgent,
+    isLinuxX64,
+    hasVideoDecoder,
+    hasAudioDecoder,
+    hasWebCodecs,
+    hasAudioWorklet,
+    hasWorkers,
+    hasOffscreenCanvas,
+    hasWasmSIMD,
+    hasWasmThreads,
+    constrainedWebCodecsEnv,
+    teslaLikeEnv: isLinuxX64 && constrainedWebCodecsEnv,
+    enableWorker: hasWorkers && hasOffscreenCanvas && !hasWasmThreads,
+    preLoadTime: constrainedWebCodecsEnv ? 20 : hasWebCodecs ? 30 : 45,
+    audioWorkletBufferLength: hasAudioWorklet && constrainedWebCodecsEnv ? 24 : undefined,
+  };
+}
+
+function getPlayerOptions(container) {
+  return {
+    container,
+    enableHardware: CAPABILITY_PROFILE.hasVideoDecoder,
+    enableWebGPU: false,
+    enableWebCodecs: CAPABILITY_PROFILE.hasWebCodecs,
+    // In no-thread environments, worker mode still moves demux/render work off the UI thread.
+    enableWorker: CAPABILITY_PROFILE.enableWorker,
+    enableAudioWorklet: CAPABILITY_PROFILE.hasAudioWorklet,
+    // Keep VOD buffering tighter when WebCodecs is the preferred path to avoid excess memory pressure.
+    preLoadTime: CAPABILITY_PROFILE.preLoadTime,
+    ...(CAPABILITY_PROFILE.audioWorkletBufferLength
+      ? { audioWorkletBufferLength: CAPABILITY_PROFILE.audioWorkletBufferLength }
+      : {}),
+  };
+}
+
+function reportDecodeInfo(data) {
+  if (data?.path) playerMetricsState.decodePath = data.path;
+  fetch("/api/dev/decode-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  }).catch(() => {});
+}
+
+async function logDecodePath(player, phase) {
+  const summary = {
+    phase,
+    webCodecsEnabled: CAPABILITY_PROFILE.hasWebCodecs,
+    hardwareAccelerationRequested: CAPABILITY_PROFILE.hasVideoDecoder,
+    constrainedWebCodecsEnv: CAPABILITY_PROFILE.constrainedWebCodecsEnv,
+  };
+
+  try {
+    const tasks = await player?.VideoPipelineProxy?.VideoDecodePipeline?.getTasksInfo?.();
+    if (Array.isArray(tasks) && tasks.length > 0) {
+      const usesHardwareDecoder = tasks.some((task) => task?.hardware === true);
+      const decodeInfo = {
+        ...summary,
+        path: usesHardwareDecoder
+          ? "webcodecs-hardware"
+          : CAPABILITY_PROFILE.hasWebCodecs
+            ? "webcodecs-or-wasm-fallback"
+            : "wasm",
+        tasks: tasks.map((task) => ({
+          codecId: task.codecId,
+          width: task.width,
+          height: task.height,
+          framerate: task.framerate,
+          hardware: task.hardware,
+        })),
+      };
+      console.log("[player] Decoder path:", decodeInfo);
+      reportDecodeInfo(decodeInfo);
+      return decodeInfo;
+    }
+  } catch (error) {
+    console.warn("[player] Failed to inspect decoder path:", error);
+  }
+
+  const decodeInfo = {
+    ...summary,
+    path: CAPABILITY_PROFILE.hasWebCodecs
+      ? "webcodecs-requested"
+      : "wasm-only",
+  };
+  console.log("[player] Decoder path:", decodeInfo);
+  reportDecodeInfo(decodeInfo);
+  return decodeInfo;
+}
 
 async function loadAVPlayerClass() {
   if (AVPlayerClass) return;
@@ -99,6 +419,7 @@ export function reportProgress() {
       }),
     }).catch(() => {});
   }
+  reportPlayerMetrics();
 }
 
 function unbindPlayerEvents(player) {
@@ -119,7 +440,7 @@ async function disposePlayer(player) {
 
 function startProgressReporting() {
   stopProgressReporting();
-  state.progressInterval = setInterval(() => reportProgress(), 10000);
+  state.progressInterval = setInterval(() => reportProgress(), PROGRESS_REPORT_INTERVAL_MS);
 }
 
 function stopProgressReporting() {
@@ -167,9 +488,19 @@ export async function togglePlayPause() {
 function bindPlayerEvents(p) {
   if (!AVPlayerEvents) return;
 
-  const onLoading = () => showBuffering();
-  const onLoaded = () => hideBuffering();
-  const onFirstVideoRendered = () => hideBuffering();
+  const onLoading = () => {
+    beginStall();
+    showBuffering();
+  };
+  const onLoaded = () => {
+    endStall();
+    hideBuffering();
+  };
+  const onFirstVideoRendered = () => {
+    endStall();
+    hideBuffering();
+    logDecodePath(p, "first-video-frame");
+  };
   const onSeeking = () => showBuffering();
   const onSeeked = () => hideBuffering();
   const onTime = (pts) => {
@@ -191,17 +522,20 @@ function bindPlayerEvents(p) {
     if (state.isBuffering) hideBuffering();
   };
   const onPlaying = () => {
+    endStall();
     state.isPlaying = true;
     updatePlayButton();
     updateMediaSession();
     hideBuffering();
   };
   const onPaused = () => {
+    endStall();
     state.isPlaying = false;
     updatePlayButton();
     updateMediaSession();
   };
   const onEnded = () => {
+    endStall();
     state.isPlaying = false;
     state.currentTime = 0;
     reportProgress();
@@ -210,6 +544,7 @@ function bindPlayerEvents(p) {
     showControls();
   };
   const onError = (err) => {
+    endStall();
     console.error("[player] Error event:", err);
     hideBuffering();
   };
@@ -256,6 +591,7 @@ export async function play(url, title, meta = {}) {
 
   try {
     await loadAVPlayerClass();
+    resetPlayerMetrics();
 
     if (state.player) {
       await disposePlayer(state.player);
@@ -287,18 +623,33 @@ export async function play(url, title, meta = {}) {
         : "/play";
     navigate(playPath, true);
 
-    state.player = new AVPlayerClass({
-      container,
-      enableHardware: true,
-      enableWebGPU: false,
-      enableWebCodecs: true,
-      // Move decode/render work off the main thread on Tesla-class browsers when libmedia falls back to worker mode.
-      enableWorker: IS_TESLA_BROWSER,
-      // Keep the VOD preload window small so libmedia does not queue minutes of media into memory.
-      preLoadTime: IS_TESLA_BROWSER ? 20 : 45,
-      // Give the audio worklet a slightly deeper buffer on Tesla to reduce underruns under GC pressure.
-      ...(IS_TESLA_BROWSER ? { audioWorkletBufferLength: 24 } : {}),
-    });
+    const playerOptions = getPlayerOptions(container);
+    state.player = new AVPlayerClass(playerOptions);
+    const decodeInfo = {
+      options: {
+        enableHardware: playerOptions.enableHardware,
+        enableWebCodecs: playerOptions.enableWebCodecs,
+        enableWorker: playerOptions.enableWorker,
+        enableAudioWorklet: playerOptions.enableAudioWorklet,
+        preLoadTime: playerOptions.preLoadTime,
+        audioWorkletBufferLength: playerOptions.audioWorkletBufferLength ?? "default",
+      },
+      capabilities: {
+        isLinuxX64: CAPABILITY_PROFILE.isLinuxX64,
+        teslaLikeEnv: CAPABILITY_PROFILE.teslaLikeEnv,
+        hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
+        hasAudioDecoder: CAPABILITY_PROFILE.hasAudioDecoder,
+        hasWasmSIMD: CAPABILITY_PROFILE.hasWasmSIMD,
+        hasWasmThreads: CAPABILITY_PROFILE.hasWasmThreads,
+      },
+      decodePreference: CAPABILITY_PROFILE.hasVideoDecoder
+        ? "prefer-webcodecs-hardware"
+        : CAPABILITY_PROFILE.hasWebCodecs
+          ? "prefer-webcodecs"
+          : "wasm-fallback",
+    };
+    console.log("[player] AVPlayer created", decodeInfo);
+    reportDecodeInfo(decodeInfo);
 
     bindPlayerEvents(state.player);
     startProgressReporting();
@@ -306,6 +657,7 @@ export async function play(url, title, meta = {}) {
     const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
     console.log("[player] Loading:", absUrl);
     await state.player.load(absUrl, { isLive: meta.isLive || false });
+    await logDecodePath(state.player, "post-load");
 
     if (!state.duration) {
       try {
@@ -349,6 +701,7 @@ export async function play(url, title, meta = {}) {
 }
 
 export async function stop() {
+  endStall();
   reportProgress();
   stopProgressReporting();
   const player = state.player;

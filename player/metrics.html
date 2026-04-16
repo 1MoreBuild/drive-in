@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drive-In Metrics</title>
+<style>
+  :root {
+    --bg: #111;
+    --panel: #1a1a1a;
+    --panel-strong: #202020;
+    --border: #2a2a2a;
+    --text: #eee;
+    --muted: #888;
+    --green: #4ade80;
+    --yellow: #fbbf24;
+    --red: #f87171;
+    --blue: #60a5fa;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.5;
+    padding: 24px;
+  }
+
+  h1 {
+    font-size: 20px;
+    margin-bottom: 8px;
+    color: #fff;
+  }
+
+  .subhead {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+
+  .dashboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+  }
+
+  .panel {
+    background: linear-gradient(180deg, var(--panel-strong), var(--panel));
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+
+  .panel h2 {
+    font-size: 14px;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 10px;
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+  }
+
+  .row:last-child {
+    margin-bottom: 0;
+  }
+
+  .label {
+    color: #999;
+    font-size: 13px;
+  }
+
+  .value {
+    font-size: 14px;
+    font-weight: 600;
+    text-align: right;
+  }
+
+  .ok { color: var(--green); }
+  .warn { color: var(--yellow); }
+  .crit { color: var(--red); }
+  .info { color: var(--blue); }
+  .muted { color: var(--muted); }
+
+  .full {
+    grid-column: 1 / -1;
+  }
+
+  @media (max-width: 720px) {
+    body { padding: 16px; }
+    .dashboard { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+  <h1>Drive-In Streaming Metrics</h1>
+  <div class="subhead" id="status-line">Waiting for data...</div>
+
+  <div class="dashboard">
+    <section class="panel">
+      <h2>Server Throughput</h2>
+      <div class="row"><span class="label">Rolling Throughput</span><span class="value" id="throughput-bps">--</span></div>
+      <div class="row"><span class="label">Rolling Throughput (Mbps)</span><span class="value" id="throughput-mbps">--</span></div>
+      <div class="row"><span class="label">Window Bytes</span><span class="value" id="window-bytes">--</span></div>
+      <div class="row"><span class="label">Active Proxy Connections</span><span class="value" id="active-proxy">--</span></div>
+      <div class="row"><span class="label">Total Bytes Served</span><span class="value" id="total-bytes">--</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Segment Delivery</h2>
+      <div class="row"><span class="label">Average Response Time</span><span class="value" id="avg-response">--</span></div>
+      <div class="row"><span class="label">P95 Response Time</span><span class="value" id="p95-response">--</span></div>
+      <div class="row"><span class="label">Rolling Samples</span><span class="value info" id="sample-count">--</span></div>
+      <div class="row"><span class="label">Metrics Window</span><span class="value info" id="window-size">--</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Player Health</h2>
+      <div class="row"><span class="label">Playback State</span><span class="value" id="playback-state">--</span></div>
+      <div class="row"><span class="label">Buffer Health</span><span class="value" id="buffer-health">--</span></div>
+      <div class="row"><span class="label">Stall Count</span><span class="value" id="stall-count">--</span></div>
+      <div class="row"><span class="label">Total Stall Duration</span><span class="value" id="stall-duration">--</span></div>
+      <div class="row"><span class="label">Position</span><span class="value info" id="position">--</span></div>
+      <div class="row"><span class="label">Player Update</span><span class="value" id="player-updated">--</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Decode Info</h2>
+      <div class="row"><span class="label">Decode Path</span><span class="value" id="decode-path">--</span></div>
+      <div class="row"><span class="label">Dropped Frames</span><span class="value" id="dropped-frames">--</span></div>
+      <div class="row"><span class="label">WebCodecs</span><span class="value" id="has-webcodecs">--</span></div>
+      <div class="row"><span class="label">Hardware Decoder</span><span class="value" id="has-hw-decoder">--</span></div>
+      <div class="row"><span class="label">Worker Decode</span><span class="value" id="worker-decode">--</span></div>
+      <div class="row"><span class="label">Tesla-like Env</span><span class="value" id="tesla-env">--</span></div>
+    </section>
+  </div>
+
+<script>
+const statusLine = document.getElementById("status-line");
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "--";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function formatRate(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond)) return "--";
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatMbps(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond)) return "--";
+  return `${((bytesPerSecond * 8) / 1_000_000).toFixed(2)} Mbps`;
+}
+
+function formatSeconds(seconds) {
+  if (!Number.isFinite(seconds)) return "--";
+  return `${seconds.toFixed(seconds >= 100 ? 0 : 1)} s`;
+}
+
+function formatDurationMs(ms) {
+  if (!Number.isFinite(ms)) return "--";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.round(ms)} ms`;
+}
+
+function formatClock(seconds) {
+  if (!Number.isFinite(seconds)) return "--:--";
+  const total = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatRelative(ts) {
+  if (!Number.isFinite(ts)) return "--";
+  const delta = Date.now() - ts;
+  if (delta < 2000) return "just now";
+  return `${Math.round(delta / 1000)}s ago`;
+}
+
+function setValue(id, text, cls = "info") {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = `value ${cls}`;
+}
+
+function booleanClass(value) {
+  return value ? "ok" : "crit";
+}
+
+function throughputClass(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "muted";
+  if (bytesPerSecond >= 1_500_000) return "ok";
+  if (bytesPerSecond >= 400_000) return "warn";
+  return "crit";
+}
+
+function latencyClass(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "muted";
+  if (ms <= 400) return "ok";
+  if (ms <= 1200) return "warn";
+  return "crit";
+}
+
+function connectionClass(count) {
+  if (!Number.isFinite(count) || count <= 0) return "muted";
+  if (count <= 4) return "ok";
+  if (count <= 8) return "warn";
+  return "crit";
+}
+
+function playbackClass(state) {
+  if (state === "playing") return "ok";
+  if (state === "buffering") return "warn";
+  if (state === "paused") return "info";
+  return "muted";
+}
+
+function bufferClass(seconds) {
+  if (!Number.isFinite(seconds)) return "muted";
+  if (seconds >= 15) return "ok";
+  if (seconds >= 5) return "warn";
+  return "crit";
+}
+
+function stallClass(count) {
+  if (!Number.isFinite(count)) return "muted";
+  if (count <= 1) return "ok";
+  if (count <= 4) return "warn";
+  return "crit";
+}
+
+function droppedFramesClass(count) {
+  if (count == null || !Number.isFinite(count)) return "muted";
+  if (count <= 10) return "ok";
+  if (count <= 100) return "warn";
+  return "crit";
+}
+
+function renderMetrics(data) {
+  const server = data?.server || {};
+  const throughput = server.throughput || {};
+  const delivery = server.segmentDelivery || {};
+  const player = data?.player || {};
+  const capability = player.capabilityProfile || {};
+
+  statusLine.textContent = data?.generatedAt
+    ? `Updating every 2s. Last server snapshot ${new Date(data.generatedAt).toLocaleTimeString()}.`
+    : "Waiting for data...";
+
+  setValue("throughput-bps", formatRate(throughput.rollingBytesPerSecond), throughputClass(throughput.rollingBytesPerSecond));
+  setValue("throughput-mbps", formatMbps(throughput.rollingBytesPerSecond), throughputClass(throughput.rollingBytesPerSecond));
+  setValue("window-bytes", formatBytes(throughput.windowBytes), "info");
+  setValue("active-proxy", Number.isFinite(server.activeProxyConnections) ? String(server.activeProxyConnections) : "--", connectionClass(server.activeProxyConnections));
+  setValue("total-bytes", formatBytes(server.totalBytesServed), "info");
+
+  setValue("avg-response", formatDurationMs(delivery.avgResponseTimeMs), latencyClass(delivery.avgResponseTimeMs));
+  setValue("p95-response", formatDurationMs(delivery.p95ResponseTimeMs), latencyClass(delivery.p95ResponseTimeMs));
+  setValue("sample-count", Number.isFinite(delivery.sampleCount) ? String(delivery.sampleCount) : "--", "info");
+  setValue("window-size", Number.isFinite(data?.windowMs) ? `${Math.round(data.windowMs / 1000)} s` : "--", "info");
+
+  setValue("playback-state", player.playbackState || "--", playbackClass(player.playbackState));
+  setValue("buffer-health", formatSeconds(player.bufferHealthSeconds), bufferClass(player.bufferHealthSeconds));
+  setValue("stall-count", Number.isFinite(player.stallCount) ? String(player.stallCount) : "--", stallClass(player.stallCount));
+  setValue("stall-duration", formatDurationMs(player.totalStallDurationMs), stallClass(player.stallCount));
+  setValue(
+    "position",
+    Number.isFinite(player.currentTime) || Number.isFinite(player.duration)
+      ? `${formatClock(player.currentTime)} / ${formatClock(player.duration)}`
+      : "--",
+    "info"
+  );
+  setValue("player-updated", formatRelative(player.updatedAt), player.updatedAt ? "info" : "muted");
+
+  setValue("decode-path", player.decodePath || "--", player.decodePath ? "info" : "muted");
+  setValue("dropped-frames", player.droppedFrames == null ? "--" : String(player.droppedFrames), droppedFramesClass(player.droppedFrames));
+  setValue("has-webcodecs", capability.hasWebCodecs ? "Yes" : "No", capability.hasWebCodecs == null ? "muted" : booleanClass(capability.hasWebCodecs));
+  setValue("has-hw-decoder", capability.hasVideoDecoder ? "Yes" : "No", capability.hasVideoDecoder == null ? "muted" : booleanClass(capability.hasVideoDecoder));
+  setValue("worker-decode", capability.enableWorker ? "Yes" : "No", capability.enableWorker == null ? "muted" : booleanClass(capability.enableWorker));
+  setValue("tesla-env", capability.teslaLikeEnv ? "Yes" : "No", capability.teslaLikeEnv == null ? "muted" : capability.teslaLikeEnv ? "warn" : "ok");
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/metrics", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderMetrics(await response.json());
+  } catch (error) {
+    statusLine.textContent = `Metrics fetch failed: ${error.message}`;
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

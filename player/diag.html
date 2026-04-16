@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drive-In Diagnostics</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; color: #eee; font-family: -apple-system, system-ui, sans-serif; padding: 24px; line-height: 1.6; }
+  h1 { font-size: 20px; margin-bottom: 16px; color: #fff; }
+  h2 { font-size: 16px; margin: 20px 0 8px; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #1a1a1a; border-radius: 6px; }
+  .label { color: #999; font-size: 14px; }
+  .value { font-size: 14px; font-weight: 600; }
+  .yes { color: #4ade80; }
+  .no { color: #f87171; }
+  .warn { color: #fbbf24; }
+  .info { color: #60a5fa; }
+  .full-width { grid-column: 1 / -1; }
+  .ua { grid-column: 1 / -1; padding: 8px 12px; background: #1a1a1a; border-radius: 6px; font-size: 12px; word-break: break-all; color: #888; }
+  #codec-results { margin-top: 8px; }
+  .codec-row { display: flex; justify-content: space-between; padding: 4px 12px; font-size: 13px; }
+  .codec-row:nth-child(odd) { background: #1a1a1a; border-radius: 4px; }
+  button { background: #333; color: #eee; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; margin-top: 12px; }
+  button:active { background: #555; }
+  #report { margin-top: 16px; padding: 12px; background: #1a1a1a; border-radius: 6px; font-size: 12px; font-family: monospace; white-space: pre-wrap; word-break: break-all; display: none; }
+</style>
+</head>
+<body>
+
+<h1>Drive-In Browser Diagnostics</h1>
+
+<h2>Browser</h2>
+<div class="grid">
+  <div class="ua" id="ua"></div>
+  <div class="row"><span class="label">Platform</span><span class="value info" id="platform"></span></div>
+  <div class="row"><span class="label">Cores</span><span class="value info" id="cores"></span></div>
+  <div class="row"><span class="label">Memory (GB)</span><span class="value info" id="memory"></span></div>
+  <div class="row"><span class="label">Screen</span><span class="value info" id="screen"></span></div>
+</div>
+
+<h2>Decode Capabilities</h2>
+<div class="grid">
+  <div class="row"><span class="label">WebCodecs VideoDecoder</span><span class="value" id="webcodecs"></span></div>
+  <div class="row"><span class="label">WebCodecs AudioDecoder</span><span class="value" id="webcodecs-audio"></span></div>
+  <div class="row"><span class="label">Hardware Acceleration</span><span class="value" id="hw-accel"></span></div>
+  <div class="row"><span class="label">MediaSource Extensions</span><span class="value" id="mse"></span></div>
+</div>
+
+<h2>WebAssembly</h2>
+<div class="grid">
+  <div class="row"><span class="label">WebAssembly</span><span class="value" id="wasm"></span></div>
+  <div class="row"><span class="label">WASM SIMD</span><span class="value" id="wasm-simd"></span></div>
+  <div class="row"><span class="label">WASM Threads</span><span class="value" id="wasm-threads"></span></div>
+  <div class="row"><span class="label">SharedArrayBuffer</span><span class="value" id="sab"></span></div>
+</div>
+
+<h2>Graphics & Audio</h2>
+<div class="grid">
+  <div class="row"><span class="label">WebGL 2.0</span><span class="value" id="webgl2"></span></div>
+  <div class="row"><span class="label">WebGL 1.0</span><span class="value" id="webgl1"></span></div>
+  <div class="row"><span class="label">GPU Renderer</span><span class="value info" id="gpu"></span></div>
+  <div class="row"><span class="label">AudioWorklet</span><span class="value" id="audioworklet"></span></div>
+  <div class="row full-width"><span class="label">OffscreenCanvas</span><span class="value" id="offscreen"></span></div>
+</div>
+
+<h2>Codec Support (WebCodecs)</h2>
+<div id="codec-results"><span class="label">Testing...</span></div>
+
+<h2>Network</h2>
+<div class="grid">
+  <div class="row"><span class="label">Connection Type</span><span class="value info" id="conn-type"></span></div>
+  <div class="row"><span class="label">Downlink (Mbps)</span><span class="value info" id="conn-speed"></span></div>
+</div>
+
+<button onclick="sendReport()">Send Report to Server</button>
+<span id="send-status" style="margin-left: 12px; font-size: 14px;"></span>
+<div id="report"></div>
+
+<script>
+const results = {};
+
+function set(id, value, cls) {
+  const el = document.getElementById(id);
+  el.textContent = value;
+  el.className = `value ${cls}`;
+  results[id] = value;
+}
+
+function yn(id, bool) {
+  set(id, bool ? "Yes" : "No", bool ? "yes" : "no");
+}
+
+// Browser info
+document.getElementById("ua").textContent = navigator.userAgent;
+results.ua = navigator.userAgent;
+set("platform", navigator.platform || "unknown", "info");
+set("cores", navigator.hardwareConcurrency || "unknown", "info");
+set("memory", navigator.deviceMemory || "unknown", "info");
+set("screen", `${screen.width}x${screen.height} @${devicePixelRatio}x`, "info");
+
+// Decode capabilities
+yn("webcodecs", typeof VideoDecoder !== "undefined");
+yn("webcodecs-audio", typeof AudioDecoder !== "undefined");
+yn("mse", typeof MediaSource !== "undefined");
+
+// WebAssembly
+yn("wasm", typeof WebAssembly !== "undefined");
+yn("sab", typeof SharedArrayBuffer !== "undefined");
+
+// WASM SIMD detection
+try {
+  // Minimal WASM module that uses SIMD: (v128.const)
+  const simdBytes = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,12,11]);
+  const simdMod = new WebAssembly.Module(simdBytes);
+  yn("wasm-simd", !!simdMod);
+} catch {
+  yn("wasm-simd", false);
+}
+
+// WASM Threads (atomics)
+try {
+  const threadBytes = new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,5,4,1,3,1,1,10,11,1,9,0,65,0,65,0,254,16,2,0,26,11]);
+  const threadMod = new WebAssembly.Module(threadBytes);
+  yn("wasm-threads", !!threadMod);
+} catch {
+  yn("wasm-threads", false);
+}
+
+// Graphics
+const c = document.createElement("canvas");
+const gl2 = c.getContext("webgl2");
+const gl1 = !gl2 && c.getContext("webgl");
+yn("webgl2", !!gl2);
+yn("webgl1", !!(gl2 || gl1));
+
+const gl = gl2 || gl1;
+if (gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  set("gpu", dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "unknown", "info");
+} else {
+  set("gpu", "N/A", "no");
+}
+
+yn("offscreen", typeof OffscreenCanvas !== "undefined");
+yn("audioworklet", typeof AudioWorklet !== "undefined" || !!(window.AudioContext && AudioContext.prototype.audioWorklet));
+
+// Hardware acceleration probe via WebCodecs
+async function probeHwAccel() {
+  if (typeof VideoDecoder === "undefined") {
+    set("hw-accel", "N/A (no WebCodecs)", "no");
+    return false;
+  }
+  try {
+    const result = await VideoDecoder.isConfigSupported({
+      codec: "avc1.640028",
+      hardwareAcceleration: "prefer-hardware",
+      width: 1920,
+      height: 1080,
+    });
+    const hw = result.supported;
+    set("hw-accel", hw ? "Yes (H.264 1080p)" : "Software only", hw ? "yes" : "warn");
+    return hw;
+  } catch {
+    set("hw-accel", "Probe failed", "no");
+    return false;
+  }
+}
+
+// Codec support matrix
+async function probeCodecs() {
+  const container = document.getElementById("codec-results");
+  if (typeof VideoDecoder === "undefined") {
+    container.innerHTML = '<span class="label">WebCodecs not available — cannot test codecs</span>';
+    return;
+  }
+
+  const codecs = [
+    { name: "H.264 Baseline", codec: "avc1.42E01E", w: 1280, h: 720 },
+    { name: "H.264 Main 720p", codec: "avc1.4D401F", w: 1280, h: 720 },
+    { name: "H.264 High 1080p", codec: "avc1.640028", w: 1920, h: 1080 },
+    { name: "H.265 (HEVC) Main", codec: "hev1.1.6.L120.B0", w: 1920, h: 1080 },
+    { name: "VP9", codec: "vp09.00.31.08", w: 1920, h: 1080 },
+    { name: "AV1 Main", codec: "av01.0.08M.08", w: 1920, h: 1080 },
+  ];
+
+  container.innerHTML = "";
+
+  for (const c of codecs) {
+    const row = document.createElement("div");
+    row.className = "codec-row";
+
+    let hwStatus = "—", swStatus = "—";
+
+    // Hardware
+    try {
+      const hw = await VideoDecoder.isConfigSupported({
+        codec: c.codec, hardwareAcceleration: "prefer-hardware",
+        width: c.w, height: c.h,
+      });
+      hwStatus = hw.supported ? "✓ HW" : "✗";
+    } catch { hwStatus = "✗"; }
+
+    // Software
+    try {
+      const sw = await VideoDecoder.isConfigSupported({
+        codec: c.codec, hardwareAcceleration: "prefer-software",
+        width: c.w, height: c.h,
+      });
+      swStatus = sw.supported ? "✓ SW" : "✗";
+    } catch { swStatus = "✗"; }
+
+    const supported = hwStatus.startsWith("✓") || swStatus.startsWith("✓");
+    row.innerHTML = `
+      <span class="label">${c.name}</span>
+      <span>
+        <span class="${hwStatus.startsWith("✓") ? "yes" : "no"}">${hwStatus}</span>
+        &nbsp;/&nbsp;
+        <span class="${swStatus.startsWith("✓") ? "yes" : "no"}">${swStatus}</span>
+      </span>
+    `;
+    container.appendChild(row);
+    results[`codec_${c.name}`] = `hw=${hwStatus} sw=${swStatus}`;
+  }
+}
+
+// Network
+const conn = navigator.connection || navigator.mozConnection;
+set("conn-type", conn?.effectiveType || "unknown", "info");
+set("conn-speed", conn?.downlink || "unknown", "info");
+
+// Run async probes, then auto-upload once
+Promise.all([probeHwAccel(), probeCodecs()]).then(() => {
+  // Auto-send report once per browser session
+  if (!sessionStorage.getItem("diag-sent")) {
+    sendReport().then(() => sessionStorage.setItem("diag-sent", "1"));
+  } else {
+    document.getElementById("send-status").textContent = "Already sent this session";
+    document.getElementById("send-status").className = "info";
+  }
+});
+
+function buildReport() {
+  const lines = [`Drive-In Browser Diagnostics`, `Date: ${new Date().toISOString()}`, `UA: ${navigator.userAgent}`, ""];
+  for (const [k, v] of Object.entries(results)) {
+    if (k === "ua") continue;
+    lines.push(`${k}: ${v}`);
+  }
+  return lines.join("\n");
+}
+
+async function sendReport() {
+  const status = document.getElementById("send-status");
+  const report = buildReport();
+  const el = document.getElementById("report");
+  el.textContent = report;
+  el.style.display = "block";
+
+  status.textContent = "Sending...";
+  status.className = "warn";
+  try {
+    const res = await fetch("/api/diag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report, results, ua: navigator.userAgent, ts: Date.now() }),
+    });
+    if (res.ok) {
+      status.textContent = "Sent!";
+      status.className = "yes";
+    } else {
+      status.textContent = "Failed";
+      status.className = "no";
+    }
+  } catch {
+    status.textContent = "Failed — server unreachable";
+    status.className = "no";
+  }
+}
+</script>
+</body>
+</html>

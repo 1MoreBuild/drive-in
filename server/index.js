@@ -120,9 +120,108 @@ const state = {
 };
 // Live player state reported via WebSocket
 let playerState = {};
+let latestPlayerMetrics = null;
 // Current non-Plex subtitle tracks (from yt-dlp)
 let currentSubtitles = []; // [{ lang, name, url, auto, filename }]
 let currentSubsCacheKey = null;
+
+// --- Real-time metrics ----------------------------------------------
+
+const METRICS_WINDOW_MS = 60_000;
+const metricsState = {
+  byteSamples: [],
+  responseTimes: [],
+  activeProxyConnections: 0,
+  totalBytesServed: 0,
+};
+
+function pruneMetrics(now = Date.now()) {
+  const cutoff = now - METRICS_WINDOW_MS;
+  while (metricsState.byteSamples.length && metricsState.byteSamples[0].ts < cutoff) {
+    metricsState.byteSamples.shift();
+  }
+  while (metricsState.responseTimes.length && metricsState.responseTimes[0].ts < cutoff) {
+    metricsState.responseTimes.shift();
+  }
+}
+
+function percentile(values, p) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1));
+  return sorted[index];
+}
+
+function beginProxyMetric(endpoint) {
+  metricsState.activeProxyConnections++;
+  return {
+    endpoint,
+    startedAt: Date.now(),
+    bytes: 0,
+    finished: false,
+  };
+}
+
+function recordProxyMetricBytes(metric, bytes) {
+  if (!metric || metric.finished || !Number.isFinite(bytes) || bytes <= 0) return;
+  metric.bytes += bytes;
+  metricsState.byteSamples.push({ ts: Date.now(), bytes, endpoint: metric.endpoint });
+  pruneMetrics();
+}
+
+function finishProxyMetric(metric) {
+  if (!metric || metric.finished) return;
+  metric.finished = true;
+  metricsState.activeProxyConnections = Math.max(0, metricsState.activeProxyConnections - 1);
+  metricsState.totalBytesServed += metric.bytes;
+  metricsState.responseTimes.push({
+    ts: Date.now(),
+    durationMs: Date.now() - metric.startedAt,
+    endpoint: metric.endpoint,
+  });
+  pruneMetrics();
+}
+
+function trackProxyMetricLifecycle(res, metric) {
+  res.once("finish", () => finishProxyMetric(metric));
+  res.once("close", () => finishProxyMetric(metric));
+}
+
+function getMetricsSnapshot() {
+  pruneMetrics();
+  const bytesInWindow = metricsState.byteSamples.reduce((sum, sample) => sum + sample.bytes, 0);
+  const durations = metricsState.responseTimes.map((sample) => sample.durationMs);
+  const playerMetrics = latestPlayerMetrics
+    ? {
+        ...latestPlayerMetrics,
+        currentTime: latestPlayerMetrics.currentTime ?? playerState.currentTime ?? null,
+        duration: latestPlayerMetrics.duration ?? playerState.duration ?? null,
+        isPlaying: latestPlayerMetrics.isPlaying ?? playerState.isPlaying ?? null,
+        isMuted: latestPlayerMetrics.isMuted ?? playerState.isMuted ?? null,
+      }
+    : Object.keys(playerState).length
+      ? { ...playerState, playbackState: playerState.isPlaying ? "playing" : "paused" }
+      : null;
+
+  return {
+    generatedAt: Date.now(),
+    windowMs: METRICS_WINDOW_MS,
+    server: {
+      throughput: {
+        rollingBytesPerSecond: bytesInWindow / (METRICS_WINDOW_MS / 1000),
+        windowBytes: bytesInWindow,
+      },
+      segmentDelivery: {
+        sampleCount: durations.length,
+        avgResponseTimeMs: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : 0,
+        p95ResponseTimeMs: percentile(durations, 0.95),
+      },
+      activeProxyConnections: metricsState.activeProxyConnections,
+      totalBytesServed: metricsState.totalBytesServed,
+    },
+    player: playerMetrics,
+  };
+}
 
 function broadcast(msg) {
   const data = JSON.stringify(msg);
@@ -771,7 +870,7 @@ async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" 
 
 // --- Stream piping helper --------------------------------------------
 
-async function pipeUpstream(upstream, req, res, { passStatus = true } = {}) {
+async function pipeUpstream(upstream, req, res, { passStatus = true, onChunk } = {}) {
   if (passStatus) res.status(upstream.status);
   for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {
     const v = upstream.headers.get(h);
@@ -781,6 +880,11 @@ async function pipeUpstream(upstream, req, res, { passStatus = true } = {}) {
 
   const { Readable } = await import("stream");
   const nodeStream = Readable.fromWeb(upstream.body);
+  if (onChunk) {
+    nodeStream.on("data", (chunk) => {
+      onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    });
+  }
   nodeStream.pipe(res);
   nodeStream.on("error", () => { if (!res.writableEnded) res.end(); });
   req.on("close", () => nodeStream.destroy());
@@ -790,6 +894,8 @@ async function pipeUpstream(upstream, req, res, { passStatus = true } = {}) {
 app.get("/api/proxy", async (req, res) => {
   const entry = proxyMap.get(req.query.id);
   if (!entry) return res.status(404).json({ error: "Unknown stream" });
+  const metric = beginProxyMetric("/api/proxy");
+  trackProxyMetricLifecycle(res, metric);
 
   try {
     const headers = proxyHeaders(entry);
@@ -805,7 +911,9 @@ app.get("/api/proxy", async (req, res) => {
         upstream = await fetchWithRetry(freshEntry.url, { headers: freshHeaders, redirect: "follow" }, { label: "proxy-reresolved" });
       }
     }
-    await pipeUpstream(upstream, req, res);
+    await pipeUpstream(upstream, req, res, {
+      onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
+    });
   } catch (e) {
     if (!res.headersSent) res.status(502).json({ error: e.message });
   }
@@ -836,6 +944,8 @@ const HLS_MAX_BANDWIDTH = 4800_000;
 app.get("/api/proxy/hls", async (req, res) => {
   const entry = proxyMap.get(req.query.id);
   if (!entry) return res.status(404).json({ error: "Unknown stream" });
+  const metric = beginProxyMetric("/api/proxy/hls");
+  trackProxyMetricLifecycle(res, metric);
 
   try {
     const upstream = await fetch(entry.url, { headers: proxyHeaders(entry), redirect: "follow" });
@@ -874,6 +984,7 @@ app.get("/api/proxy/hls", async (req, res) => {
       return isM3u8 ? `/api/proxy/hls?id=${id}` : `/api/proxy?id=${id}`;
     });
 
+    recordProxyMetricBytes(metric, Buffer.byteLength(body));
     res.set("Content-Type", "application/vnd.apple.mpegurl");
     res.set("Access-Control-Allow-Origin", "*");
     res.send(body);
@@ -1491,12 +1602,25 @@ app.post("/api/dev/log", (req, res) => {
   log.debug({ src: "tesla" }, entry.msg);
   res.json({ ok: true });
 });
+app.post("/api/dev/decode-log", (req, res) => {
+  log.info({ decode: req.body }, "Player decode path report");
+  res.json({ ok: true });
+});
 app.get("/api/dev/log", (_req, res) => {
   res.json(devLog);
 });
 
 app.get("/api/dev/player", (_req, res) => {
   res.json(playerState);
+});
+
+app.post("/api/metrics/player", (req, res) => {
+  latestPlayerMetrics = { ...req.body, updatedAt: Date.now() };
+  res.json({ ok: true });
+});
+
+app.get("/api/metrics", (_req, res) => {
+  res.json(getMetricsSnapshot());
 });
 
 // Current status
@@ -1614,6 +1738,20 @@ const spaIndexPath = resolve(serveDist ? playerDist : playerSrc, "index.html");
 app.get(/^\/(play|show\/\d+)/, (_req, res) => {
   res.set("Cache-Control", "no-store");
   res.sendFile(spaIndexPath);
+});
+
+// --- Diagnostics upload ----------------------------------------------
+
+const DIAG_DIR = resolve(__dirname, "../.diag-reports");
+mkdirSync(DIAG_DIR, { recursive: true });
+
+app.post("/api/diag", (req, res) => {
+  const data = req.body;
+  if (!data) return res.status(400).json({ error: "empty" });
+  const filename = `diag-${Date.now()}.json`;
+  writeFileSync(resolve(DIAG_DIR, filename), JSON.stringify(data, null, 2));
+  log.info({ filename }, "Diagnostic report saved");
+  res.json({ ok: true, filename });
 });
 
 // --- Start -----------------------------------------------------------
