@@ -17,6 +17,8 @@ const btnSubs = document.getElementById("btn-subs");
 const subsPanel = document.getElementById("subs-panel");
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
+const audioGainSlider = document.getElementById("audio-gain-slider");
+const audioGainValue = document.getElementById("audio-gain-value");
 export const mediaTitle = document.getElementById("media-title");
 
 // --- Controls visibility (auto-hide) ---------------------------------
@@ -38,13 +40,29 @@ function hideControls() {
 
 // --- Time / progress display -----------------------------------------
 
+let lastCurrentTimeText = "";
+let lastDurationText = "";
+let lastProgressPct = "";
+
 export function updateTimeDisplay() {
-  timeCurrent.textContent = fmt(state.currentTime);
-  timeDuration.textContent = fmt(state.duration);
+  const nextCurrentTimeText = fmt(state.currentTime);
+  const nextDurationText = fmt(state.duration);
+
+  if (nextCurrentTimeText !== lastCurrentTimeText) {
+    lastCurrentTimeText = nextCurrentTimeText;
+    timeCurrent.textContent = nextCurrentTimeText;
+  }
+  if (nextDurationText !== lastDurationText) {
+    lastDurationText = nextDurationText;
+    timeDuration.textContent = nextDurationText;
+  }
 }
 
 export function updateProgress(fraction) {
-  const pct = `${(fraction * 100).toFixed(3)}%`;
+  const clampedFraction = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0;
+  const pct = `${(clampedFraction * 100).toFixed(3)}%`;
+  if (pct === lastProgressPct) return;
+  lastProgressPct = pct;
   progressPlayed.style.width = pct;
   progressScrubber.style.left = pct;
 }
@@ -59,6 +77,13 @@ export function updatePlayButton() {
 
 export function updateVolumeButton() {
   btnVolume.classList.toggle("muted", state.isMuted);
+}
+
+export function updateAudioGainUI() {
+  if (!audioGainSlider || !audioGainValue) return;
+  const gain = Number(state.audioGain || 2);
+  audioGainSlider.value = String(gain);
+  audioGainValue.textContent = `${gain.toFixed(1)}x`;
 }
 
 // --- Buffering state -------------------------------------------------
@@ -91,7 +116,7 @@ export function isDraggingProgress() {
   return isDragging;
 }
 
-export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVolume }) {
+export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVolume, onSetAudioGain }) {
   // Pointer movement shows controls
   app.addEventListener("pointermove", showControls);
   app.addEventListener("pointerdown", showControls);
@@ -115,6 +140,18 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     onSetVolume(state.isMuted ? 0 : 1);
     updateVolumeButton();
   });
+
+  if (audioGainSlider) {
+    for (const eventName of ["click", "pointerdown"]) {
+      audioGainSlider.addEventListener(eventName, (e) => e.stopPropagation());
+    }
+    audioGainSlider.addEventListener("input", (e) => {
+      const gain = Number(e.target.value);
+      onSetAudioGain(gain);
+      updateAudioGainUI();
+      showControls();
+    });
+  }
 
   // Subtitle panel toggle
   btnSubs.addEventListener("click", (e) => {
@@ -210,4 +247,6 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     isDragging = false;
     progressWrap.classList.remove("dragging");
   });
+
+  updateAudioGainUI();
 }
