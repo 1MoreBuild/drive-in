@@ -4,7 +4,10 @@ import { WebSocketServer } from "ws";
 import { execFile, execSync, spawn } from "child_process";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
-import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { createHash } from "crypto";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
 import httpProxy from "http-proxy";
 import log from "./logger.js";
@@ -12,6 +15,18 @@ import log from "./logger.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
 const PLEX_URL = process.env.PLEX_URL || "http://localhost:32400";
+const PROXY_TTL_MS = 3600_000;
+const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
+const SEGMENT_CACHE_DIR = resolve(__dirname, "../.segment-cache");
+const SEGMENT_CACHE_MAX_BYTES = (() => {
+  const parsed = Number(process.env.SEGMENT_CACHE_MAX_BYTES);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  return 20 * 1024 * 1024 * 1024;
+})();
+const SEGMENT_CACHE_MIN_BYTES = 10 * 1024;
+const SEGMENT_CACHE_TARGET_BYTES = Math.floor(SEGMENT_CACHE_MAX_BYTES * 0.9);
+const SEGMENT_CACHE_EVICT_DEBOUNCE_MS = 60_000;
+const SEGMENT_CACHE_MAX_PREFETCHES = 5;
 const PLEX_TOKEN = process.env.PLEX_TOKEN || (() => {
   try { return execSync("defaults read com.plexapp.plexmediaserver PlexOnlineToken 2>/dev/null").toString().trim(); }
   catch { return ""; }
@@ -121,6 +136,7 @@ const state = {
 // Live player state reported via WebSocket
 let playerState = {};
 let latestPlayerMetrics = null;
+let latestStutterLog = null;
 // Current non-Plex subtitle tracks (from yt-dlp)
 let currentSubtitles = []; // [{ lang, name, url, auto, filename }]
 let currentSubsCacheKey = null;
@@ -128,6 +144,8 @@ let currentSubsCacheKey = null;
 // --- Real-time metrics ----------------------------------------------
 
 const METRICS_WINDOW_MS = 60_000;
+const SLOW_PROXY_RESPONSE_MS = 2_000;
+const LOW_PROXY_THROUGHPUT_BPS = 500 * 1024;
 const metricsState = {
   byteSamples: [],
   responseTimes: [],
@@ -159,7 +177,59 @@ function beginProxyMetric(endpoint) {
     startedAt: Date.now(),
     bytes: 0,
     finished: false,
+    proxyId: null,
+    url: null,
+    originalUrl: null,
+    range: null,
+    upstreamStatus: null,
+    upstreamContentLength: null,
+    upstreamResponseTimeMs: null,
+    error: null,
   };
+}
+
+function truncateUrl(url, max = 200) {
+  if (!url) return null;
+  return url.length > max ? `${url.slice(0, max)}...` : url;
+}
+
+function proxyEntryAgeMs(entry, now = Date.now()) {
+  const registeredAt = entry?.ts || entry?.createdAt || entry?.lastAccessAt;
+  return registeredAt ? now - registeredAt : null;
+}
+
+function setProxyMetricRequest(metric, req, entry, proxyId, range = null) {
+  if (!metric) return;
+  metric.proxyId = proxyId || null;
+  metric.url = entry?.url || null;
+  metric.originalUrl = entry?.originalUrl || null;
+  metric.range = range || req.headers.range || null;
+}
+
+function setProxyMetricUpstream(metric, upstream, upstreamResponseTimeMs = null) {
+  if (!metric || !upstream) return;
+  metric.upstreamStatus = upstream.status;
+  const contentLength = upstream.headers?.get?.("content-length");
+  metric.upstreamContentLength = contentLength ? Number(contentLength) : null;
+  metric.upstreamResponseTimeMs = upstreamResponseTimeMs;
+}
+
+function logProxyUrlHealth({ level = "warn", proxyId, entry, status = null, err = null, event }) {
+  const now = Date.now();
+  const payload = {
+    event,
+    proxyId,
+    status,
+    originalUrl: truncateUrl(entry?.originalUrl || entry?.url, 80),
+    proxyEntryAgeMs: proxyEntryAgeMs(entry, now),
+    err: err ? (err.message || String(err)) : status ? `upstream_${status}` : null,
+  };
+  log[level](payload, "Proxy URL health degraded");
+}
+
+function warnOnProxyStatus(proxyId, entry, upstream, event = "upstream_status") {
+  if (!upstream || (upstream.status !== 403 && upstream.status !== 410)) return;
+  logProxyUrlHealth({ proxyId, entry, status: upstream.status, event });
 }
 
 function recordProxyMetricBytes(metric, bytes) {
@@ -174,12 +244,36 @@ function finishProxyMetric(metric) {
   metric.finished = true;
   metricsState.activeProxyConnections = Math.max(0, metricsState.activeProxyConnections - 1);
   metricsState.totalBytesServed += metric.bytes;
+  const now = Date.now();
+  const durationMs = now - metric.startedAt;
   metricsState.responseTimes.push({
-    ts: Date.now(),
-    durationMs: Date.now() - metric.startedAt,
+    ts: now,
+    durationMs,
     endpoint: metric.endpoint,
   });
   pruneMetrics();
+
+  const bytesPerSecond = durationMs > 0 ? metric.bytes / (durationMs / 1000) : null;
+  const degraded = durationMs > SLOW_PROXY_RESPONSE_MS
+    || (metric.upstreamStatus != null && metric.upstreamStatus !== 200)
+    || (bytesPerSecond != null && metric.bytes > 0 && bytesPerSecond < LOW_PROXY_THROUGHPUT_BPS)
+    || !!metric.error;
+  const payload = {
+    endpoint: metric.endpoint,
+    proxyId: metric.proxyId,
+    url: truncateUrl(metric.url, 300),
+    originalUrl: truncateUrl(metric.originalUrl, 120),
+    range: metric.range,
+    upstreamStatus: metric.upstreamStatus,
+    upstreamContentLength: metric.upstreamContentLength,
+    upstreamResponseTimeMs: metric.upstreamResponseTimeMs,
+    responseTimeMs: durationMs,
+    bytesServed: metric.bytes,
+    bytesPerSecond,
+    totalBytesServed: metricsState.totalBytesServed,
+    err: metric.error,
+  };
+  log[degraded ? "warn" : "info"](payload, "Proxy request completed");
 }
 
 function trackProxyMetricLifecycle(res, metric) {
@@ -191,6 +285,7 @@ function getMetricsSnapshot() {
   pruneMetrics();
   const bytesInWindow = metricsState.byteSamples.reduce((sum, sample) => sum + sample.bytes, 0);
   const durations = metricsState.responseTimes.map((sample) => sample.durationMs);
+  const cacheHitTotal = segmentCacheState.hits + segmentCacheState.misses;
   const playerMetrics = latestPlayerMetrics
     ? {
         ...latestPlayerMetrics,
@@ -215,6 +310,19 @@ function getMetricsSnapshot() {
         sampleCount: durations.length,
         avgResponseTimeMs: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : 0,
         p95ResponseTimeMs: percentile(durations, 0.95),
+      },
+      segmentCache: {
+        sizeBytes: segmentCacheState.sizeBytes,
+        maxBytes: SEGMENT_CACHE_MAX_BYTES,
+        hits: segmentCacheState.hits,
+        misses: segmentCacheState.misses,
+        hitRatio: cacheHitTotal ? segmentCacheState.hits / cacheHitTotal : 0,
+        logicalKeyHits: segmentCacheState.logicalKeyHits,
+        hashKeyHits: segmentCacheState.hashKeyHits,
+        prefetchCount: segmentCacheState.prefetchCount,
+        prefetchQueueDepth: segmentCachePrefetchQueue.length + segmentCachePrefetchActive,
+        evictionCount: segmentCacheState.evictionCount,
+        cacheUtilizationPercent: getSegmentCacheUtilizationPercent(),
       },
       activeProxyConnections: metricsState.activeProxyConnections,
       totalBytesServed: metricsState.totalBytesServed,
@@ -254,7 +362,7 @@ function ytdlpJson(url) {
         "-f", FORMAT_SELECTOR,
         url,
       ],
-      { timeout: 30_000 },
+      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
         try { resolve(JSON.parse(stdout)); }
@@ -373,82 +481,342 @@ for (const d of readdirSync(hlsBase)) {
 }
 
 let ffmpegProc = null;
-let currentHlsDir = null;
-
 let ytdlpProc = null;
+let currentHlsDir = null;
+let currentTranscodeDir = null;
+const DASH_TRANSCODE = String(process.env.DASH_TRANSCODE ?? "").trim().toLowerCase() !== "false";
+const DASH_TRANSCODE_STARTUP_TIMEOUT_MS = 18_000;
 
-function killPipeline() {
-  if (ytdlpProc) { ytdlpProc.kill("SIGTERM"); ytdlpProc = null; }
-  if (ffmpegProc) { ffmpegProc.kill("SIGTERM"); ffmpegProc = null; }
-  if (currentHlsDir) {
-    try { rmSync(currentHlsDir, { recursive: true, force: true }); } catch {}
-    currentHlsDir = null;
+let transcodeState = {
+  sessionId: null,
+  startedAt: null,
+  videoUrl: null,
+  audioUrl: null,
+  readyAt: null,
+  segmentCount: 0,
+  readyCheckTimer: null,
+  errors: [],
+};
+
+function normalizeHeaderValue(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value.filter(Boolean).map((v) => String(v).trim()).join("; ");
+  return String(value).trim();
+}
+
+function normalizeHeaders(headers) {
+  const normalized = {};
+  if (!headers || typeof headers !== "object") return normalized;
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    if (!rawName) continue;
+    const name = String(rawName).trim();
+    const value = normalizeHeaderValue(rawValue);
+    if (!name || !value) continue;
+    normalized[name] = value;
+  }
+  return normalized;
+}
+
+function hasHeader(normalizedHeaders, targetName) {
+  const key = targetName.toLowerCase();
+  return Object.keys(normalizedHeaders).some((k) => k.toLowerCase() === key);
+}
+
+function setHeaderIfMissing(normalizedHeaders, targetName, value) {
+  if (!hasHeader(normalizedHeaders, targetName)) {
+    normalizedHeaders[targetName] = value;
   }
 }
 
-function startPipeline(originalUrl, formatSelector) {
-  killPipeline();
+function buildFfmpegHeadersArg(url, sourceHeaders) {
+  const headers = normalizeHeaders(sourceHeaders);
+  if (/googlevideo\.com/.test(url || "")) {
+    setHeaderIfMissing(headers, "Referer", "https://www.youtube.com/");
+    setHeaderIfMissing(headers, "Origin", "https://www.youtube.com");
+  }
+  if (/bilivideo\.com/.test(url || "")) {
+    setHeaderIfMissing(headers, "Referer", "https://www.bilibili.com/");
+  }
+  setHeaderIfMissing(headers, "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36");
+  setHeaderIfMissing(headers, "Accept", "*/*");
+  setHeaderIfMissing(headers, "Accept-Language", "en-US,en;q=0.8");
 
-  const sessionId = `s-${Date.now()}`;
-  currentHlsDir = resolve(hlsBase, sessionId);
-  mkdirSync(currentHlsDir, { recursive: true });
+  const headerLines = Object.entries(headers)
+    .filter(([, value]) => typeof value === "string" && value.length > 0)
+    .map(([name, value]) => `${name}: ${value}`)
+    .join("\\r\\n");
+  return headerLines ? `${headerLines}\\r\\n` : null;
+}
 
-  const hlsOutput = resolve(currentHlsDir, "stream.m3u8");
+function resetTranscodeState() {
+  if (transcodeState.readyCheckTimer) {
+    clearInterval(transcodeState.readyCheckTimer);
+  }
+  transcodeState = {
+    sessionId: null,
+    startedAt: null,
+    videoUrl: null,
+    audioUrl: null,
+    readyAt: null,
+    segmentCount: 0,
+    readyCheckTimer: null,
+    errors: [],
+  };
+}
 
-  // yt-dlp downloads + merges, pipes to ffmpeg for HLS segmentation
-  const ytdlpArgs = [
-    ...YTDLP_COMMON,
-    "--no-warnings", "--no-playlist",
-    "-f", formatSelector,
-    "--merge-output-format", "mp4",
-    "-o", "-",
-    originalUrl,
-  ];
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function countTranscodeSegments(dir) {
+  try {
+    return readdirSync(dir).filter((file) => /\.m4s$/i.test(file)).length;
+  } catch {
+    return 0;
+  }
+}
+
+function isTranscodeStartupReady(dir) {
+  const playlistPath = resolve(dir, "playlist.m3u8");
+  const initPath = resolve(dir, "init.mp4");
+  if (!existsSync(playlistPath) || !existsSync(initPath)) return false;
+  return countTranscodeSegments(dir) >= 2;
+}
+
+async function waitForTranscodePlaylist(playlistPath, { timeoutMs = DASH_TRANSCODE_STARTUP_TIMEOUT_MS, pollMs = 120 } = {}) {
+  const dir = dirname(playlistPath);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (isTranscodeStartupReady(dir)) {
+      try {
+        const body = readFileSync(playlistPath, "utf-8");
+        if (body.includes("#EXTM3U") && body.includes("init.mp4") && body.includes(".m4s")) {
+          return { ready: true, body, segmentCount: countTranscodeSegments(dir) };
+        }
+      } catch {}
+    }
+    if (!transcodeState.process && !existsSync(playlistPath)) {
+      return { ready: false, timedOut: true };
+    }
+    await sleep(pollMs);
+  }
+  return { ready: false, timedOut: true };
+}
+
+function getCurrentTranscodeSnapshot() {
+  return {
+    process: ffmpegProc,
+    hlsDir: currentHlsDir,
+    transcodeDir: currentTranscodeDir,
+    state: transcodeState,
+  };
+}
+
+async function stopTranscodeSnapshot(snapshot, { clearCurrentRefs = false, timeoutMs = 5000 } = {}) {
+  if (!snapshot) return;
+
+  const { process: proc, hlsDir, transcodeDir, state } = snapshot;
+
+  if (state?.readyCheckTimer) {
+    clearInterval(state.readyCheckTimer);
+    state.readyCheckTimer = null;
+  }
+
+  if (proc && proc.exitCode == null && proc.signalCode == null) {
+    let exited = false;
+    const exitPromise = new Promise((resolve) => {
+      const finish = () => {
+        if (exited) return;
+        exited = true;
+        resolve();
+      };
+      proc.once("close", finish);
+      proc.once("error", finish);
+    });
+
+    try { proc.kill("SIGTERM"); } catch {}
+    await Promise.race([exitPromise, sleep(timeoutMs)]);
+    if (!exited && proc.exitCode == null && proc.signalCode == null) {
+      try { proc.kill("SIGKILL"); } catch {}
+      await Promise.race([exitPromise, sleep(2000)]);
+    }
+  }
+
+  const dirToClean = hlsDir || transcodeDir;
+  if (dirToClean) {
+    try { rmSync(dirToClean, { recursive: true, force: true }); } catch {}
+  }
+
+  if (clearCurrentRefs) {
+    if (ffmpegProc === proc) ffmpegProc = null;
+    if (currentHlsDir === hlsDir) currentHlsDir = null;
+    if (currentTranscodeDir === transcodeDir) currentTranscodeDir = null;
+    if (transcodeState === state) resetTranscodeState();
+  }
+}
+
+function startTranscodePipeline(videoUrl, audioUrl, { videoHeaders = null, audioHeaders = null } = {}) {
+  const previousPipeline = getCurrentTranscodeSnapshot();
+
+  const sessionId = `t-${Date.now()}-${Math.floor(Math.random() * 10_000)}`;
+  const transcodeDir = resolve(hlsBase, sessionId);
+  mkdirSync(transcodeDir, { recursive: true });
+  const playlistPath = resolve(transcodeDir, "playlist.m3u8");
+  const initFilename = "init.mp4";
+  const pipelineState = {
+    sessionId,
+    startedAt: Date.now(),
+    videoUrl,
+    audioUrl,
+    readyAt: null,
+    segmentCount: 0,
+    readyCheckTimer: null,
+    errors: [],
+    process: null,
+  };
 
   const ffmpegArgs = [
-    "-hide_banner", "-loglevel", "warning",
-    "-i", "pipe:0",
-    "-map", "0:v:0", "-map", "0:a:0",
-    "-c:v", "copy",
+    "-hide_banner",
+    "-loglevel", "info",
+    ...(buildFfmpegHeadersArg(videoUrl, videoHeaders) ? ["-headers", buildFfmpegHeadersArg(videoUrl, videoHeaders)] : []),
+    "-i", videoUrl,
+    ...(buildFfmpegHeadersArg(audioUrl, audioHeaders) ? ["-headers", buildFfmpegHeadersArg(audioUrl, audioHeaders)] : []),
+    "-i", audioUrl,
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "libx264", "-preset", "veryfast",
+    "-profile:v", "main", "-level", "4.0", "-crf", "23",
+    "-maxrate", "4800k", "-bufsize", "9600k",
     "-c:a", "aac", "-b:a", "192k",
     "-f", "hls",
-    "-hls_time", "4",
+    "-hls_time", "6",
     "-hls_list_size", "0",
-    "-hls_segment_filename", resolve(currentHlsDir, "seg%03d.ts"),
-    hlsOutput,
+    "-hls_segment_type", "fmp4",
+    "-hls_fmp4_init_filename", initFilename,
+    "-hls_segment_filename", resolve(transcodeDir, "seg%d.m4s"),
+    playlistPath,
   ];
 
-  log.info("Pipeline starting: yt-dlp | ffmpeg");
-  ytdlpProc = spawn("yt-dlp", ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  ffmpegProc = spawn("ffmpeg", ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  log.info({ sessionId, url: truncateUrl(videoUrl, 200), urlAudio: truncateUrl(audioUrl, 200) }, "Starting DASH split transcoding pipeline");
 
-  // Pipe yt-dlp stdout → ffmpeg stdin
-  ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+  let proc;
+  try {
+    proc = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    rmSync(transcodeDir, { recursive: true, force: true });
+    throw new Error(`Failed to launch ffmpeg: ${error.message}`);
+  }
 
-  ytdlpProc.stderr.on("data", (d) => {
-    const msg = d.toString().trim();
-    if (msg) log.debug({ src: "yt-dlp" }, msg);
-  });
-  ffmpegProc.stderr.on("data", (d) => {
-    const msg = d.toString().trim();
-    if (msg) log.debug({ src: "ffmpeg" }, msg);
+  pipelineState.process = proc;
+  ffmpegProc = proc;
+  currentHlsDir = transcodeDir;
+  currentTranscodeDir = transcodeDir;
+  transcodeState = pipelineState;
+
+  const onProgressLine = (line) => {
+    const segmentMatch = line.match(/Opening ["']([^"']*\.m4s)["']/i);
+    if (segmentMatch) {
+      pipelineState.segmentCount += 1;
+      log.info({
+        sessionId,
+        segment: segmentMatch[1].split("/").at(-1),
+        segmentIndex: pipelineState.segmentCount,
+      }, "Transcode segment generated");
+      return;
+    }
+
+    if (line.includes("frame=")) {
+      const frameMatch = line.match(/frame=\s*(\d+)\s*time=([^\s]+)/);
+      const progress = frameMatch ? { frame: Number(frameMatch[1]), time: frameMatch[2] } : { rawLine: line.trim() };
+      log.debug({ sessionId, ...progress }, "Transcode progress");
+    }
+
+    if (line.toLowerCase().includes("error") || line.toLowerCase().includes("failed")) {
+      log.error({ sessionId, line: line.trim() }, "Transcode stderr");
+    }
+  };
+
+  proc.stderr.on("data", (chunk) => {
+    const payload = chunk.toString("utf-8");
+    for (const line of payload.split(/\r?\n/)) {
+      if (!line) continue;
+      onProgressLine(line);
+    }
   });
 
-  ytdlpProc.on("close", (code) => {
-    log.info({ exitCode: code }, "yt-dlp exited");
-    ytdlpProc = null;
-    // Close ffmpeg stdin so it finishes writing the last segments
-    try { ffmpegProc?.stdin.end(); } catch {}
+  proc.on("error", (error) => {
+    pipelineState.errors.push(error.message || String(error));
+    log.error({ sessionId, err: error.message }, "DASH transcode process spawn error");
   });
-  ffmpegProc.on("close", (code) => {
-    log.info({ exitCode: code }, "ffmpeg exited");
+
+  proc.on("close", (code, signal) => {
+    if (!pipelineState.readyAt && code !== 0) {
+      log.error({ sessionId, exitCode: code, signal }, "DASH transcode process exited before playback ready");
+      if (code === null && signal === "SIGTERM") {
+        log.info({ sessionId }, "DASH transcode process stopped");
+      }
+    }
+    if (pipelineState.readyAt) {
+      log.info({ sessionId, exitCode: code, signal }, "DASH transcode process finished");
+    }
+    if (ffmpegProc === proc) ffmpegProc = null;
+    if (transcodeState === pipelineState) transcodeState.process = null;
+    if (pipelineState.readyCheckTimer) {
+      clearInterval(pipelineState.readyCheckTimer);
+      pipelineState.readyCheckTimer = null;
+    }
+  });
+
+  const readyCheck = async () => {
+    if (!pipelineState.process) return;
+    if (pipelineState.readyAt) return;
+    if (isTranscodeStartupReady(transcodeDir)) {
+      pipelineState.readyAt = Date.now();
+      if (pipelineState.readyCheckTimer) {
+        clearInterval(pipelineState.readyCheckTimer);
+        pipelineState.readyCheckTimer = null;
+      }
+      log.info({ sessionId }, "DASH transcode is ready for playback");
+    }
+  };
+  pipelineState.readyCheckTimer = setInterval(readyCheck, 250);
+  pipelineState.readyCheckTimer.unref();
+
+  if (previousPipeline.process || previousPipeline.hlsDir || previousPipeline.transcodeDir) {
+    void stopTranscodeSnapshot(previousPipeline).catch((error) => {
+      log.warn({ err: error?.message || String(error) }, "Failed to stop previous DASH transcode");
+    });
+  }
+
+  return {
+    sessionId,
+    sessionDir: transcodeDir,
+    playlistPath,
+    process: proc,
+  };
+}
+
+async function killPipeline() {
+  const snapshot = getCurrentTranscodeSnapshot();
+  if (!snapshot.process && !snapshot.hlsDir && !snapshot.transcodeDir) {
+    resetTranscodeState();
+    currentHlsDir = null;
+    currentTranscodeDir = null;
     ffmpegProc = null;
-    // Pipeline complete — HLS now has #EXT-X-ENDLIST, switch player to VOD mode
-    broadcast({ type: "pipelineComplete" });
-    log.info("Pipeline complete, notified player for VOD mode");
-  });
+    return;
+  }
+  await stopTranscodeSnapshot(snapshot, { clearCurrentRefs: true });
+}
 
-  return hlsOutput;
+function getTranscodeSession() {
+  if (!currentTranscodeDir) return null;
+  const playlistPath = resolve(currentTranscodeDir, "playlist.m3u8");
+  if (!existsSync(playlistPath)) return null;
+  return {
+    sessionId: transcodeState.sessionId,
+    sessionDir: currentTranscodeDir,
+    playlistPath,
+    process: transcodeState.process,
+  };
 }
 
 // --- Media cache (thumbnails + subtitles) ----------------------------
@@ -530,6 +898,17 @@ async function downloadSubtitlesDirect(subtitleList, destDir) {
         continue;
       }
 
+      // Clean VTT: strip cue tags (<c>, timestamp tags) and decode HTML entities
+      content = content
+        .replace(/<\/?c[^>]*>/g, "")
+        .replace(/<[\d:.]+>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, " ");
+
       const filename = `sub_${sub.lang}.vtt`;
       writeFileSync(resolve(destDir, filename), content);
       results.push({ lang: sub.lang, name: sub.name, auto: sub.auto, filename });
@@ -549,7 +928,7 @@ app.get("/api/subs/:key/:filename", (req, res) => {
   }
   res.set("Content-Type", "text/vtt");
   res.set("Access-Control-Allow-Origin", "*");
-  res.sendFile(filePath);
+  res.sendFile(filePath, { dotfiles: "allow" });
 });
 
 // List subtitles for current non-Plex content
@@ -599,9 +978,60 @@ app.use("/api/hls", (req, res, next) => {
   hlsMiddleware(req, res, next);
 });
 
+function rewriteTranscodePlaylist(body) {
+  const manifestBasePath = "/api/transcode";
+  return body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return match;
+    if (/^https?:\/\//i.test(trimmed)) {
+      return trimmed;
+    }
+    const segmentName = trimmed.split("?")[0];
+    if (!segmentName) return match;
+    const safeSegmentName = segmentName.replace(/[\\/]+/g, "").replace(/^\.+/g, "");
+    return `${manifestBasePath}/segment?name=${encodeURIComponent(safeSegmentName)}`;
+  });
+}
+
+app.get("/api/transcode/playlist.m3u8", async (req, res) => {
+  const session = getTranscodeSession();
+  if (!session) return res.status(404).json({ error: "No active transcode session" });
+  const ready = await waitForTranscodePlaylist(session.playlistPath, { timeoutMs: DASH_TRANSCODE_STARTUP_TIMEOUT_MS, pollMs: 120 });
+  if (!ready.ready) {
+    return res.status(503).json({
+      error: transcodeState.process ? "Transcode still starting" : "Transcode pipeline unavailable",
+      ready: false,
+    });
+  }
+  let body = ready.body;
+  if (typeof body !== "string") {
+    try { body = readFileSync(session.playlistPath, "utf-8"); } catch { body = ""; }
+  }
+  if (!body) return res.status(503).json({ error: "Invalid transcode playlist" });
+  res.set("Content-Type", "application/vnd.apple.mpegurl");
+  res.set("Access-Control-Allow-Origin", "*");
+  res.send(rewriteTranscodePlaylist(body));
+});
+
+app.get("/api/transcode/segment", (req, res) => {
+  const session = getTranscodeSession();
+  if (!session) return res.status(404).json({ error: "No active transcode session" });
+  const name = req.query.name ? String(req.query.name) : "";
+  if (!name || !/^(?:init\.mp4|[A-Za-z0-9._-]+\.m4s)$/i.test(name)) {
+    return res.status(400).json({ error: "Invalid segment name" });
+  }
+  const safeName = name;
+  const filePath = resolve(session.sessionDir, safeName);
+  if (!existsSync(filePath)) return res.status(404).json({ error: "Segment not found" });
+  res.set("Content-Type", "video/mp4");
+  res.set("Cache-Control", "no-cache");
+  res.sendFile(filePath, { dotfiles: "allow" });
+});
+
 // --- DASH MPD generation (for YouTube/Bilibili split streams) --------
 
 let currentDashMpd = null; // generated MPD XML string
+const dashMpdRequestCounts = new Map();
 
 // Probe MP4 structure: find init segment end, parse sidx for segment byte ranges
 async function probeMP4Structure(proxyId) {
@@ -615,7 +1045,7 @@ async function probeMP4Structure(proxyId) {
   const totalSize = parseInt((resp.headers.get("content-range") || "").split("/")[1] || "0");
 
   let initEnd = 0;
-  let sidxOffset = 0;
+  let sidxOffset = -1;
   let mdatOffset = 0;
   let pos = 0;
 
@@ -633,35 +1063,46 @@ async function probeMP4Structure(proxyId) {
 
   // Parse sidx to extract segment byte ranges
   const segments = [];
-  if (sidxOffset && sidxOffset + 12 < buf.length) {
+  let timescale = 1000;
+  if (sidxOffset >= 0 && sidxOffset + 12 < buf.length) {
     const sidxSize = buf.readUInt32BE(sidxOffset);
     const version = buf[sidxOffset + 8];
     let off = sidxOffset + 12;
     // reference_ID (4) + timescale (4)
     off += 4; // reference_ID
-    const timescale = buf.readUInt32BE(off); off += 4;
+    timescale = buf.readUInt32BE(off); off += 4;
     // earliest_presentation_time + first_offset
-    off += version === 0 ? 8 : 16;
+    let firstOffset = 0;
+    if (version === 0) {
+      off += 4; // earliest_presentation_time
+      firstOffset = buf.readUInt32BE(off); off += 4;
+    } else {
+      off += 8; // earliest_presentation_time
+      firstOffset = Number(buf.readBigUInt64BE(off)); off += 8;
+    }
     // reserved (2) + reference_count (2)
     off += 2;
     const referenceCount = buf.readUInt16BE(off); off += 2;
 
-    let segStart = sidxOffset + sidxSize;
+    let segStart = sidxOffset + sidxSize + firstOffset;
     for (let i = 0; i < referenceCount && off + 12 <= buf.length; i++) {
       const firstWord = buf.readUInt32BE(off);
+      const referenceType = firstWord >>> 31;
+      if (referenceType === 1) break; // nested sidx not supported here
       const referencedSize = firstWord & 0x7FFFFFFF;
       const subsegDuration = buf.readUInt32BE(off + 4);
       segments.push({
         start: segStart,
         end: segStart + referencedSize - 1,
         duration: subsegDuration / timescale,
+        durationTicks: subsegDuration,
       });
       segStart += referencedSize;
       off += 12;
     }
   }
 
-  return { initEnd, segments, totalSize };
+  return { initEnd, segments, totalSize, timescale };
 }
 
 function generateMpd(videoFormat, audioFormat, duration, videoProxyId, audioProxyId, videoInfo, audioInfo) {
@@ -688,14 +1129,28 @@ function generateMpd(videoFormat, audioFormat, duration, videoProxyId, audioProx
     if (!info.segments.length) return "";
     const mapId = `seg-${proxyId}`;
     dashSegmentMaps.set(mapId, { proxyId, initEnd: info.initEnd, segments: info.segments });
-    const avgDur = info.segments.reduce((a, s) => a + s.duration, 0) / info.segments.length;
-    const timescale = 1000;
-    const segDurMs = Math.round(avgDur * 1000);
+    const timeline = [];
+    let run = null;
+    for (const seg of info.segments) {
+      const durationTicks = seg.durationTicks || Math.round(seg.duration * (info.timescale || 1000));
+      if (run?.d === durationTicks) {
+        run.r += 1;
+      } else {
+        if (run) timeline.push(run);
+        run = { d: durationTicks, r: 0 };
+      }
+    }
+    if (run) timeline.push(run);
+    const segmentTimeline = timeline
+      .map(({ d, r }) => (r ? `<S d="${d}" r="${r}"/>` : `<S d="${d}"/>`))
+      .join("");
     // Use path-based URLs (no query params) to avoid &amp; XML escaping issues
-    return `<SegmentTemplate timescale="${timescale}" duration="${segDurMs}"
+    return `<SegmentTemplate timescale="${info.timescale || 1000}"
                           initialization="api/dash/${mapId}/init.mp4"
                           media="api/dash/${mapId}/$Number$.mp4"
-                          startNumber="0"/>`;
+                          startNumber="0">
+                  <SegmentTimeline>${segmentTimeline}</SegmentTimeline>
+                </SegmentTemplate>`;
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -729,10 +1184,11 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
   if (req.params.mapId === "manifest.mpd") return; // skip, handled below
   const map = dashSegmentMaps.get(req.params.mapId);
   if (!map) return res.status(404).json({ error: "Unknown segment map" });
-  const entry = proxyMap.get(map.proxyId);
-  if (!entry) return res.status(404).json({ error: "Proxy expired" });
+  const metric = beginProxyMetric("/api/dash/:mapId/:segment");
+  trackProxyMetricLifecycle(res, metric);
 
   let rangeStr;
+  let segmentIndex = null;
   const segName = req.params.segment.replace(".mp4", "");
   if (segName === "init") {
     rangeStr = `bytes=0-${map.initEnd}`;
@@ -742,23 +1198,78 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
       return res.status(404).json({ error: "Segment not found" });
     }
     // Clamp to last segment if index is past end (rounding mismatch)
-    const seg = map.segments[Math.min(idx, map.segments.length - 1)];
+    segmentIndex = Math.min(idx, map.segments.length - 1);
+    const seg = map.segments[segmentIndex];
     rangeStr = `bytes=${seg.start}-${seg.end}`;
   }
 
   try {
-    const headers = proxyHeaders(entry);
-    headers["Range"] = rangeStr;
-    const upstream = await fetchWithRetry(entry.url, { headers, redirect: "follow" }, { label: "dash-seg" });
-    res.status(200);
-    await pipeUpstream(upstream, req, res, { passStatus: false });
+    const entry = proxyMap.get(map.proxyId);
+    if (!entry) return res.status(404).json({ error: "Proxy expired" });
+    const cacheEntry = getSegmentCacheEntry(entry.url, rangeStr, entry);
+    if (cacheEntry) {
+      segmentCacheState.hits += 1;
+      if (cacheEntry.kind === "hash") segmentCacheState.hashKeyHits += 1;
+      else segmentCacheState.logicalKeyHits += 1;
+      logSegmentCacheHit({ cacheKey: cacheEntry, cacheEntry, proxyId: map.proxyId, rangeHeader: rangeStr });
+      await serveSegmentCacheToResponse(cacheEntry, res, (bytes) => recordProxyMetricBytes(metric, bytes));
+      if (segmentIndex !== null) {
+        for (let offset = 1; offset <= 3; offset++) {
+          const next = map.segments[segmentIndex + offset];
+          if (!next) break;
+          enqueueSegmentPrefetch(map.proxyId, `bytes=${next.start}-${next.end}`, segmentIndex + offset);
+        }
+      }
+      return;
+    }
+
+    segmentCacheState.misses += 1;
+    logSegmentCacheMiss({
+      cacheKey: getSegmentCachePaths(entry.url, rangeStr, entry),
+      proxyId: map.proxyId,
+      upstreamUrl: entry.url,
+      rangeHeader: rangeStr,
+    });
+    const proxied = await fetchProxyUpstream(map.proxyId, {
+      rangeHeader: rangeStr,
+      label: "dash-seg",
+      req,
+      metric,
+    });
+    if (!proxied) return res.status(404).json({ error: "Proxy expired" });
+    await maybeCacheSegmentResponse(proxied.upstream, proxied.entry.url, rangeStr, req, res, {
+      passStatus: false,
+      passRangeHeaders: false,
+      onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
+      metric,
+      cacheContext: proxied.entry,
+    });
+    if (segmentIndex !== null) {
+      for (let offset = 1; offset <= 3; offset++) {
+        const next = map.segments[segmentIndex + offset];
+        if (!next) break;
+        enqueueSegmentPrefetch(map.proxyId, `bytes=${next.start}-${next.end}`, segmentIndex + offset);
+      }
+    }
   } catch (e) {
-    if (!res.headersSent) res.status(502).json({ error: e.message });
+    if (metric) metric.error = e.message || String(e);
+    if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
+      res.status(502).json({ error: e.message });
+    }
   }
 });
 
 app.get("/api/dash/manifest.mpd", (req, res) => {
   if (!currentDashMpd) return res.status(404).json({ error: "No DASH manifest" });
+  const key = "/api/dash/manifest.mpd";
+  const requestCount = (dashMpdRequestCounts.get(key) || 0) + 1;
+  dashMpdRequestCounts.set(key, requestCount);
+  log.info({
+    endpoint: key,
+    requestCount,
+    currentTime: playerState.currentTime ?? null,
+    userAgent: req.headers["user-agent"] || null,
+  }, "DASH MPD requested");
   // Replace localhost BaseURL with the actual request origin so tunnel/remote access works
   const proto = req.headers["x-forwarded-proto"] || req.protocol;
   const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -776,15 +1287,93 @@ app.get("/api/dash/manifest.mpd", (req, res) => {
 const proxyMap = new Map();
 setInterval(() => {
   const now = Date.now();
+  let removedExpired = 0;
   for (const [k, v] of proxyMap) {
-    if (now - v.ts > 3600_000) proxyMap.delete(k); // 1 hour TTL
+    if (now - (v.lastAccessAt || v.createdAt || now) > PROXY_TTL_MS) {
+      proxyMap.delete(k);
+      removedExpired++;
+    }
   }
+  let oldestEntryAgeMs = 0;
+  for (const entry of proxyMap.values()) {
+    oldestEntryAgeMs = Math.max(oldestEntryAgeMs, proxyEntryAgeMs(entry, now) || 0);
+  }
+  log.info({
+    proxyMapSize: proxyMap.size,
+    oldestEntryAgeMs,
+    totalBytesServed: metricsState.totalBytesServed,
+    removedExpired,
+  }, "Proxy map health");
 }, 60_000).unref();
 
 function proxyRegister(url, headers = null, meta = {}) {
   const id = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  proxyMap.set(id, { url, ts: Date.now(), headers, ...meta });
+  const now = Date.now();
+  const registeredUrl = snapshotProxyUrl(url);
+  const originalUrl = meta.originalUrl ? snapshotProxyUrl(meta.originalUrl) : null;
+  proxyMap.set(id, {
+    url,
+    headers,
+    createdAt: now,
+    lastAccessAt: now,
+    expiresAt: parseProxyUrlExpiry(url),
+    registeredUrlHost: registeredUrl.host,
+    registeredUrlPathname: registeredUrl.pathname,
+    registeredUrlParams: registeredUrl.params,
+    originalUrlHost: originalUrl?.host || registeredUrl.host,
+    originalUrlPathname: originalUrl?.pathname || registeredUrl.pathname,
+    originalUrlParams: originalUrl?.params || registeredUrl.params,
+    ...meta,
+  });
   return id;
+}
+
+function parseProxyUrlExpiry(url) {
+  try {
+    const parsed = new URL(url);
+    const raw = parsed.searchParams.get("expire") || parsed.searchParams.get("expires");
+    if (!raw) return null;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    return value < 1e12 ? value * 1000 : value;
+  } catch {
+    return null;
+  }
+}
+
+function touchProxyEntry(entry) {
+  if (entry) entry.lastAccessAt = Date.now();
+}
+
+function getProxyExpiryState(entry, now = Date.now()) {
+  const expiresAt = entry?.expiresAt ?? parseProxyUrlExpiry(entry?.url || "");
+  if (!expiresAt) {
+    return { expiresAt: null, expiresInMs: null, isExpired: false, needsRefresh: false };
+  }
+  const expiresInMs = expiresAt - now;
+  return {
+    expiresAt,
+    expiresInMs,
+    isExpired: expiresInMs <= 0,
+    needsRefresh: expiresInMs <= PROXY_REFRESH_SKEW_MS,
+  };
+}
+
+function proxyLogMeta(proxyId, entry, extra = {}) {
+  const expiry = getProxyExpiryState(entry);
+  let upstreamHost = null;
+  if (entry?.url) {
+    try { upstreamHost = new URL(entry.url).host; } catch {}
+  }
+  return {
+    proxyId,
+    role: entry?.role,
+    pairId: entry?.pairId,
+    upstreamHost,
+    urlExpiresAt: expiry.expiresAt,
+    urlExpiresInMs: expiry.expiresInMs,
+    ...extra,
+  };
 }
 
 // Re-resolve expired CDN URLs via yt-dlp
@@ -809,11 +1398,13 @@ async function reResolveProxy(proxyId) {
         if (e.pairId !== entry.pairId) continue;
         if (e.role === "video") { e.url = resolved.videoUrl; e.headers = resolved.videoHeaders; }
         if (e.role === "audio") { e.url = resolved.audioUrl; e.headers = resolved.audioHeaders; }
-        e.ts = Date.now();
+        e.expiresAt = parseProxyUrlExpiry(e.url);
+        touchProxyEntry(e);
       }
     } else if (resolved.url) {
       entry.url = resolved.url;
-      entry.ts = Date.now();
+      entry.expiresAt = parseProxyUrlExpiry(entry.url);
+      touchProxyEntry(entry);
     }
     log.info("CDN URLs refreshed");
   })();
@@ -837,11 +1428,589 @@ function proxyHeaders(entry) {
   return h;
 }
 
+// --- Segment cache (proxied segments + HLS/DASH .ts/.mp4 chunks) ----
+
+const segmentCacheState = {
+  sizeBytes: 0,
+  hits: 0,
+  misses: 0,
+  logicalKeyHits: 0,
+  hashKeyHits: 0,
+  prefetchCount: 0,
+  evictionCount: 0,
+};
+
+const segmentCachePrefetchQueue = [];
+let segmentCachePrefetchActive = 0;
+const segmentCachePrefetchSet = new Set();
+let segmentCacheEvictionTimer = null;
+let lastSegmentCacheEvictionMs = 0;
+let segmentCacheHealthSnapshot = {
+  hits: 0,
+  misses: 0,
+};
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value)).digest("hex");
+}
+
+function safeUnlink(filePath) {
+  if (!filePath) return;
+  try { unlinkSync(filePath); } catch {}
+}
+
+function snapshotProxyUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return {
+      host: parsed.host.toLowerCase(),
+      pathname: parsed.pathname || "/",
+      params: Object.fromEntries(parsed.searchParams.entries()),
+    };
+  } catch {
+    return {
+      host: "",
+      pathname: "",
+      params: {},
+    };
+  }
+}
+
+function normalizeRangeForCacheKey(rangeHeader = "") {
+  const match = String(rangeHeader).match(/^bytes=(\d+)?-(\d+)?$/i);
+  return {
+    start: match?.[1] || "*",
+    end: match?.[2] || "*",
+  };
+}
+
+function computeCacheKey(upstreamUrl, rangeHeader = "", cacheContext = null) {
+  const urlInfo = snapshotProxyUrl(upstreamUrl);
+  const hostCandidates = [urlInfo.host, cacheContext?.registeredUrlHost, cacheContext?.originalUrlHost]
+    .filter(Boolean)
+    .map((value) => value.toLowerCase());
+  const mergedParams = {
+    ...(cacheContext?.registeredUrlParams || {}),
+    ...(cacheContext?.originalUrlParams || {}),
+    ...urlInfo.params,
+  };
+  const isYouTubeSource = hostCandidates.some((host) => host.includes("googlevideo.com") || host.includes("youtube.com") || host.includes("youtu.be"));
+  if (isYouTubeSource) {
+    const required = ["id", "itag", "clen", "lmt"];
+    if (required.every((key) => mergedParams[key])) {
+      const range = normalizeRangeForCacheKey(rangeHeader);
+      const logicalKey = `yt:${mergedParams.id}:${mergedParams.itag}:${mergedParams.clen}:${mergedParams.lmt}:${range.start}-${range.end}`;
+      return {
+        kind: "logical",
+        sourceType: "youtube",
+        logicalKey,
+        filenameKey: sha256Hex(logicalKey),
+      };
+    }
+  }
+
+  const hlsPath = urlInfo.pathname || cacheContext?.registeredUrlPathname || cacheContext?.originalUrlPathname || "";
+  if (hlsPath.toLowerCase().endsWith(".ts")) {
+    const logicalKey = `hls:${sha256Hex(hlsPath)}`;
+    return {
+      kind: "logical",
+      sourceType: "hls",
+      logicalKey,
+      filenameKey: sha256Hex(logicalKey),
+    };
+  }
+
+  const fallbackHash = sha256Hex(`${upstreamUrl}\n${rangeHeader || ""}`);
+  return {
+    kind: "hash",
+    sourceType: "fallback",
+    logicalKey: `hash:${fallbackHash}`,
+    filenameKey: fallbackHash,
+  };
+}
+
+function getSegmentCachePaths(upstreamUrl, rangeHeader = "", cacheContext = null) {
+  const cacheKey = computeCacheKey(upstreamUrl, rangeHeader, cacheContext);
+  return {
+    ...cacheKey,
+    key: cacheKey.filenameKey,
+    dataPath: resolve(SEGMENT_CACHE_DIR, `${cacheKey.filenameKey}.dat`),
+    metaPath: resolve(SEGMENT_CACHE_DIR, `${cacheKey.filenameKey}.meta`),
+  };
+}
+
+function parseSegmentCacheMeta(path) {
+  const raw = readFileSync(path, "utf-8");
+  return JSON.parse(raw);
+}
+
+function touchSegmentCacheAccess(dataPath) {
+  try {
+    const stat = statSync(dataPath);
+    utimesSync(dataPath, new Date(), stat.mtime);
+  } catch {}
+}
+
+function logSegmentCacheError(operation, cacheKey, err, extra = {}) {
+  log.warn({
+    operation,
+    cacheKey: cacheKey?.logicalKey || cacheKey?.filenameKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    err: err?.message || String(err),
+    ...extra,
+  }, "Cache error");
+}
+
+function logSegmentCacheHit({ cacheKey, cacheEntry, proxyId, rangeHeader }) {
+  log.info({
+    cacheKey: cacheKey?.logicalKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    fileSizeBytes: cacheEntry?.sizeBytes || 0,
+    proxyId: proxyId || null,
+    rangeRequested: rangeHeader || null,
+  }, "Cache hit");
+}
+
+function logSegmentCacheMiss({ cacheKey, proxyId, upstreamUrl, rangeHeader }) {
+  log.info({
+    cacheKey: cacheKey?.logicalKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    upstreamUrl: truncateUrl(upstreamUrl, 80),
+    proxyId: proxyId || null,
+    rangeRequested: rangeHeader || null,
+  }, "Cache miss");
+}
+
+function logSegmentCacheWrite({ cacheKey, bytesWritten, writeDurationMs }) {
+  log.info({
+    cacheKey: cacheKey?.logicalKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    bytesWritten,
+    writeDurationMs,
+  }, "Cache write");
+}
+
+function logSegmentCacheEviction({ filesEvicted, bytesFreed, newCacheSizeBytes }) {
+  log.info({
+    filesEvicted,
+    bytesFreed,
+    newCacheSizeBytes,
+  }, "Cache eviction");
+}
+
+function logSegmentPrefetchStart({ cacheKey, segmentIndex }) {
+  log.debug({
+    cacheKey: cacheKey?.logicalKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    segmentIndex,
+  }, "Prefetch start");
+}
+
+function logSegmentPrefetchComplete({ cacheKey, bytesCached, durationMs }) {
+  log.info({
+    cacheKey: cacheKey?.logicalKey || null,
+    cacheKeyType: cacheKey?.kind || null,
+    bytesCached,
+    durationMs,
+  }, "Prefetch complete");
+}
+
+function getCachedSegmentCount() {
+  try {
+    let count = 0;
+    for (const file of readdirSync(SEGMENT_CACHE_DIR)) {
+      if (file.endsWith(".meta")) count += 1;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+function getSegmentCacheUtilizationPercent() {
+  if (!SEGMENT_CACHE_MAX_BYTES) return 0;
+  return Math.min(100, Math.max(0, (segmentCacheState.sizeBytes / SEGMENT_CACHE_MAX_BYTES) * 100));
+}
+
+function purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext = null) {
+  const paths = getSegmentCachePaths(upstreamUrl, rangeHeader || "", cacheContext);
+  safeUnlink(paths.dataPath);
+  safeUnlink(paths.metaPath);
+}
+
+function getSegmentCacheEntry(upstreamUrl, rangeHeader, cacheContext = null) {
+  const paths = getSegmentCachePaths(upstreamUrl, rangeHeader || "", cacheContext);
+  if (!existsSync(paths.dataPath) || !existsSync(paths.metaPath)) return null;
+  try {
+    const meta = parseSegmentCacheMeta(paths.metaPath);
+    const stat = statSync(paths.dataPath);
+    touchSegmentCacheAccess(paths.dataPath);
+    return { ...paths, meta, sizeBytes: stat.size };
+  } catch (err) {
+    logSegmentCacheError("read", paths, err);
+    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader || "", cacheContext);
+    return null;
+  }
+}
+
+function initializeSegmentCache() {
+  mkdirSync(SEGMENT_CACHE_DIR, { recursive: true });
+  let total = 0;
+  const files = readdirSync(SEGMENT_CACHE_DIR);
+  const validData = new Set();
+
+  for (const file of files) {
+    if (!file.endsWith(".dat")) continue;
+    const dataPath = resolve(SEGMENT_CACHE_DIR, file);
+    const metaPath = resolve(SEGMENT_CACHE_DIR, `${file.slice(0, -4)}.meta`);
+    if (!existsSync(metaPath)) {
+      safeUnlink(metaPath);
+      safeUnlink(dataPath);
+      continue;
+    }
+    try {
+      const stat = statSync(dataPath);
+      total += stat.size;
+      validData.add(file);
+    } catch {
+      safeUnlink(dataPath);
+      safeUnlink(metaPath);
+    }
+  }
+
+  for (const file of files) {
+    if (!file.endsWith(".meta")) continue;
+    const base = file.slice(0, -5);
+    const dataPath = resolve(SEGMENT_CACHE_DIR, `${base}.dat`);
+    if (!validData.has(`${base}.dat`)) {
+      safeUnlink(dataPath);
+      safeUnlink(resolve(SEGMENT_CACHE_DIR, file));
+    }
+  }
+
+  segmentCacheState.sizeBytes = total;
+  log.info({ path: SEGMENT_CACHE_DIR, sizeBytes: segmentCacheState.sizeBytes }, "Segment cache initialized");
+}
+
+setInterval(() => {
+  const hitsSinceLast = segmentCacheState.hits - segmentCacheHealthSnapshot.hits;
+  const missesSinceLast = segmentCacheState.misses - segmentCacheHealthSnapshot.misses;
+  const totalSinceLast = hitsSinceLast + missesSinceLast;
+  segmentCacheHealthSnapshot = {
+    hits: segmentCacheState.hits,
+    misses: segmentCacheState.misses,
+  };
+  log.info({
+    totalCacheSizeMB: segmentCacheState.sizeBytes / (1024 * 1024),
+    maxCacheSizeMB: SEGMENT_CACHE_MAX_BYTES / (1024 * 1024),
+    cacheUtilizationPercent: getSegmentCacheUtilizationPercent(),
+    hitRatioSinceLastHealthLog: totalSinceLast ? hitsSinceLast / totalSinceLast : 0,
+    hitsSinceLastHealthLog: hitsSinceLast,
+    missesSinceLastHealthLog: missesSinceLast,
+    cachedSegments: getCachedSegmentCount(),
+    prefetchQueueDepth: segmentCachePrefetchQueue.length + segmentCachePrefetchActive,
+  }, "Segment cache health");
+}, 120_000).unref();
+
+function scheduleSegmentCacheEviction() {
+  if (segmentCacheEvictionTimer) return;
+  const now = Date.now();
+  const waitMs = Math.max(0, SEGMENT_CACHE_EVICT_DEBOUNCE_MS - (now - lastSegmentCacheEvictionMs));
+  segmentCacheEvictionTimer = setTimeout(() => {
+    segmentCacheEvictionTimer = null;
+    lastSegmentCacheEvictionMs = Date.now();
+    pruneSegmentCache();
+  }, waitMs);
+  segmentCacheEvictionTimer.unref();
+}
+
+function pruneSegmentCache() {
+  if (segmentCacheState.sizeBytes <= SEGMENT_CACHE_MAX_BYTES) return;
+
+  const candidates = [];
+  for (const file of readdirSync(SEGMENT_CACHE_DIR)) {
+    if (!file.endsWith(".meta")) continue;
+    const metaPath = resolve(SEGMENT_CACHE_DIR, file);
+    const dataPath = resolve(SEGMENT_CACHE_DIR, `${file.slice(0, -5)}.dat`);
+    if (!existsSync(dataPath)) {
+      safeUnlink(metaPath);
+      continue;
+    }
+    try {
+      const stat = statSync(dataPath);
+      let cacheKey = null;
+      try {
+        const meta = parseSegmentCacheMeta(metaPath);
+        cacheKey = meta?.cacheKey ? { logicalKey: meta.cacheKey, kind: meta.cacheKeyKind || null } : null;
+      } catch {}
+      candidates.push({
+        dataPath,
+        metaPath,
+        sizeBytes: stat.size,
+        atimeMs: stat.atimeMs,
+        cacheKey,
+      });
+    } catch (err) {
+      logSegmentCacheError("evict", { logicalKey: file.slice(0, -5), filenameKey: file.slice(0, -5), kind: "hash" }, err, { dataPath, metaPath });
+      safeUnlink(dataPath);
+      safeUnlink(metaPath);
+    }
+  }
+
+  candidates.sort((a, b) => a.atimeMs - b.atimeMs);
+  let evicted = 0;
+  let bytesFreed = 0;
+  while (segmentCacheState.sizeBytes > SEGMENT_CACHE_TARGET_BYTES && candidates.length) {
+    const candidate = candidates.shift();
+    if (!existsSync(candidate.dataPath) || !existsSync(candidate.metaPath)) continue;
+    try {
+      unlinkSync(candidate.dataPath);
+      unlinkSync(candidate.metaPath);
+    } catch (err) {
+      logSegmentCacheError("evict", candidate.cacheKey || { logicalKey: candidate.metaPath, filenameKey: candidate.metaPath, kind: "hash" }, err, {
+        dataPath: candidate.dataPath,
+        metaPath: candidate.metaPath,
+      });
+      continue;
+    }
+    segmentCacheState.sizeBytes = Math.max(0, segmentCacheState.sizeBytes - candidate.sizeBytes);
+    segmentCacheState.evictionCount += 1;
+    evicted += 1;
+    bytesFreed += candidate.sizeBytes;
+  }
+
+  if (evicted) {
+    logSegmentCacheEviction({ filesEvicted: evicted, bytesFreed, newCacheSizeBytes: segmentCacheState.sizeBytes });
+  }
+}
+
+function shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader) {
+  if (upstream.status !== 200 && upstream.status !== 206) return false;
+  const lowerUrl = upstreamUrl.toLowerCase();
+  if (/\.m3u8(\?|#|$)/i.test(lowerUrl) || /\.mpd(\?|#|$)/i.test(lowerUrl)) return false;
+
+  const type = (upstream.headers.get("content-type") || "").toLowerCase();
+  if (type.includes("mpegurl") || type.includes("x-mpegurl") || type.includes("application/dash+xml")) return false;
+
+  const contentLength = Number.parseInt(upstream.headers.get("content-length") || "", 10);
+  if (Number.isFinite(contentLength) && contentLength >= 0 && contentLength < SEGMENT_CACHE_MIN_BYTES) return false;
+
+  if (rangeHeader && !rangeHeader.startsWith("bytes=")) return false;
+  return true;
+}
+
+async function serveSegmentCacheToResponse(cacheEntry, res, onChunk) {
+  const meta = cacheEntry.meta || {};
+  res.status(meta.status || 200);
+  if (meta.contentType) res.set("Content-Type", meta.contentType);
+  if (meta.contentLength) res.set("Content-Length", String(meta.contentLength));
+  if (meta.contentRange) res.set("Content-Range", meta.contentRange);
+  res.set("Access-Control-Allow-Origin", "*");
+  const source = createReadStream(cacheEntry.dataPath);
+  if (onChunk) {
+    source.on("data", (chunk) => onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
+  }
+  await pipeline(source, res);
+}
+
+function finalizeSegmentCacheWrite(paths, upstream, bytesWritten, startedAt) {
+  const meta = {
+    status: upstream.status,
+    contentType: upstream.headers.get("content-type") || "application/octet-stream",
+    contentLength: Number.parseInt(upstream.headers.get("content-length") || "", 10) || bytesWritten,
+    contentRange: upstream.headers.get("content-range") || null,
+    cacheKey: paths.logicalKey,
+    cacheKeyHash: paths.filenameKey,
+    cacheKeyKind: paths.kind,
+    cacheKeySourceType: paths.sourceType,
+  };
+  writeFileSync(paths.metaPath, JSON.stringify(meta));
+  segmentCacheState.sizeBytes += bytesWritten;
+  scheduleSegmentCacheEviction();
+  logSegmentCacheWrite({
+    cacheKey: paths,
+    bytesWritten,
+    writeDurationMs: Date.now() - startedAt,
+  });
+  return { cached: true, bytes: bytesWritten };
+}
+
+async function writeSegmentResponseToCache(upstream, upstreamUrl, rangeHeader = "", cacheContext = null) {
+  const paths = getSegmentCachePaths(upstreamUrl, rangeHeader, cacheContext);
+  if (!shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader)) return { cached: false, reason: "disabled", cacheKey: paths };
+  if (!upstream.body) return { cached: false, reason: "no-body", cacheKey: paths };
+
+  const source = Readable.fromWeb(upstream.body);
+  const cacheStream = createWriteStream(paths.dataPath);
+  let downloaded = 0;
+  let failed = false;
+  const startedAt = Date.now();
+
+  source.on("data", (chunk) => {
+    downloaded += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+  });
+  source.once("error", () => { failed = true; });
+  cacheStream.once("error", () => { failed = true; });
+
+  try {
+    await pipeline(source, cacheStream);
+  } catch (e) {
+    failed = true;
+    logSegmentCacheError("write", paths, e);
+    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext);
+    throw e;
+  }
+
+  if (failed || downloaded < SEGMENT_CACHE_MIN_BYTES) {
+    if (failed) logSegmentCacheError("write", paths, new Error("Segment cache write failed"));
+    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext);
+    return { cached: false, cacheKey: paths };
+  }
+  return finalizeSegmentCacheWrite(paths, upstream, downloaded, startedAt);
+}
+
+async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req, res, options = {}) {
+  const { passStatus = true, passRangeHeaders = true, onChunk, metric, cacheContext = null } = options;
+  const paths = getSegmentCachePaths(upstreamUrl, rangeHeader || "", cacheContext);
+  const headersToCopy = ["content-type", "content-length"];
+  if (passRangeHeaders) headersToCopy.push("content-range", "accept-ranges");
+  for (const h of headersToCopy) {
+    const value = upstream.headers.get(h);
+    if (value) res.set(h, value);
+  }
+  res.set("Access-Control-Allow-Origin", "*");
+
+  if (passStatus) res.status(upstream.status);
+
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+
+  if (!shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader)) {
+    const source = Readable.fromWeb(upstream.body);
+    if (onChunk) source.on("data", (chunk) => onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
+    await pipeline(source, res);
+    return;
+  }
+
+  const source = Readable.fromWeb(upstream.body);
+  const cacheStream = createWriteStream(paths.dataPath);
+  let downloaded = 0;
+  let cacheError;
+  let closedByClient = false;
+  const startedAt = Date.now();
+
+  const abort = () => {
+    closedByClient = true;
+    if (metric) metric.error = "Client closed connection";
+    if (cacheStream.writable) cacheStream.destroy();
+    source.destroy();
+    upstream.body?.cancel?.().catch(() => {});
+  };
+
+  const onSourceData = (chunk) => {
+    const len = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    downloaded += len;
+    if (onChunk) onChunk(len);
+    const ok = cacheStream.write(chunk);
+    if (!ok) source.pause();
+  };
+
+  req?.once("close", abort);
+  res.once("close", abort);
+  source.on("data", onSourceData);
+  source.once("end", () => {
+    if (!cacheStream.destroyed) cacheStream.end();
+  });
+  cacheStream.on("drain", () => {
+    if (!source.destroyed) source.resume();
+  });
+  cacheStream.on("error", (err) => { cacheError = err; });
+
+  try {
+    await Promise.all([
+      pipeline(source, res),
+      new Promise((resolve, reject) => {
+        cacheStream.once("finish", resolve);
+        cacheStream.once("error", reject);
+      }),
+    ]);
+  } catch (err) {
+    cacheError = cacheError || err;
+    if (metric) metric.error = err.message || String(err);
+    logSegmentCacheError("write", paths, err);
+    if (!isAbortLikeError(err) || !(req.destroyed || res.destroyed)) throw err;
+  } finally {
+    req?.off("close", abort);
+    res.off("close", abort);
+    source.off("data", onSourceData);
+  }
+
+  if (cacheError || closedByClient || downloaded < SEGMENT_CACHE_MIN_BYTES) {
+    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext);
+    return;
+  }
+
+  finalizeSegmentCacheWrite(paths, upstream, downloaded, startedAt);
+}
+
+function enqueueSegmentPrefetch(proxyId, range, segmentIndex = null) {
+  const entry = proxyMap.get(proxyId);
+  const cacheKey = getSegmentCachePaths(entry?.url || "", range || "", entry);
+  const key = `${cacheKey.filenameKey}|${range || ""}`;
+  if (segmentCachePrefetchSet.has(key)) return;
+  segmentCachePrefetchSet.add(key);
+  segmentCachePrefetchQueue.push({ proxyId, range: range || "", key, segmentIndex, cacheKey });
+  segmentCacheState.prefetchCount += 1;
+  runSegmentPrefetchQueue();
+}
+
+function runSegmentPrefetchQueue() {
+  while (segmentCachePrefetchActive < SEGMENT_CACHE_MAX_PREFETCHES && segmentCachePrefetchQueue.length) {
+    const item = segmentCachePrefetchQueue.shift();
+    segmentCachePrefetchActive += 1;
+    (async () => {
+      const startedAt = Date.now();
+      try {
+        logSegmentPrefetchStart({ cacheKey: item.cacheKey, segmentIndex: item.segmentIndex });
+        const proxied = await fetchProxyUpstream(item.proxyId, {
+          rangeHeader: item.range,
+          label: "segment-prefetch",
+          req: null,
+          metric: null,
+        });
+        if (!proxied) return;
+
+        const entry = proxied.entry?.url ? getSegmentCacheEntry(proxied.entry.url, item.range, proxied.entry) : null;
+        if (entry) {
+          logSegmentPrefetchComplete({ cacheKey: item.cacheKey, bytesCached: 0, durationMs: Date.now() - startedAt });
+          return;
+        }
+
+        const result = await writeSegmentResponseToCache(proxied.upstream, proxied.entry.url, item.range, proxied.entry);
+        logSegmentPrefetchComplete({
+          cacheKey: item.cacheKey,
+          bytesCached: result?.bytes || 0,
+          durationMs: Date.now() - startedAt,
+        });
+      } catch (err) {
+        log.debug({ proxyId: item.proxyId, err: err.message || String(err) }, "Segment prefetch failed");
+      } finally {
+        segmentCachePrefetchActive -= 1;
+        segmentCachePrefetchSet.delete(item.key);
+        runSegmentPrefetchQueue();
+      }
+    })();
+  }
+}
+
 // --- Fetch with retry (exponential backoff + jitter) -----------------
 
 async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" } = {}) {
   let lastResp, lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (options.signal?.aborted) throw options.signal.reason || new Error("Fetch aborted");
     try {
       const resp = await fetch(url, options);
       if (resp.ok || resp.status === 206) return resp; // success or partial content
@@ -856,6 +2025,7 @@ async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" 
       }
       return resp; // non-retryable status (404, 416, etc.)
     } catch (err) {
+      if (options.signal?.aborted || err.name === "AbortError") throw err;
       lastErr = err;
       if (attempt < retries) {
         const delay = Math.min(500 * 2 ** attempt, 5000) + Math.random() * 500;
@@ -870,70 +2040,207 @@ async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" 
 
 // --- Stream piping helper --------------------------------------------
 
-async function pipeUpstream(upstream, req, res, { passStatus = true, onChunk } = {}) {
+function isAbortLikeError(err) {
+  return err?.name === "AbortError" || err?.code === "ERR_STREAM_PREMATURE_CLOSE" || err?.code === "ECONNRESET";
+}
+
+async function pipeUpstream(upstream, req, res, { passStatus = true, passRangeHeaders = true, onChunk } = {}) {
   if (passStatus) res.status(upstream.status);
-  for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+  const headersToCopy = ["content-type", "content-length"];
+  if (passRangeHeaders) headersToCopy.push("content-range", "accept-ranges");
+  for (const h of headersToCopy) {
     const v = upstream.headers.get(h);
     if (v) res.set(h, v);
   }
   res.set("Access-Control-Allow-Origin", "*");
 
-  const { Readable } = await import("stream");
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+
   const nodeStream = Readable.fromWeb(upstream.body);
   if (onChunk) {
     nodeStream.on("data", (chunk) => {
       onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
     });
   }
-  nodeStream.pipe(res);
-  nodeStream.on("error", () => { if (!res.writableEnded) res.end(); });
-  req.on("close", () => nodeStream.destroy());
+
+  const abortUpstream = () => {
+    nodeStream.destroy();
+    const cancelPromise = upstream.body?.cancel?.();
+    if (cancelPromise && typeof cancelPromise.catch === "function") cancelPromise.catch(() => {});
+  };
+
+  req.once("close", abortUpstream);
+  res.once("close", abortUpstream);
+  try {
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (!isAbortLikeError(err) && !req.destroyed && !res.destroyed) throw err;
+  } finally {
+    req.off("close", abortUpstream);
+    res.off("close", abortUpstream);
+  }
+}
+
+function buildProxyRequestHeaders(entry, rangeHeader) {
+  const headers = proxyHeaders(entry);
+  if (rangeHeader) headers.Range = rangeHeader;
+  return headers;
+}
+
+async function fetchProxyUpstream(proxyId, { rangeHeader, label = "proxy", signal, req = null, metric = null } = {}) {
+  let entry = proxyMap.get(proxyId);
+  if (!entry) return null;
+  touchProxyEntry(entry);
+  setProxyMetricRequest(metric, req || { headers: {} }, entry, proxyId, rangeHeader);
+
+  const expiry = getProxyExpiryState(entry);
+  if (entry.originalUrl && expiry.needsRefresh) {
+    log.info(proxyLogMeta(proxyId, entry, { range: rangeHeader, reason: expiry.isExpired ? "expired" : "expiring_soon" }), "Refreshing proxy URL before upstream request");
+    await reResolveProxy(proxyId);
+    entry = proxyMap.get(proxyId) || entry;
+    setProxyMetricRequest(metric, req || { headers: {} }, entry, proxyId, rangeHeader);
+  }
+
+  let upstream;
+  let upstreamStartedAt = Date.now();
+  try {
+    upstream = await fetchWithRetry(
+      entry.url,
+      { headers: buildProxyRequestHeaders(entry, rangeHeader), redirect: "follow", signal },
+      { label },
+    );
+  } catch (err) {
+    if (!(isAbortLikeError(err) && signal?.aborted)) {
+      logProxyUrlHealth({ level: "error", proxyId, entry, err, event: "fetch_failed" });
+    }
+    if (metric) metric.error = err.message || String(err);
+    throw err;
+  }
+  setProxyMetricUpstream(metric, upstream, Date.now() - upstreamStartedAt);
+
+  if (upstream.status === 403 && entry.originalUrl) {
+    const currentExpiry = getProxyExpiryState(entry);
+    warnOnProxyStatus(proxyId, entry, upstream, "upstream_rejected");
+    log.warn(proxyLogMeta(proxyId, entry, { range: rangeHeader, status: upstream.status, urlMayBeExpired: currentExpiry.isExpired || currentExpiry.needsRefresh }), "Upstream rejected proxy request");
+    await upstream.body?.cancel();
+    if (await reResolveProxy(proxyId)) {
+      entry = proxyMap.get(proxyId) || entry;
+      setProxyMetricRequest(metric, req || { headers: {} }, entry, proxyId, rangeHeader);
+      upstreamStartedAt = Date.now();
+      try {
+        upstream = await fetchWithRetry(
+          entry.url,
+          { headers: buildProxyRequestHeaders(entry, rangeHeader), redirect: "follow", signal },
+          { label: `${label}-reresolved` },
+        );
+      } catch (err) {
+        if (!(isAbortLikeError(err) && signal?.aborted)) {
+          logProxyUrlHealth({ level: "error", proxyId, entry, err, event: "fetch_failed_after_refresh" });
+        }
+        if (metric) metric.error = err.message || String(err);
+        throw err;
+      }
+      setProxyMetricUpstream(metric, upstream, Date.now() - upstreamStartedAt);
+    }
+  }
+
+  touchProxyEntry(entry);
+  warnOnProxyStatus(proxyId, entry, upstream, "upstream_status");
+  if (upstream.status !== 200 && upstream.status !== 206) {
+    log.warn(proxyLogMeta(proxyId, entry, {
+      range: rangeHeader,
+      status: upstream.status,
+      contentRange: upstream.headers.get("content-range"),
+      retryAfterRefresh: upstream.status === 403 && !!entry.originalUrl,
+    }), "Unexpected upstream proxy response");
+  }
+  return { entry, upstream };
 }
 
 // Raw stream proxy (mp4, ts segments, etc.)
 app.get("/api/proxy", async (req, res) => {
-  const entry = proxyMap.get(req.query.id);
-  if (!entry) return res.status(404).json({ error: "Unknown stream" });
+  if (!proxyMap.has(req.query.id)) return res.status(404).json({ error: "Unknown stream" });
   const metric = beginProxyMetric("/api/proxy");
   trackProxyMetricLifecycle(res, metric);
+  const upstreamController = new AbortController();
+  const abortFetch = () => upstreamController.abort();
+  req.once("close", abortFetch);
+  res.once("close", abortFetch);
+  const entry = proxyMap.get(req.query.id);
+  const rangeHeader = req.headers.range || "";
 
   try {
-    const headers = proxyHeaders(entry);
-    if (req.headers.range) headers["Range"] = req.headers.range;
-    let upstream = await fetchWithRetry(entry.url, { headers, redirect: "follow" }, { label: "proxy" });
-    // Re-resolve expired CDN URLs on persistent 403
-    if (upstream.status === 403 && entry.originalUrl) {
-      await upstream.body?.cancel();
-      if (await reResolveProxy(req.query.id)) {
-        const freshEntry = proxyMap.get(req.query.id);
-        const freshHeaders = proxyHeaders(freshEntry);
-        if (req.headers.range) freshHeaders["Range"] = req.headers.range;
-        upstream = await fetchWithRetry(freshEntry.url, { headers: freshHeaders, redirect: "follow" }, { label: "proxy-reresolved" });
-      }
+    const cacheEntry = entry ? getSegmentCacheEntry(entry.url, rangeHeader, entry) : null;
+    if (cacheEntry) {
+      segmentCacheState.hits += 1;
+      if (cacheEntry.kind === "hash") segmentCacheState.hashKeyHits += 1;
+      else segmentCacheState.logicalKeyHits += 1;
+      logSegmentCacheHit({ cacheKey: cacheEntry, cacheEntry, proxyId: req.query.id, rangeHeader });
+      await serveSegmentCacheToResponse(cacheEntry, res, (bytes) => recordProxyMetricBytes(metric, bytes));
+      return;
     }
-    await pipeUpstream(upstream, req, res, {
+
+    segmentCacheState.misses += 1;
+    logSegmentCacheMiss({
+      cacheKey: getSegmentCachePaths(entry?.url || "", rangeHeader, entry),
+      proxyId: req.query.id,
+      upstreamUrl: entry?.url || "",
+      rangeHeader,
+    });
+    const proxied = await fetchProxyUpstream(req.query.id, {
+      rangeHeader: rangeHeader || null,
+      label: "proxy",
+      signal: upstreamController.signal,
+      req,
+      metric,
+    });
+    if (!proxied) return res.status(404).json({ error: "Unknown stream" });
+    await maybeCacheSegmentResponse(proxied.upstream, proxied.entry.url, rangeHeader, req, res, {
       onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
+      metric,
+      cacheContext: proxied.entry,
     });
   } catch (e) {
-    if (!res.headersSent) res.status(502).json({ error: e.message });
+    if (metric) metric.error = e.message || String(e);
+    if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
+      res.status(502).json({ error: e.message });
+    }
+  } finally {
+    req.off("close", abortFetch);
+    res.off("close", abortFetch);
   }
 });
 
 // DASH segment proxy — serve a specific byte range from upstream
 app.get("/api/proxy/range", async (req, res) => {
-  const entry = proxyMap.get(req.query.id);
-  if (!entry) return res.status(404).json({ error: "Unknown stream" });
+  if (!proxyMap.has(req.query.id)) return res.status(404).json({ error: "Unknown stream" });
   const range = req.query.r;
   if (!range) return res.status(400).json({ error: "range required" });
+  const metric = beginProxyMetric("/api/proxy/range");
+  trackProxyMetricLifecycle(res, metric);
 
   try {
-    const headers = proxyHeaders(entry);
-    headers["Range"] = `bytes=${range}`;
-    const upstream = await fetchWithRetry(entry.url, { headers, redirect: "follow" }, { label: "proxy/range" });
+    const proxied = await fetchProxyUpstream(req.query.id, {
+      rangeHeader: `bytes=${range}`,
+      label: "proxy/range",
+      req,
+      metric,
+    });
+    if (!proxied) return res.status(404).json({ error: "Unknown stream" });
     res.status(200); // Always 200 for DASH segment fetches
-    await pipeUpstream(upstream, req, res, { passStatus: false });
+    await pipeUpstream(proxied.upstream, req, res, {
+      passStatus: false,
+      passRangeHeaders: false,
+      onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
+    });
   } catch (e) {
-    if (!res.headersSent) res.status(502).json({ error: e.message });
+    if (metric) metric.error = e.message || String(e);
+    if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
+      res.status(502).json({ error: e.message });
+    }
   }
 });
 
@@ -945,10 +2252,21 @@ app.get("/api/proxy/hls", async (req, res) => {
   const entry = proxyMap.get(req.query.id);
   if (!entry) return res.status(404).json({ error: "Unknown stream" });
   const metric = beginProxyMetric("/api/proxy/hls");
+  setProxyMetricRequest(metric, req, entry, req.query.id);
   trackProxyMetricLifecycle(res, metric);
 
   try {
-    const upstream = await fetch(entry.url, { headers: proxyHeaders(entry), redirect: "follow" });
+    const upstreamStartedAt = Date.now();
+    let upstream;
+    try {
+      upstream = await fetch(entry.url, { headers: proxyHeaders(entry), redirect: "follow" });
+    } catch (err) {
+      metric.error = err.message || String(err);
+      logProxyUrlHealth({ level: "error", proxyId: req.query.id, entry, err, event: "fetch_failed" });
+      throw err;
+    }
+    setProxyMetricUpstream(metric, upstream, Date.now() - upstreamStartedAt);
+    warnOnProxyStatus(req.query.id, entry, upstream, "upstream_status");
     let body = await upstream.text();
     const baseUrl = new URL(entry.url);
 
@@ -989,6 +2307,7 @@ app.get("/api/proxy/hls", async (req, res) => {
     res.set("Access-Control-Allow-Origin", "*");
     res.send(body);
   } catch (e) {
+    if (metric) metric.error = e.message || String(e);
     if (!res.headersSent) res.status(502).json({ error: e.message });
   }
 });
@@ -1019,7 +2338,7 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     maxVideoBitrate: "8000",
     subtitleSize: "100",
     subtitles: subtitleStreamID ? "burn" : "none",
-    audioBoost: "700",
+    audioBoost: "280",
     location: "lan",
     addDebugOverlay: "0",
     autoAdjustQuality: "0",
@@ -1032,6 +2351,10 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     "X-Plex-Product": "Drive-In",
     "X-Plex-Features": "external-media,indirect-media,hub-style-list",
     "X-Plex-Platform": "Chrome",
+    "X-Plex-Platform-Version": "136.0",
+    "X-Plex-Device": "Linux",
+    "X-Plex-Device-Name": "Drive-In Player",
+    "X-Plex-Model": "bundled",
     "X-Plex-Token": PLEX_TOKEN,
   });
 }
@@ -1055,13 +2378,43 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
     transcodeDecisionText: mc?.transcodeDecisionText,
     subtitleDecision: subStreams.map((s) => ({ id: s.id, codec: s.codec, decision: s.decision, burn: s.burn })),
   }, "[plex] transcode decision");
-  // Store DASH start URL for manifest proxy
-  plexDashMpdUrl = `${PLEX_URL}/video/:/transcode/universal/start.mpd?${params}`;
+  // Fetch start.mpd eagerly — this triggers the actual transcode and takes ~10s.
+  // Cache the MPD so the player's manifest request is instant.
+  const startMpdUrl = `${PLEX_URL}/video/:/transcode/universal/start.mpd?${params}`;
+  plexDashMpdUrl = startMpdUrl;
+  plexDashMpdCache = null;
+
+  try {
+    log.info({ session }, "[plex] Fetching start.mpd (this triggers transcode)...");
+    const mpdRes = await fetch(startMpdUrl);
+    if (mpdRes.ok) {
+      let body = await mpdRes.text();
+      body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/dash/");
+      plexDashMpdCache = body;
+      log.info({ session, bodyLength: body.length }, "[plex] start.mpd cached, transcode ready");
+
+      // Pre-warm: fetch video+audio headers to keep the session alive until player connects
+      const sessionMatch = body.match(/session\/([^/]+)\//);
+      if (sessionMatch) {
+        const sid = sessionMatch[1];
+        const headerBase = `${PLEX_URL}/video/:/transcode/universal/session/${sid}`;
+        fetch(`${headerBase}/0/header?X-Plex-Token=${PLEX_TOKEN}`).catch(() => {});
+        fetch(`${headerBase}/1/header?X-Plex-Token=${PLEX_TOKEN}`).catch(() => {});
+        log.info({ session: sid }, "[plex] Pre-warmed video+audio headers");
+      }
+    } else {
+      log.warn({ session, status: mpdRes.status }, "[plex] start.mpd failed");
+    }
+  } catch (e) {
+    log.error({ session, err: e.message }, "[plex] start.mpd fetch error");
+  }
+
   return `/api/plex/dash/manifest.mpd`;
 }
 
 // --- Plex DASH proxy (http-proxy for low-overhead streaming) ---------
 let plexDashMpdUrl = null;
+let plexDashMpdCache = null; // Cache the rewritten MPD body so we don't re-fetch start.mpd
 const plexProxy = httpProxy.createProxyServer({
   changeOrigin: true,
   secure: false,
@@ -1070,27 +2423,71 @@ const plexProxy = httpProxy.createProxyServer({
 });
 plexProxy.on("error", (err, _req, res) => {
   log.error({ err: err.message }, "[plex-proxy] error");
+  if (_req?.driveInProxyMetric) _req.driveInProxyMetric.error = err.message || String(err);
   if (res.writeHead) res.writeHead(502).end();
+});
+plexProxy.on("proxyRes", (proxyRes, req) => {
+  const metric = req.driveInProxyMetric;
+  if (!metric) return;
+  metric.upstreamStatus = proxyRes.statusCode;
+  const contentLength = proxyRes.headers?.["content-length"];
+  metric.upstreamContentLength = contentLength ? Number(contentLength) : null;
+  metric.upstreamResponseTimeMs = Date.now() - metric.startedAt;
+  proxyRes.on("data", (chunk) => {
+    recordProxyMetricBytes(metric, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+  });
 });
 
 app.get("/api/plex/dash/manifest.mpd", async (req, res) => {
   if (!plexDashMpdUrl) return res.status(404).json({ error: "No active Plex transcode" });
+  const key = "/api/plex/dash/manifest.mpd";
+  const requestCount = (dashMpdRequestCounts.get(key) || 0) + 1;
+  dashMpdRequestCounts.set(key, requestCount);
+  log.info({
+    endpoint: key,
+    requestCount,
+    cached: !!plexDashMpdCache,
+    currentTime: playerState.currentTime ?? null,
+  }, "DASH MPD requested");
+
+  // Serve cached MPD if available (Plex start.mpd only works once per session)
+  if (plexDashMpdCache) {
+    res.set("Content-Type", "application/dash+xml");
+    res.set("Access-Control-Allow-Origin", "*");
+    return res.send(plexDashMpdCache);
+  }
+
+  const metric = beginProxyMetric(key);
+  metric.url = truncateUrl(plexDashMpdUrl, 300);
+  trackProxyMetricLifecycle(res, metric);
   try {
+    const upstreamStartedAt = Date.now();
     const mpdRes = await fetch(plexDashMpdUrl);
+    setProxyMetricUpstream(metric, mpdRes, Date.now() - upstreamStartedAt);
     if (!mpdRes.ok) return res.status(mpdRes.status).json({ error: `Plex MPD ${mpdRes.status}` });
     let body = await mpdRes.text();
+    recordProxyMetricBytes(metric, Buffer.byteLength(body));
     body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/dash/");
+    plexDashMpdCache = body; // Cache for subsequent requests
     res.set("Content-Type", "application/dash+xml");
     res.set("Access-Control-Allow-Origin", "*");
     res.send(body);
   } catch (e) {
+    if (metric) metric.error = e.message || String(e);
     if (!res.headersSent) res.status(502).json({ error: e.message });
   }
 });
 
 app.use("/api/plex/dash/*path", (req, res) => {
+  // Reconstruct full original path (Express 5 may null originalUrl in sub-routes)
+  const fullPath = req.originalUrl || (req.baseUrl + req.url) || req.url;
+  const metric = beginProxyMetric("/api/plex/dash/*path");
+  metric.range = req.headers.range || null;
+  req.driveInProxyMetric = metric;
+  trackProxyMetricLifecycle(res, metric);
   // Rewrite path back to Plex's original URL structure
-  const plexPath = req.originalUrl.replace("/api/plex/dash/", "/video/:/transcode/universal/");
+  const plexPath = fullPath.replace("/api/plex/dash/", "/video/:/transcode/universal/");
+  metric.url = truncateUrl(`${PLEX_URL}${plexPath}`, 300);
   req.url = `${plexPath}${plexPath.includes("?") ? "&" : "?"}X-Plex-Token=${PLEX_TOKEN}`;
   plexProxy.web(req, res, { target: PLEX_URL });
 });
@@ -1237,7 +2634,7 @@ app.post("/api/plex/play", async (req, res) => {
     const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, { method: "PUT" });
     log.info({ status: putRes.status, partId: part.id, subtitleStreamID: subtitleStreamID || 0 }, "[plex] PUT subtitle/audio on part");
 
-    killPipeline();
+    await killPipeline();
 
     // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
     const resumeMs = offset || meta.viewOffset || 0;
@@ -1435,10 +2832,51 @@ app.post("/api/resolve", async (req, res) => {
   }
 });
 
+async function buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl }) {
+  resolved.isLive = false;
+  const pairId = `pair-${Date.now()}`;
+  const videoProxyId = proxyRegister(resolved.videoUrl, resolved.videoHeaders, {
+    originalUrl: sourceUrl, pairId, role: "video",
+  });
+  const audioProxyId = proxyRegister(resolved.audioUrl, resolved.audioHeaders, {
+    originalUrl: sourceUrl, pairId, role: "audio",
+  });
+  const videoInfo = await probeMP4Structure(videoProxyId);
+  const audioInfo = await probeMP4Structure(audioProxyId);
+  log.info({
+    video: { init: videoInfo.initEnd, segs: videoInfo.segments.length, mb: Math.round(videoInfo.totalSize / 1048576) },
+    audio: { init: audioInfo.initEnd, segs: audioInfo.segments.length, mb: Math.round(audioInfo.totalSize / 1048576) },
+  }, "DASH probe complete");
+  currentDashMpd = generateMpd(
+    resolved.videoFormat, resolved.audioFormat,
+    resolved.duration, videoProxyId, audioProxyId,
+    videoInfo, audioInfo,
+  );
+  return "/api/dash/manifest.mpd";
+}
+
+async function buildDashSplitTranscodeAndPlayerUrl({ resolved }) {
+  resolved.isLive = false;
+  const session = startTranscodePipeline(resolved.videoUrl, resolved.audioUrl, {
+    videoHeaders: resolved.videoHeaders,
+    audioHeaders: resolved.audioHeaders,
+  });
+  const ready = await waitForTranscodePlaylist(session.playlistPath, { timeoutMs: DASH_TRANSCODE_STARTUP_TIMEOUT_MS, pollMs: 150 });
+  if (ready.ready) {
+    log.info({ sessionId: session.sessionId, segmentCount: ready.segmentCount }, "DASH transcode ready for playback");
+    return "/api/transcode/playlist.m3u8";
+  }
+  if (!transcodeState.process) {
+    throw new Error("Transcode exited before playlist was ready");
+  }
+  throw new Error("DASH transcode did not produce init.mp4 and media segments within the startup window");
+}
+
 // Play a URL (resolve + push to player)
 app.post("/api/play", async (req, res) => {
-  const { url } = req.body;
+  const { url, transcode: transcodeEnabled } = req.body;
   if (!url) return res.status(400).json({ error: "url required" });
+  const shouldTranscode = transcodeEnabled !== false && String(transcodeEnabled).toLowerCase() !== "false" && DASH_TRANSCODE;
 
   if (!playerWs || playerWs.readyState !== 1) {
     return res.status(503).json({ error: "No player connected. Open the player in Tesla browser first." });
@@ -1460,28 +2898,28 @@ app.post("/api/play", async (req, res) => {
     let playerUrl;
 
     if (resolved.type === "dash_split") {
-      killPipeline();
-      // DASH: proxy video+audio streams separately, generate MPD for libmedia
-      const pairId = `pair-${Date.now()}`;
-      const videoProxyId = proxyRegister(resolved.videoUrl, resolved.videoHeaders, { originalUrl: url, pairId, role: "video" });
-      const audioProxyId = proxyRegister(resolved.audioUrl, resolved.audioHeaders, { originalUrl: url, pairId, role: "audio" });
-      // Sequential probes — some CDNs (Bilibili) reject concurrent range requests
-      const videoInfo = await probeMP4Structure(videoProxyId);
-      const audioInfo = await probeMP4Structure(audioProxyId);
-      log.info({ video: { init: videoInfo.initEnd, segs: videoInfo.segments.length, mb: Math.round(videoInfo.totalSize / 1048576) }, audio: { init: audioInfo.initEnd, segs: audioInfo.segments.length, mb: Math.round(audioInfo.totalSize / 1048576) } }, "DASH probe complete");
-      currentDashMpd = generateMpd(
-        resolved.videoFormat, resolved.audioFormat,
-        resolved.duration, videoProxyId, audioProxyId,
-        videoInfo, audioInfo,
-      );
-      resolved.isLive = false;
-      playerUrl = "/api/dash/manifest.mpd";
+      if (shouldTranscode) {
+        try {
+          playerUrl = await buildDashSplitTranscodeAndPlayerUrl({ resolved });
+          log.info({ url }, "Using DASH split ffmpeg transcode path");
+        } catch (err) {
+          log.error({ err: err.message }, "DASH transcode pipeline failed, falling back to MPD proxy");
+          await killPipeline();
+          playerUrl = await buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl: url });
+        }
+      } else {
+        log.info({ url }, "DASH split transcode disabled for this request");
+        playerUrl = await buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl: url });
+        await killPipeline();
+      }
     } else if (resolved.type === "hls") {
       const id = proxyRegister(resolved.url);
       playerUrl = `/api/proxy/hls?id=${id}`;
+      await killPipeline();
     } else {
       const id = proxyRegister(resolved.url);
       playerUrl = `/api/proxy?id=${id}`;
+      await killPipeline();
     }
 
     // Subtitles — check cache first, download if missing
@@ -1564,14 +3002,14 @@ app.post("/api/play", async (req, res) => {
 });
 
 // Playback control
-app.post("/api/control", (req, res) => {
+app.post("/api/control", async (req, res) => {
   const { action } = req.body;
   if (!["pause", "resume", "stop"].includes(action)) {
     return res.status(400).json({ error: "Invalid action" });
   }
 
   if (action === "stop") {
-    killPipeline();
+    await killPipeline();
     currentSubtitles = [];
     updateState({ status: "idle", url: null, resolvedUrl: null, title: null });
   }
@@ -1595,6 +3033,7 @@ app.post("/api/dev/reload", (_req, res) => {
 
 // Tesla controls debug log
 const devLog = [];
+const playerLog = [];
 app.post("/api/dev/log", (req, res) => {
   const entry = { ...req.body, serverTs: Date.now() };
   devLog.push(entry);
@@ -1606,8 +3045,30 @@ app.post("/api/dev/decode-log", (req, res) => {
   log.info({ decode: req.body }, "Player decode path report");
   res.json({ ok: true });
 });
+app.post("/api/dev/stutter-log", (req, res) => {
+  latestStutterLog = { ...req.body, receivedAt: Date.now() };
+  log.info({ stutter: latestStutterLog }, "Player stutter telemetry report");
+  res.json({ ok: true });
+});
+app.post("/api/dev/player-log", (req, res) => {
+  const receivedAt = Date.now();
+  const entries = Array.isArray(req.body) ? req.body : [req.body];
+  for (const item of entries) {
+    const entry = { ...item, receivedAt };
+    playerLog.push(entry);
+    if (playerLog.length > 50) playerLog.shift();
+    log.info({ playerLog: entry }, "Player runtime log");
+  }
+  res.json({ ok: true });
+});
 app.get("/api/dev/log", (_req, res) => {
   res.json(devLog);
+});
+app.get("/api/dev/stutter-log", (_req, res) => {
+  res.json(latestStutterLog || null);
+});
+app.get("/api/dev/player-log", (_req, res) => {
+  res.json(playerLog);
 });
 
 app.get("/api/dev/player", (_req, res) => {
@@ -1621,6 +3082,35 @@ app.post("/api/metrics/player", (req, res) => {
 
 app.get("/api/metrics", (_req, res) => {
   res.json(getMetricsSnapshot());
+});
+
+app.delete("/api/cache", (_req, res) => {
+  try {
+    rmSync(SEGMENT_CACHE_DIR, { recursive: true, force: true });
+    mkdirSync(SEGMENT_CACHE_DIR, { recursive: true });
+    segmentCacheState.sizeBytes = 0;
+    segmentCacheState.hits = 0;
+    segmentCacheState.misses = 0;
+    segmentCacheState.logicalKeyHits = 0;
+    segmentCacheState.hashKeyHits = 0;
+    segmentCacheState.prefetchCount = 0;
+    segmentCacheState.evictionCount = 0;
+    segmentCachePrefetchQueue.length = 0;
+    segmentCachePrefetchSet.clear();
+    segmentCachePrefetchActive = 0;
+    segmentCacheHealthSnapshot = {
+      hits: 0,
+      misses: 0,
+    };
+    if (segmentCacheEvictionTimer) {
+      clearTimeout(segmentCacheEvictionTimer);
+      segmentCacheEvictionTimer = null;
+    }
+    res.json({ ok: true, cleared: true, path: SEGMENT_CACHE_DIR });
+  } catch (err) {
+    log.error({ err: err?.message }, "Failed to clear segment cache");
+    res.status(500).json({ error: "Failed to clear segment cache" });
+  }
 });
 
 // Current status
@@ -1765,12 +3255,12 @@ process.on("uncaughtException", (err) => {
   log.fatal({ err: err?.message, stack: err?.stack }, "Uncaught exception");
 });
 
-function gracefulShutdown(signal) {
+async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   log.info({ signal }, "Shutting down gracefully");
   broadcast({ type: "serverShutdown" });
-  killPipeline();
+  await killPipeline();
   wss.clients.forEach((ws) => { try { ws.close(1001, "Server shutting down"); } catch {} });
   server.close(() => {
     log.info("All connections drained, exiting");
@@ -1779,8 +3269,10 @@ function gracefulShutdown(signal) {
   setTimeout(() => { log.error("Forced exit after 10s timeout"); process.exit(1); }, 10_000).unref();
 }
 
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
+process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+
+initializeSegmentCache();
 
 server.listen(PORT, () => {
   log.info({ port: PORT }, "Drive-In server started");

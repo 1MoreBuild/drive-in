@@ -4,6 +4,34 @@ const subtitleOverlay = document.getElementById("subtitle-overlay");
 let subtitleTracks = []; // [{ lang, cues }]
 let lastRenderedSubtitle = "";
 
+function clearSubtitleOverlay() {
+  if (!lastRenderedSubtitle && !subtitleOverlay.hasChildNodes()) return;
+  subtitleOverlay.replaceChildren();
+  lastRenderedSubtitle = "";
+}
+
+function renderSubtitleLines(lines) {
+  const nextRenderedSubtitle = lines.join("\n");
+  if (nextRenderedSubtitle === lastRenderedSubtitle) return;
+
+  lastRenderedSubtitle = nextRenderedSubtitle;
+  if (!lines.length) {
+    subtitleOverlay.replaceChildren();
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  lines.forEach((line, index) => {
+    const span = document.createElement("span");
+    span.textContent = line;
+    fragment.append(span);
+    if (index < lines.length - 1) {
+      fragment.append(document.createElement("br"));
+    }
+  });
+  subtitleOverlay.replaceChildren(fragment);
+}
+
 function binarySearchCue(cues, time) {
   let low = 0;
   let high = cues.length - 1;
@@ -62,43 +90,44 @@ export function parseVTT(text) {
     const lines = block.split("\n");
     const tsIdx = lines.findIndex((l) => l.includes("-->"));
     const content = lines.slice(tsIdx + 1).join("\n").replace(/<[^>]+>/g, "").trim();
-    if (content) cues.push({ start, end, text: content });
+    if (content) {
+      cues.push({
+        start,
+        end,
+        text: content,
+        displayText: content.replace(/\n/g, " "),
+      });
+    }
   }
   return cues;
 }
 
 export function renderSubtitle(time) {
   if (!subtitleTracks.length) {
-    if (lastRenderedSubtitle) {
-      subtitleOverlay.innerHTML = "";
-      lastRenderedSubtitle = "";
-    }
+    clearSubtitleOverlay();
     return;
   }
 
   const lines = [];
   for (const track of subtitleTracks) {
     const active = findActiveCue(track, time);
-    if (active) lines.push(active.text.replace(/\n/g, " "));
+    if (active) lines.push(active.displayText);
   }
-
-  const html = lines.length ? lines.map((l) => `<span>${l}</span>`).join("<br>") : "";
-  if (html !== lastRenderedSubtitle) {
-    lastRenderedSubtitle = html;
-    subtitleOverlay.innerHTML = html;
-  }
+  renderSubtitleLines(lines);
 }
 
 export async function loadSubtitleTrack(lang, url) {
   try {
     const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
+    const existingTrack = subtitleTracks.find((track) => track.lang === lang && track.url === absUrl);
+    if (existingTrack) return;
     const resp = await fetch(absUrl);
     const text = await resp.text();
     const cues = parseVTT(text);
     subtitleTracks = subtitleTracks.filter((t) => t.lang !== lang);
     // Store the current cue cursor with each track so subtitle lookup stays O(1) during steady playback.
-    subtitleTracks.push({ lang, cues, cursor: 0, lastTime: null });
-    lastRenderedSubtitle = "";
+    subtitleTracks.push({ lang, url: absUrl, cues, cursor: 0, lastTime: null });
+    clearSubtitleOverlay();
     console.log(`[subs] Loaded ${cues.length} cues for ${lang}`);
   } catch (e) {
     console.error("[subs] Failed to load subtitle:", e);
@@ -107,12 +136,14 @@ export async function loadSubtitleTrack(lang, url) {
 
 export function disableExternalSubtitle() {
   subtitleTracks = [];
-  subtitleOverlay.innerHTML = "";
-  lastRenderedSubtitle = "";
+  clearSubtitleOverlay();
 }
 
 export function removeSubtitleTrack(lang) {
   subtitleTracks = subtitleTracks.filter((t) => t.lang !== lang);
+  if (!subtitleTracks.length) {
+    clearSubtitleOverlay();
+    return;
+  }
   lastRenderedSubtitle = "";
-  if (!subtitleTracks.length) subtitleOverlay.innerHTML = "";
 }

@@ -24,6 +24,47 @@ const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
 const audioList = document.getElementById("audio-list");
 
+// --- Subtitle label formatting (based on actual Plex library data) ---
+
+function formatSubtitleLabel(sub) {
+  const t = (sub.title || "").trim();
+  const low = t.toLowerCase();
+
+  // Chinese: detect variant from title field
+  if (sub.languageCode === "zho" || sub.language === "中文" || (sub.displayTitle || "").includes("中文")) {
+    const hasChs = /chs|简体|简中|simplified/i.test(t);
+    const hasCht = /cht|繁体|繁中|traditional/i.test(t);
+    const hasEng = /eng|english|英/i.test(t);
+    const hasEffect = /特效/i.test(t);
+    const isForced = /forced|强制/i.test(t) || (sub.displayTitle || "").includes("Forced");
+
+    let label = "中文";
+    if (hasChs && hasEng) label = "简英双语";
+    else if (hasCht && hasEng) label = "繁英双语";
+    else if (hasChs) label = "简体中文";
+    else if (hasCht) label = "繁体中文";
+
+    if (hasEffect) label += "（特效）";
+    if (isForced) label += "（强制）";
+    return label;
+  }
+
+  // Non-Chinese: use displayTitle (Plex already localizes well), add flags from title
+  let label = sub.displayTitle || sub.language || t || "Unknown";
+  const isSDH = /sdh/i.test(t) || (sub.displayTitle || "").includes("SDH");
+  const isForced = /forced/i.test(t) || (sub.displayTitle || "").includes("Forced");
+  const isSigns = /signs/i.test(t);
+
+  // Avoid duplicating flags already in displayTitle
+  const flags = [];
+  if (isSDH && !label.includes("SDH")) flags.push("SDH");
+  if (isForced && !label.includes("Forced") && !label.includes("强制")) flags.push("强制");
+  if (isSigns) flags.push("标识");
+  if (flags.length) label += ` (${flags.join(", ")})`;
+
+  return label;
+}
+
 // --- Subtitle selection UI -------------------------------------------
 
 export function updateSubsUI() {
@@ -51,11 +92,8 @@ export function updateSubsUI() {
   if (hasPlex) {
     for (const sub of state.plexInfo.subtitles) {
       const btn = document.createElement("button");
-      const codec = (sub.codec || "").toUpperCase();
-      const label = sub.displayTitle || sub.language || "Unknown";
-      const mainText = codec ? `${label} (${codec})` : label;
-      const subText = sub.title && sub.title !== sub.displayTitle ? sub.title : "";
-      btn.innerHTML = `<span>${escHtml(mainText)}</span>${subText ? `<small>${escHtml(subText)}</small>` : ""}`;
+      const label = formatSubtitleLabel(sub);
+      btn.innerHTML = `<span>${escHtml(label)}</span>`;
       if (String(state.plexInfo.activeSubtitleID) === String(sub.id)) btn.classList.add("active");
       btn.addEventListener("click", (e) => { e.stopPropagation(); selectSubtitle(sub.id); });
       subsList.appendChild(btn);
@@ -121,7 +159,10 @@ export function toggleSubtitle(lang) {
 // --- Audio track selection -------------------------------------------
 
 export function updateAudioUI() {
-  if (!state.plexInfo?.audioTracks?.length || state.plexInfo.audioTracks.length <= 1) {
+  const hasTrackSelection = state.plexInfo?.audioTracks?.length > 1;
+  const hasBoostControl = !!state.player;
+
+  if (!hasTrackSelection && !hasBoostControl) {
     btnAudio.classList.add("hidden");
     audioPanel.classList.add("hidden");
     return;
@@ -129,6 +170,8 @@ export function updateAudioUI() {
   btnAudio.classList.remove("hidden");
 
   audioList.innerHTML = "";
+  if (!hasTrackSelection) return;
+
   for (const track of state.plexInfo.audioTracks) {
     const btn = document.createElement("button");
     const codec = (track.codec || "").toUpperCase();

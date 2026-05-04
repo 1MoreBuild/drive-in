@@ -2,6 +2,7 @@ node_modules/
 dist/
 .hls-cache/
 .media-cache/
+.segment-cache/
 .logs/
 .subs-cache/
 .env

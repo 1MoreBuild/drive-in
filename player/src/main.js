@@ -1,7 +1,7 @@
 import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
-import { initControls, updatePlayButton, updateVolumeButton } from "./controls.js";
-import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
+import { initControls, updateAudioGainUI, updatePlayButton, updateVolumeButton } from "./controls.js";
+import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setAudioGain, setPlayerCallbacks } from "./player.js";
 import { loadBrowseScreen, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 
@@ -20,7 +20,9 @@ initControls({
   onStop: stop,
   onSeekToTime: seekToTime,
   onSetVolume: (v) => { if (state.player) state.player.setVolume(v); },
+  onSetAudioGain: setAudioGain,
 });
+updateAudioGainUI();
 
 // --- Router ----------------------------------------------------------
 
@@ -45,6 +47,10 @@ function unlockAudio() {
     ctx.resume().then(() => ctx.close()).catch(() => {});
   } catch {}
 
+  try {
+    state.player?.constructor?.audioContext?.resume?.().catch(() => {});
+  } catch {}
+
   if (state.player) {
     try {
       state.player.setVolume(1);
@@ -52,6 +58,11 @@ function unlockAudio() {
       updateVolumeButton();
       state.player.resume().catch(() => {});
     } catch {}
+  }
+
+  // Sync Media Session after user gesture so Tesla car UI shows correct playback state
+  if (state.isPlaying) {
+    updateMediaSession();
   }
 }
 
@@ -102,6 +113,7 @@ function connect() {
 
   state.ws.onmessage = (e) => {
     try {
+      if (typeof e.data !== "string") return;
       const msg = JSON.parse(e.data);
 
       if (msg.type === "ping") {
@@ -110,9 +122,7 @@ function connect() {
         }
         return;
       }
-
-      // Skip per-message DOM lookups and noisy ping logs to reduce steady-state GC churn on Tesla.
-      console.log("[ws] Received:", msg.type);
+      if (msg.type === "pong" || msg.type === "playerState") return;
 
       switch (msg.type) {
         case "play":
@@ -185,7 +195,12 @@ function connect() {
             loadSubtitleTrack(msg.lang, msg.url);
           } else if (!msg.lang) {
             disableExternalSubtitle();
+            state.activeExternalSubs.clear();
           }
+          // Persist preference so next video auto-selects the same subtitles (CLI + UI)
+          try {
+            localStorage.setItem("preferred-sub-langs", JSON.stringify([...state.activeExternalSubs]));
+          } catch {}
           updateSubsUI();
           break;
         case "reload":
