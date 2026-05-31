@@ -4,6 +4,7 @@ dist/
 .media-cache/
 .segment-cache/
 .logs/
+.diag-reports/
 .subs-cache/
 .env
 .play-history.json
