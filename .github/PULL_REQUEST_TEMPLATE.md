@@ -20,7 +20,7 @@
 
 - [ ] Server starts without errors
 - [ ] Player loads in browser
-- [ ] Tested with relevant stream type(s): <!-- HLS / DASH / Direct / Plex -->
+- [ ] Tested with relevant stream type(s): <!-- HLS / split fMP4 HLS / Direct MP4 / Plex -->
 
 ## Related issues
 

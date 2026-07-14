@@ -46,6 +46,7 @@ All Node.js dependencies are listed in `package.json` files across the monorepo 
 | ws | MIT | WebSocket server |
 | http-proxy | MIT | Plex transcode proxy |
 | pino | MIT | Logging |
+| better-sqlite3 | MIT | Queue and playlist persistence |
 | commander | MIT | CLI framework |
 | mediabunny | MPL-2.0 | Media demuxing and WebCodecs decoding |
 | vite | MIT | Player build tool (dev dependency) |

@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19"
   },
   "repository": {
     "type": "git",
@@ -18,7 +18,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "vite": "^8.0.3"
+    "vite": "8.0.16"
   },
   "dependencies": {
     "mediabunny": "1.50.8"

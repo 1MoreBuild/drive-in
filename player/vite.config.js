@@ -1,4 +1,8 @@
 import { defineConfig } from "vite";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   server: {
@@ -21,5 +25,14 @@ export default defineConfig({
       },
     },
   },
-  build: { outDir: "dist" },
+  build: {
+    outDir: "dist",
+    rollupOptions: {
+      input: {
+        player: resolve(__dirname, "index.html"),
+        diagnostics: resolve(__dirname, "diag.html"),
+        metrics: resolve(__dirname, "metrics.html"),
+      },
+    },
+  },
 });

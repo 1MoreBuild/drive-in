@@ -1,6 +1,6 @@
 # Drive-In
 
-In-car media player for Tesla vehicles. Renders video on `<canvas>` via WebAssembly to bypass Tesla's restriction of freezing `<video>` elements while driving.
+In-car media player for Tesla vehicles. Mediabunny decodes with WebCodecs and Drive-In renders frames on `<canvas>` instead of `<video>`.
 
 > **Disclaimer**
 >
@@ -24,7 +24,7 @@ In-car media player for Tesla vehicles. Renders video on `<canvas>` via WebAssem
 ## Architecture
 
 ```
-CLI / Discord / Phone
+CLI / Browser UI
         |
         v  POST /api/play
    Express server (port 9090)
@@ -58,7 +58,7 @@ Tesla browser opens http://<server>/
 
 ## Prerequisites
 
-- **Node.js** >= 20
+- **Node.js** >= 20.19
 - **yt-dlp** — `brew install yt-dlp`
 - **ffmpeg** — `brew install ffmpeg`
 - **Deno** — `brew install deno` (required by yt-dlp for YouTube)
@@ -71,18 +71,20 @@ git clone https://github.com/1MoreBuild/drive-in.git
 cd drive-in
 cp .env.example .env          # configure environment variables (optional)
 npm install                    # install all workspaces
-npm run dev                    # start server + Cloudflare Tunnel
+npm run dev                    # start server + Vite at http://localhost:5173
 ```
 
-Open `http://localhost:9090` in a browser (or use the Cloudflare Tunnel URL on your Tesla).
+Open `http://localhost:5173` during development.
 
 ### Other Modes
 
 ```bash
-SERVE_SOURCE=1 npm run dev     # dev mode — serve player source, no Vite build
 npm run build                  # build player only (Vite production build)
-npm run start                  # build player + start server + Cloudflare Tunnel
+npm run start                  # build player + start production server on :9090
 npm run start -w server        # start server only (no tunnel, no build)
+npm run dev:remote             # dev server + Vite + temporary Cloudflare Tunnel
+npm run start:tunnel           # production server + configured named tunnel
+SERVE_SOURCE=1 npm run dev:server # serve source directly on :9090
 ```
 
 ### Playback Engine
@@ -178,7 +180,12 @@ npx drivein plex play 12345     # play by rating key
 
 - **SharedArrayBuffer** is required — the server sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless` headers automatically
 - **Audio autoplay** — the player starts muted due to browser restrictions; tap anywhere to unmute
-- **Cloudflare Tunnel** is recommended for accessing the server from the Tesla browser — set up your own tunnel with `cloudflared tunnel`
+- **Cloudflare Tunnel** is useful for Tesla access, but Drive-In has no built-in authentication. Protect public deployments with Cloudflare Access or an equivalent policy.
+
+## Diagnostics
+
+- `/diag.html` checks the browser features required by the Mediabunny player.
+- `/metrics.html` shows current proxy, buffering, and player metrics.
 
 ## Project Structure
 
@@ -187,12 +194,14 @@ drive-in/              (npm workspaces monorepo)
 +-- server/            Express + WebSocket + yt-dlp + Plex + proxy
 |   +-- index.js       Main server, all route/proxy/pipeline logic
 |   +-- logger.js      Pino logger setup
+|   +-- queue-store.js SQLite queue and playlist storage
 +-- player/            Browser frontend (Vite build for prod, source for dev)
 |   +-- index.html     Import map for Mediabunny source-mode development
 |   +-- vite.config.js Vite config for production build
 |   +-- src/
-|       +-- main.js    Mediabunny setup, WebSocket, audio unlock, controls
-|       +-- style.css  Fullscreen canvas layout, UI overlay
+|       +-- engine/    Mediabunny decoder, audio ring buffer, presentation clock
+|       +-- main.js    WebSocket, routing, audio unlock, controls
+|       +-- style.css  Canvas player and browse UI
 +-- cli/               CLI tool
 |   +-- bin/drivein.js Commander-based CLI
 +-- skills/            Claude Code skill definitions
@@ -204,6 +213,11 @@ drive-in/              (npm workspaces monorepo)
 |----------|---------|-------------|
 | `PLEX_URL` | `http://localhost:32400` | Plex server URL |
 | `PLEX_TOKEN` | (auto-detected on macOS) | Plex authentication token |
+| `PORT` | `9090` | HTTP and WebSocket port |
+| `LOG_LEVEL` | `info` in production | Pino log level |
+| `DRIVEIN_DB` | `.drive-in.sqlite` | Queue and playlist database path |
+| `SEGMENT_CACHE_MAX_BYTES` | `21474836480` | Maximum split-stream segment cache size |
+| `DASH_TRANSCODE` | disabled | Set to `1` to prefer the ffmpeg split-stream fallback |
 | `DRIVEIN_SERVER` | `http://localhost:9090` | CLI remote server URL |
 | `SERVE_SOURCE` | — | Set to `1` for dev mode (serve player source) |
 

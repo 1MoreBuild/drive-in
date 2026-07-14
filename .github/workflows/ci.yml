@@ -32,6 +32,9 @@ jobs:
       - name: Build player
         run: npm run build -w player
 
+      - name: Verify production pages
+        run: test -f player/dist/index.html && test -f player/dist/diag.html && test -f player/dist/metrics.html
+
       - name: Smoke test — server starts
         run: |
           node server/index.js &

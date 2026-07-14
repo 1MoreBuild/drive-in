@@ -6,7 +6,7 @@ Thanks for your interest in contributing! This guide will help you get started.
 
 ### Prerequisites
 
-- **Node.js** >= 20
+- **Node.js** >= 20.19
 - **yt-dlp** — `brew install yt-dlp`
 - **ffmpeg** — `brew install ffmpeg`
 - **Deno** — `brew install deno` (required by yt-dlp for YouTube)
@@ -19,18 +19,21 @@ git clone https://github.com/1MoreBuild/drive-in.git
 cd drive-in
 cp .env.example .env          # configure environment variables
 npm install                    # install all workspaces
-SERVE_SOURCE=1 npm run dev     # start in dev mode (no build needed)
+npm run dev                    # start server + Vite
 ```
 
-Open `http://localhost:9090` in a browser.
+Open `http://localhost:5173` in a browser.
 
 ### Development Modes
 
 | Command | Description |
 |---------|-------------|
-| `SERVE_SOURCE=1 npm run dev` | Dev mode — serves player source directly, hot reload |
-| `npm run dev` | Dev mode with Vite dev server + Cloudflare Tunnel |
-| `npm run build` | Build player and start production server + tunnel |
+| `npm run dev` | Server watch mode + Vite dev server |
+| `npm run dev:remote` | Dev mode with a temporary Cloudflare Tunnel |
+| `SERVE_SOURCE=1 npm run dev:server` | Serve player source directly on port 9090 |
+| `npm run build` | Build the production player |
+| `npm run start` | Build and start the production server on port 9090 |
+| `npm run start:tunnel` | Build and start with a configured named tunnel |
 | `npm run start -w server` | Server only, no tunnel |
 
 ## Code Style
@@ -71,7 +74,7 @@ Use clear, descriptive commit messages:
 There are no automated tests yet. Before submitting a PR, please verify:
 
 - [ ] Server starts without errors (`npm run start -w server`)
-- [ ] Player loads in browser at `http://localhost:9090`
+- [ ] Player loads in browser at `http://localhost:5173` in dev mode
 - [ ] Your change works for the relevant stream type(s):
 
 ```bash

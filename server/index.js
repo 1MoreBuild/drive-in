@@ -376,8 +376,8 @@ function updateState(patch) {
 
 // --- yt-dlp resolver -------------------------------------------------
 
-// Cap total bitrate at 4800k — allows 1080p30 (~4500k) and 720p60 (~3400k),
-// blocks 1080p60 (~5800k) which is too heavy for Tesla WASM decoding.
+// Cap total bitrate at 4800k — this still allows typical 1080p30 sources while
+// keeping segment size and Canvas 2D presentation load inside the tested range.
 const FORMAT_SELECTOR = "bv[vcodec^=avc1][tbr<=4800]+ba[acodec^=mp4a]/bv[vcodec^=avc1][tbr<=4800]+ba*/bv[tbr<=4800]+ba*/b*";
 
 // Common yt-dlp flags — use browser cookies to avoid 429 rate limiting

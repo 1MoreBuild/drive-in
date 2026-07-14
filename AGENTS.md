@@ -7,7 +7,7 @@ Drive-In is an in-car media player for Tesla vehicles. It bypasses Tesla's restr
 ### Architecture
 
 ```
-CLI / Discord / Phone
+CLI / Browser UI
         │
         ▼  POST /api/play
    Express server (port 9090)
@@ -64,18 +64,20 @@ drive-in/              (npm workspaces root)
 
 ```bash
 npm install                     # install all workspaces
-npm run dev                     # start server + Vite dev server + cloudflared tunnel
+npm run dev                     # start server + Vite dev server
 npm run build                   # build player only (Vite production build)
-npm run start                   # build player + start server + cloudflared tunnel
+npm run start                   # build player + start production server
 npm run start -w server         # start server only (no tunnel)
-SERVE_SOURCE=1 npm run dev      # dev mode — serve player source, no build needed
+npm run dev:remote              # dev server + temporary Cloudflare Tunnel
+npm run start:tunnel            # production server + configured named tunnel
+SERVE_SOURCE=1 npm run dev:server # serve player source directly on port 9090
 ```
 
-Open `http://localhost:9090` in a browser (or Tesla browser via Cloudflare Tunnel).
+Open `http://localhost:5173` in development, or `http://localhost:9090` after `npm run start`.
 
 ### Prerequisites
 
-- **Node.js** >= 20
+- **Node.js** >= 20.19
 - **yt-dlp** — `brew install yt-dlp`
 - **ffmpeg** — `brew install ffmpeg`
 - **Deno** — `brew install deno` (required by yt-dlp for YouTube)
@@ -121,6 +123,8 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - **Audio autoplay** — browsers require user gesture. Player starts muted and shows a mute icon; clicking anywhere unmutes.
 - **HLS cache cleanup** — old session dirs are removed on startup and when playback stops.
 - **Proxy map TTL** — registered proxy URLs expire after 1 hour.
+- **Segment cache** — split-stream byte ranges are cached under `.segment-cache/`; the default limit is 20 GiB.
+- **Queue storage** — queues and playlists use SQLite at `.drive-in.sqlite` by default.
 - **Play history** — last 30 items persisted to `.play-history.json`, used for resume on replay.
 - **Subtitles** — yt-dlp extracts subtitle URLs, server downloads and caches VTT/SRT files. Plex subtitles use burn-in via transcode.
 - **fMP4 HLS generation** — for split video+audio streams, the server probes MP4 structure and builds local HLS playlists over original byte ranges.

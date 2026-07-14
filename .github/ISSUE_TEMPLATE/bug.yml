@@ -27,7 +27,7 @@ body:
       description: Minimal steps to reproduce the issue
       placeholder: |
         1. Run `npm run dev`
-        2. Open browser to localhost:9090
+        2. Open http://localhost:5173
         3. ...
     validations:
       required: true
@@ -43,9 +43,9 @@ body:
       label: Environment
       description: OS, Node.js version, tool versions
       placeholder: |
-        OS: macOS 15.3
-        Node: v22.0.0
-        yt-dlp: 2025.03.31
-        ffmpeg: 7.1
+        OS: <name and version>
+        Node: <node --version>
+        yt-dlp: <yt-dlp --version>
+        ffmpeg: <ffmpeg -version>
     validations:
       required: true

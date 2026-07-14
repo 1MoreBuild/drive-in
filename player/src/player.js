@@ -47,7 +47,6 @@ const PLAYBACK_RATE_DROP_COOLDOWN_MS = 5_000;
 const AUDIO_UNDERRUN_COOLDOWN_MS = 2_000;
 const MEMORY_PRESSURE_GROWTH_BYTES = 8 * 1024 * 1024;
 const MEMORY_PRESSURE_GROWTH_RATIO = 0.15;
-const PLAYER_CANVAS_DIAGNOSTICS_KEY = "__driveInCanvasDiagnostics";
 const playerMetricsState = createPlayerMetricsState();
 const stutterEventBuffer = Array.from({ length: STUTTER_EVENT_CAPACITY }, () => ({
   seq: 0,
@@ -75,7 +74,6 @@ let stutterFlushIdleHandle = null;
 let scheduledStutterFlushReason = "interval";
 let longTaskObserver = null;
 let decodeHealthInterval = null;
-let canvasMonitorObserver = null;
 let playerHealthHeartbeatInterval = null;
 const playbackRecoveryState = {
   attempts: 0,
@@ -101,7 +99,7 @@ function defaultDecodePath() {
     ? "prefer-webcodecs-hardware"
     : CAPABILITY_PROFILE.hasWebCodecs
       ? "prefer-webcodecs"
-      : "wasm-fallback";
+      : "webcodecs-unavailable";
 }
 
 function clampAudioGain(value) {
@@ -1277,7 +1275,6 @@ function queueDecodeHealthCheck(player, phase, extra = {}, { jankCooldownMs = 0 
 
 function startDecodeHealthMonitoring(player) {
   stopDecodeHealthMonitoring();
-  attachCanvasDiagnostics(player);
   decodeHealthInterval = setInterval(() => {
     queueDecodeHealthCheck(state.player, "periodic-60s");
   }, DECODE_HEALTH_INTERVAL_MS);
@@ -1288,7 +1285,6 @@ function stopDecodeHealthMonitoring() {
     clearInterval(decodeHealthInterval);
     decodeHealthInterval = null;
   }
-  detachCanvasDiagnostics();
 }
 
 // --- MediaSession (Tesla steering wheel / browser media keys) --------
@@ -1518,78 +1514,6 @@ document.addEventListener("fullscreenchange", handleResize);
 document.addEventListener("webkitfullscreenchange", handleResize);
 const btnAudio = document.getElementById("btn-audio");
 
-function bindCanvasDiagnostics(canvas, player) {
-  if (!(canvas instanceof HTMLCanvasElement)) return;
-  if (canvas[PLAYER_CANVAS_DIAGNOSTICS_KEY]) return;
-
-  const onContextLost = (event) => {
-    event.preventDefault?.();
-    console.warn("[player] WebGL context lost");
-    queueDecodeHealthCheck(player, "webgl-context-lost", {
-      contextEvent: "lost",
-    });
-  };
-  const onContextRestored = () => {
-    console.log("[player] WebGL context restored");
-    try {
-      player?.resize?.(container.clientWidth, container.clientHeight);
-    } catch {}
-    queueDecodeHealthCheck(player, "webgl-context-restored", {
-      contextEvent: "restored",
-    });
-  };
-  const onContextCreationError = (event) => {
-    console.warn("[player] WebGL context creation error", event?.statusMessage || event);
-    queueDecodeHealthCheck(player, "webgl-context-creation-error", {
-      contextEvent: "creation-error",
-      statusMessage: event?.statusMessage || null,
-    });
-  };
-
-  canvas.addEventListener("webglcontextlost", onContextLost, { passive: false });
-  canvas.addEventListener("webglcontextrestored", onContextRestored);
-  canvas.addEventListener("webglcontextcreationerror", onContextCreationError);
-  canvas[PLAYER_CANVAS_DIAGNOSTICS_KEY] = {
-    onContextLost,
-    onContextRestored,
-    onContextCreationError,
-  };
-}
-
-function detachCanvasDiagnostics() {
-  if (canvasMonitorObserver) {
-    canvasMonitorObserver.disconnect();
-    canvasMonitorObserver = null;
-  }
-
-  for (const canvas of container.querySelectorAll("canvas")) {
-    const diagnostics = canvas[PLAYER_CANVAS_DIAGNOSTICS_KEY];
-    if (!diagnostics) continue;
-    canvas.removeEventListener("webglcontextlost", diagnostics.onContextLost);
-    canvas.removeEventListener("webglcontextrestored", diagnostics.onContextRestored);
-    canvas.removeEventListener("webglcontextcreationerror", diagnostics.onContextCreationError);
-    delete canvas[PLAYER_CANVAS_DIAGNOSTICS_KEY];
-  }
-}
-
-function attachCanvasDiagnostics(player) {
-  detachCanvasDiagnostics();
-
-  const bindExistingCanvases = () => {
-    for (const canvas of container.querySelectorAll("canvas")) {
-      bindCanvasDiagnostics(canvas, player);
-    }
-  };
-
-  bindExistingCanvases();
-
-  if (typeof MutationObserver !== "function") return;
-  canvasMonitorObserver = new MutationObserver(() => {
-    bindExistingCanvases();
-  });
-  canvasMonitorObserver.observe(container, { childList: true, subtree: true });
-}
-
 export function showStatus(text) {
   statusText.textContent = text;
   overlay.classList.remove("hidden");
@@ -1690,7 +1614,7 @@ export async function play(url, title, meta = {}) {
     stopProgressReporting();
     stopStutterTelemetryReporting();
     stopPlayerHealthHeartbeat();
-    // Tear down partially initialized players on failure so retry loops do not retain wasm/render resources.
+    // Tear down partially initialized players so retry loops do not retain decoders or canvases.
     const failedPlayer = state.player;
     state.player = null;
     await disposePlayer(failedPlayer);

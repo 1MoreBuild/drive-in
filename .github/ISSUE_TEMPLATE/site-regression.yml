@@ -31,8 +31,8 @@ body:
       label: Environment
       description: yt-dlp version, region, Node.js version
       placeholder: |
-        yt-dlp: 2025.03.31
-        Region: US
-        Node: v22.0.0
+        yt-dlp: <yt-dlp --version>
+        Region: <country or region>
+        Node: <node --version>
     validations:
       required: true

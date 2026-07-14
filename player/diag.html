@@ -45,24 +45,15 @@
   <div class="row"><span class="label">WebCodecs VideoDecoder</span><span class="value" id="webcodecs"></span></div>
   <div class="row"><span class="label">WebCodecs AudioDecoder</span><span class="value" id="webcodecs-audio"></span></div>
   <div class="row"><span class="label">Hardware Acceleration</span><span class="value" id="hw-accel"></span></div>
-  <div class="row"><span class="label">MediaSource Extensions</span><span class="value" id="mse"></span></div>
 </div>
 
-<h2>WebAssembly</h2>
+<h2>Drive-In Runtime</h2>
 <div class="grid">
-  <div class="row"><span class="label">WebAssembly</span><span class="value" id="wasm"></span></div>
-  <div class="row"><span class="label">WASM SIMD</span><span class="value" id="wasm-simd"></span></div>
-  <div class="row"><span class="label">WASM Threads</span><span class="value" id="wasm-threads"></span></div>
+  <div class="row"><span class="label">Cross-origin isolated</span><span class="value" id="isolated"></span></div>
   <div class="row"><span class="label">SharedArrayBuffer</span><span class="value" id="sab"></span></div>
-</div>
-
-<h2>Graphics & Audio</h2>
-<div class="grid">
-  <div class="row"><span class="label">WebGL 2.0</span><span class="value" id="webgl2"></span></div>
-  <div class="row"><span class="label">WebGL 1.0</span><span class="value" id="webgl1"></span></div>
-  <div class="row"><span class="label">GPU Renderer</span><span class="value info" id="gpu"></span></div>
+  <div class="row"><span class="label">Canvas 2D</span><span class="value" id="canvas2d"></span></div>
+  <div class="row"><span class="label">AudioContext</span><span class="value" id="audiocontext"></span></div>
   <div class="row"><span class="label">AudioWorklet</span><span class="value" id="audioworklet"></span></div>
-  <div class="row full-width"><span class="label">OffscreenCanvas</span><span class="value" id="offscreen"></span></div>
 </div>
 
 <h2>Codec Support (WebCodecs)</h2>
@@ -103,48 +94,13 @@ set("screen", `${screen.width}x${screen.height} @${devicePixelRatio}x`, "info");
 // Decode capabilities
 yn("webcodecs", typeof VideoDecoder !== "undefined");
 yn("webcodecs-audio", typeof AudioDecoder !== "undefined");
-yn("mse", typeof MediaSource !== "undefined");
-
-// WebAssembly
-yn("wasm", typeof WebAssembly !== "undefined");
+yn("isolated", globalThis.crossOriginIsolated === true);
 yn("sab", typeof SharedArrayBuffer !== "undefined");
-
-// WASM SIMD detection
-try {
-  // Minimal WASM module that uses SIMD: (v128.const)
-  const simdBytes = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,12,11]);
-  const simdMod = new WebAssembly.Module(simdBytes);
-  yn("wasm-simd", !!simdMod);
-} catch {
-  yn("wasm-simd", false);
-}
-
-// WASM Threads (atomics)
-try {
-  const threadBytes = new Uint8Array([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,5,4,1,3,1,1,10,11,1,9,0,65,0,65,0,254,16,2,0,26,11]);
-  const threadMod = new WebAssembly.Module(threadBytes);
-  yn("wasm-threads", !!threadMod);
-} catch {
-  yn("wasm-threads", false);
-}
-
-// Graphics
 const c = document.createElement("canvas");
-const gl2 = c.getContext("webgl2");
-const gl1 = !gl2 && c.getContext("webgl");
-yn("webgl2", !!gl2);
-yn("webgl1", !!(gl2 || gl1));
-
-const gl = gl2 || gl1;
-if (gl) {
-  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-  set("gpu", dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "unknown", "info");
-} else {
-  set("gpu", "N/A", "no");
-}
-
-yn("offscreen", typeof OffscreenCanvas !== "undefined");
-yn("audioworklet", typeof AudioWorklet !== "undefined" || !!(window.AudioContext && AudioContext.prototype.audioWorklet));
+yn("canvas2d", !!c.getContext("2d"));
+const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+yn("audiocontext", typeof AudioContextClass === "function");
+yn("audioworklet", typeof AudioContextClass === "function" && typeof AudioWorkletNode === "function");
 
 // Hardware acceleration probe via WebCodecs
 async function probeHwAccel() {

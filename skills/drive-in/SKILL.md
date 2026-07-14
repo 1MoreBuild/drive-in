@@ -46,6 +46,7 @@ Config is stored at `~/.config/drivein/config.json`. Precedence: `--server` flag
 - User asks to pause, resume, stop, or check what's currently playing
 - User wants to browse available movies, shows, or search for something to watch
 - User asks to switch subtitles, audio tracks, or pick a specific episode
+- User wants to manage Up Next or a saved playlist
 
 ## Play a URL
 
@@ -94,8 +95,26 @@ drivein plex play <ratingKey> --audio <audioId>   # play with a specific audio t
 drivein plex play <ratingKey> --sub <id> --audio <id>  # both
 ```
 
-Plex handles transcoding, so all codecs and subtitle formats are supported.
+Plex handles transcoding and subtitle burn-in when the selected source needs it.
 Playback resumes from where the user left off (Plex tracks progress).
+
+## Queue and playlists
+
+```bash
+drivein queue list
+drivein queue add "<url>"
+drivein queue plex <ratingKey>
+drivein queue next
+drivein queue remove <itemId>
+drivein queue clear
+
+drivein playlist list
+drivein playlist create "Watch Later"
+drivein playlist add <playlistId> "<url>"
+drivein playlist plex <playlistId> <ratingKey>
+drivein playlist import "<playlist-url>"
+drivein playlist enqueue <playlistId>
+```
 
 ### Subtitles (Plex)
 
@@ -182,6 +201,10 @@ Fallback when the CLI doesn't cover a use case. Base URL from `$DRIVEIN_SERVER`.
 | POST | `/api/control` | `{"action":"pause\|resume\|stop"}` | Control playback |
 | GET | `/api/status` | — | Server + player state |
 | GET | `/api/history` | — | Play history with resume offsets |
+| GET/POST/DELETE | `/api/queue` | Queue operations | Manage Up Next |
+| POST | `/api/queue/next` | — | Play the next queued item |
+| GET/POST | `/api/playlists` | Playlist operations | List or create playlists |
+| POST | `/api/playlists/:id/enqueue` | — | Add a playlist to Up Next |
 | GET | `/api/subtitles` | — | List subtitles for current non-Plex playback |
 | POST | `/api/subtitles/select` | `{"lang":"en"}` or `{"lang":null}` | Select/disable subtitle |
 | GET | `/api/plex/libraries` | — | List Plex libraries |

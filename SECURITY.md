@@ -22,14 +22,14 @@ The following are in scope for security reports:
 
 ## Out of Scope
 
-- The proxy endpoints are intentionally open (designed for local/tunnel use, not public internet)
 - Issues requiring physical access to the host machine
 - Denial of service via resource exhaustion (known limitation of local-only design)
 
 ## Security Design
 
 - WebSocket `updateState` only accepts the `status` field from player clients (sanitized)
-- Proxy endpoints are intended for local network or Cloudflare Tunnel use only
+- HTTP APIs, WebSocket control, and proxy endpoints do not currently have application-level authentication
+- Public deployments must add an access layer such as Cloudflare Access, a VPN, or a trusted-network firewall
 - yt-dlp commands have a 30-second timeout to prevent hanging
 - Environment variables are used for all secrets (Plex tokens, API keys)
 - No secrets are stored in the codebase
