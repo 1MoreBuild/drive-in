@@ -4,6 +4,7 @@ import { initControls, updateAudioGainUI, updatePlayButton, updateVolumeButton }
 import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setAudioGain, setPlayerCallbacks } from "./player.js";
 import { loadBrowseScreen, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
+import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
 
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
@@ -92,12 +93,21 @@ function connect() {
     if (route.view === "player" && (route.url || route.plex)) {
       showStatus("Resuming playback...");
       const endpoint = route.plex ? "/api/plex/play" : "/api/play";
-      const body = route.plex ? { ratingKey: route.plex } : { url: route.url };
-      fetch(`${location.origin}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).catch(() => {
+      const body = route.plex ? plexPlaybackRequest(route.plex) : { url: route.url };
+      const playbackRequest = route.plex
+        ? requestPlexPlayback(body)
+        : fetch(`${location.origin}${endpoint}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(async (response) => {
+          if (response.ok) return response;
+          const result = await response.json().catch(() => ({}));
+          throw new Error(result.error || `Playback failed with ${response.status}`);
+        });
+      playbackRequest.catch((error) => {
+        console.error("[playback] Resume failed:", error);
+        showStatus(`Playback error: ${error.message}`);
         navigate("/", true);
         loadBrowseScreen();
       });
@@ -128,27 +138,6 @@ function connect() {
           btnAudio.classList.add("hidden");
           audioPanel.classList.add("hidden");
           showStatus(`Loading: ${msg.title || "..."}`);
-          // Auto-select Plex subtitle and audio from saved preferences
-          if (msg.plex?.ratingKey && !msg.plex.activeSubtitleID && !msg.plex.activeAudioID) {
-            try {
-              const subPrefs = JSON.parse(localStorage.getItem("preferred-sub-langs") || "[]");
-              const audioLang = localStorage.getItem("preferred-audio-lang");
-              const subMatch = subPrefs.length && msg.plex.subtitles?.find((s) => subPrefs.includes(s.language));
-              const audioMatch = audioLang && msg.plex.audioTracks?.find((t) => t.language === audioLang && !t.selected);
-              if (subMatch || audioMatch) {
-                fetch(`${location.origin}/api/plex/play`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    ratingKey: msg.plex.ratingKey,
-                    ...(subMatch ? { subtitleStreamID: subMatch.id } : {}),
-                    ...(audioMatch ? { audioStreamID: audioMatch.id } : {}),
-                  }),
-                }).catch(() => {});
-                break;
-              }
-            } catch {}
-          }
           play(msg.url, msg.title, {
             isLive: msg.isLive,
             duration: msg.duration || 0,

@@ -412,10 +412,19 @@ function normalizeBufferedSeconds(value) {
   }
 
   if (typeof value === "object") {
-    if ("bufferHealthSeconds" in value) return normalizeBufferedSeconds(value.bufferHealthSeconds);
-    if ("bufferedSeconds" in value) return normalizeBufferedSeconds(value.bufferedSeconds);
-    if ("bufferedDuration" in value) return normalizeBufferedSeconds(value.bufferedDuration);
-    if ("seconds" in value) return normalizeBufferedSeconds(value.seconds);
+    if ("hlsBufferedAheadSeconds" in value) {
+      const seconds = normalizeMetricNumber(value.hlsBufferedAheadSeconds);
+      return seconds == null ? null : Math.max(0, seconds);
+    }
+    if ("videoBufferedMs" in value) {
+      const milliseconds = normalizeMetricNumber(value.videoBufferedMs);
+      if (milliseconds != null) return Math.max(0, milliseconds / 1000);
+    }
+    for (const key of ["bufferHealthSeconds", "bufferedSeconds", "bufferedDuration", "seconds"]) {
+      if (!(key in value)) continue;
+      const seconds = normalizeMetricNumber(value[key]);
+      return seconds == null ? null : Math.max(0, seconds);
+    }
     if ("end" in value) {
       const end = toMetricSeconds(value.end);
       const start = "start" in value ? toMetricSeconds(value.start) : state.currentTime;
@@ -770,6 +779,12 @@ function summarizePlayerStats(player) {
     videoCodec: typeof stats.videocodec === "string" ? stats.videocodec : null,
     width: normalizeMetricNumber(stats.width),
     height: normalizeMetricNumber(stats.height),
+    hlsBufferedAheadSeconds: normalizeMetricNumber(stats.hlsBufferedAheadSeconds),
+    abrCurrentBitrate: normalizeMetricNumber(stats.abrCurrentBitrate),
+    abrAdvertisedBitrate: normalizeMetricNumber(stats.abrAdvertisedBitrate),
+    abrLastDecision: stats.abrLastDecision && typeof stats.abrLastDecision === "object"
+      ? stats.abrLastDecision
+      : null,
     jitterBuffer,
   };
 }
@@ -1477,6 +1492,47 @@ function createMediabunnyPlayer(meta) {
         hideBuffering();
         showStatus(`Error: ${error.message}`);
       }
+    },
+    onAbrSwitch: async ({
+      session,
+      switchUrl,
+      fromBitrate,
+      videoBitrate,
+      currentTime,
+      reason,
+      network,
+    }) => {
+      postPlayerRuntimeLog("abr_switch_start", {
+        session,
+        fromBitrate,
+        toBitrate: videoBitrate,
+        reason,
+        network,
+      });
+      const response = await fetch(switchUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session,
+          videoBitrate,
+          currentTime,
+          switchOffset: currentTime + Math.max(0, Number(network?.bufferedAheadSeconds) || 0),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `ABR switch failed with ${response.status}`);
+      if (meta.mediaSource?.abr) {
+        meta.mediaSource.abr.currentBitrate = result.videoBitrate;
+        meta.mediaSource.abr.advertisedBitrate = result.advertisedBitrate || null;
+      }
+      postPlayerRuntimeLog("abr_switch_end", {
+        session,
+        fromBitrate,
+        toBitrate: result.videoBitrate,
+        advertisedBitrate: result.advertisedBitrate || null,
+        reason,
+      });
+      return result;
     },
   });
 

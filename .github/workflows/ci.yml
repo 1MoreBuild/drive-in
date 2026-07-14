@@ -29,6 +29,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Test player
+        run: npm test
+
       - name: Build player
         run: npm run build -w player
 

@@ -9,7 +9,6 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, rmSync, rea
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
-import httpProxy from "http-proxy";
 import log from "./logger.js";
 import {
   addPlaylistItem,
@@ -33,6 +32,17 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
 const PLEX_URL = process.env.PLEX_URL || "http://localhost:32400";
+const PLEX_ABR_BITRATES = (() => {
+  const parsed = String(process.env.PLEX_ABR_BITRATES || "3000,5000,8000")
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value) && value >= 500 && value <= 20_000)
+    .map(Math.floor);
+  const unique = [...new Set(parsed)].sort((a, b) => a - b);
+  return unique.length ? unique : [3000, 5000, 8000];
+})();
+const PLEX_INITIAL_VIDEO_BITRATE = PLEX_ABR_BITRATES[0];
+const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
 const SEGMENT_CACHE_DIR = resolve(__dirname, "../.segment-cache");
@@ -2553,7 +2563,26 @@ async function plexApi(path) {
   return res.json();
 }
 
-function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offsetSec, session } = {}) {
+function normalizePlexAbrBitrate(value, fallback = PLEX_INITIAL_VIDEO_BITRATE) {
+  const requested = Number(value);
+  if (PLEX_ABR_BITRATES.includes(requested)) return requested;
+  return PLEX_ABR_BITRATES.includes(fallback) ? fallback : PLEX_INITIAL_VIDEO_BITRATE;
+}
+
+let plexHlsManifestUrl = null;
+let plexHlsManifestCache = null;
+let activePlexTranscode = null;
+let plexAbrSwitchPromise = null;
+let plexTranscodeGeneration = 0;
+
+function plexTranscodeParams(ratingKey, {
+  subtitleStreamID,
+  audioStreamID,
+  offsetSec,
+  session,
+  videoBitrate,
+} = {}) {
+  const selectedVideoBitrate = normalizePlexAbrBitrate(videoBitrate);
   return new URLSearchParams({
     hasMDE: "1",
     path: `/library/metadata/${ratingKey}`,
@@ -2565,7 +2594,10 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     directStream: "1",
     directStreamAudio: "1",
     videoResolution: "1920x1080",
-    maxVideoBitrate: "8000",
+    // Resolution stays independent from rate selection. Drive-In changes this
+    // rate inside one Plex HLS session, so segment URLs and playback stay stable.
+    maxVideoBitrate: String(selectedVideoBitrate),
+    videoBitrate: String(selectedVideoBitrate),
     subtitleSize: "100",
     subtitles: subtitleStreamID ? "burn" : "none",
     audioBoost: "280",
@@ -2578,7 +2610,7 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     ...(offsetSec ? { offset: String(offsetSec) } : {}),
     session,
     "X-Plex-Incomplete-Segments": "1",
-    "X-Plex-Client-Identifier": "drive-in-player",
+    "X-Plex-Client-Identifier": `drive-in-player-${session}`,
     "X-Plex-Product": "Drive-In",
     "X-Plex-Features": "external-media,indirect-media,hub-style-list",
     "X-Plex-Platform": "Chrome",
@@ -2591,8 +2623,10 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
 }
 
 async function plexTranscodeUrl(ratingKey, opts = {}) {
+  const generation = ++plexTranscodeGeneration;
   const session = opts.session || `di-${Date.now()}`;
-  const params = plexTranscodeParams(ratingKey, { ...opts, session });
+  const videoBitrate = normalizePlexAbrBitrate(opts.videoBitrate);
+  const params = plexTranscodeParams(ratingKey, { ...opts, session, videoBitrate });
   // Call decision endpoint first — Plex needs this to set up the transcode pipeline
   const decisionUrl = `${PLEX_URL}/video/:/transcode/universal/decision?${params}`;
   const decisionRes = await fetch(decisionUrl, { headers: { Accept: "application/json" } });
@@ -2603,64 +2637,183 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
   log.info({
     status: decisionRes.status,
     session,
+    videoBitrate,
     generalDecisionCode: mc?.generalDecisionCode,
     generalDecisionText: mc?.generalDecisionText,
     transcodeDecisionCode: mc?.transcodeDecisionCode,
     transcodeDecisionText: mc?.transcodeDecisionText,
     subtitleDecision: subStreams.map((s) => ({ id: s.id, codec: s.codec, decision: s.decision, burn: s.burn })),
   }, "[plex] transcode decision");
+  if (!decisionRes.ok) {
+    throw new Error(`Plex transcode decision failed with ${decisionRes.status}`);
+  }
   // Fetch the master playlist eagerly so Plex starts transcoding before the
   // browser asks for its first media segment.
   const startHlsUrl = `${PLEX_URL}/video/:/transcode/universal/start.m3u8?${params}`;
-  plexHlsManifestUrl = startHlsUrl;
-  plexHlsManifestCache = null;
 
   try {
-    log.info({ session }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
+    log.info({ session, videoBitrate }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
     const manifestRes = await fetch(startHlsUrl);
     if (manifestRes.ok) {
-      let body = await manifestRes.text();
+      const upstreamBody = await manifestRes.text();
+      if (opts.prewarmSegments) {
+        await prewarmPlexHlsSegments(upstreamBody, startHlsUrl, opts.prewarmSegments);
+      }
+      if (generation !== plexTranscodeGeneration) {
+        await stopPlexTranscodeSession(session);
+        throw new Error("Plex transcode request was superseded");
+      }
+      let body = upstreamBody;
       body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
+      plexHlsManifestUrl = startHlsUrl;
       plexHlsManifestCache = body;
-      log.info({ session, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
+      const advertisedBitrate = Number(body.match(/(?:^|,)BANDWIDTH=(\d+)/m)?.[1]) || null;
+      activePlexTranscode = {
+        session,
+        ratingKey: String(ratingKey),
+        subtitleStreamID: opts.subtitleStreamID || null,
+        audioStreamID: opts.audioStreamID || null,
+        videoBitrate,
+        advertisedBitrate,
+        offsetSec: Number(opts.offsetSec) || 0,
+      };
+      log.info({ session, videoBitrate, advertisedBitrate, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
     } else {
-      log.warn({ session, status: manifestRes.status }, "[plex] start.m3u8 failed");
+      throw new Error(`Plex start.m3u8 failed with ${manifestRes.status}`);
     }
   } catch (e) {
     log.error({ session, err: e.message }, "[plex] start.m3u8 fetch error");
+    throw e;
   }
 
   return `/api/plex/hls/master.m3u8`;
 }
 
 // --- Plex HLS proxy ---------------------------------------------------
-let plexHlsManifestUrl = null;
-let plexHlsManifestCache = null;
-const plexProxy = httpProxy.createProxyServer({
-  changeOrigin: true,
-  secure: false,
-  followRedirects: true,
-  ws: true,
-});
-plexProxy.on("error", (err, _req, res) => {
-  log.error({ err: err.message }, "[plex-proxy] error");
-  if (_req?.driveInProxyMetric) _req.driveInProxyMetric.error = err.message || String(err);
-  if (res.writeHead) res.writeHead(502).end();
-});
-plexProxy.on("proxyRes", (proxyRes, req) => {
-  const metric = req.driveInProxyMetric;
-  if (!metric) return;
-  metric.upstreamStatus = proxyRes.statusCode;
-  const contentLength = proxyRes.headers?.["content-length"];
-  metric.upstreamContentLength = contentLength ? Number(contentLength) : null;
-  metric.upstreamResponseTimeMs = Date.now() - metric.startedAt;
-  proxyRes.on("data", (chunk) => {
-    recordProxyMetricBytes(metric, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
-  });
-});
+
+async function stopPlexTranscodeSession(session) {
+  if (!session || !PLEX_TOKEN) return;
+  const params = new URLSearchParams({ session, "X-Plex-Token": PLEX_TOKEN });
+  await fetch(`${PLEX_URL}/video/:/transcode/universal/stop?${params}`);
+}
+
+async function stopActivePlexTranscode() {
+  plexTranscodeGeneration += 1;
+  plexAbrSwitchPromise = null;
+  const session = activePlexTranscode?.session;
+  activePlexTranscode = null;
+  plexHlsManifestUrl = null;
+  plexHlsManifestCache = null;
+  try {
+    await stopPlexTranscodeSession(session);
+  } catch (error) {
+    log.warn({ session, err: error.message }, "[plex] failed to stop transcode session");
+  }
+}
+
+function trimPlexHlsResumePlaceholders(body) {
+  const hadTrailingNewline = body.endsWith("\n");
+  const lines = body.split(/\r?\n/);
+  const startLine = lines.find((line) => line.startsWith("#EXT-X-START:"));
+  const offsetMatch = startLine?.match(/TIME-OFFSET=(-?\d+(?:\.\d+)?)/i);
+  const resumeOffset = Number(offsetMatch?.[1]);
+  if (!Number.isFinite(resumeOffset) || resumeOffset <= 0) return body;
+
+  const firstSegmentIndex = lines.findIndex((line) => line.startsWith("#EXTINF:"));
+  if (firstSegmentIndex === -1) return body;
+
+  let accumulatedDuration = 0;
+  let droppedSegments = 0;
+  let firstKeptSegmentIndex = -1;
+  for (let index = firstSegmentIndex; index < lines.length; index += 1) {
+    if (!lines[index].startsWith("#EXTINF:")) continue;
+    const duration = Number(lines[index].slice("#EXTINF:".length).split(",", 1)[0]);
+    if (!Number.isFinite(duration) || duration < 0) return body;
+    if (accumulatedDuration + duration > resumeOffset) {
+      firstKeptSegmentIndex = index;
+      break;
+    }
+    accumulatedDuration += duration;
+    droppedSegments += 1;
+  }
+
+  if (!droppedSegments || firstKeptSegmentIndex === -1) return body;
+
+  const mediaSequenceIndex = lines.findIndex((line) => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
+  const originalMediaSequence = mediaSequenceIndex === -1
+    ? 0
+    : Number(lines[mediaSequenceIndex].slice("#EXT-X-MEDIA-SEQUENCE:".length));
+  if (!Number.isInteger(originalMediaSequence) || originalMediaSequence < 0) return body;
+
+  const trimmedLines = [
+    ...lines.slice(0, firstSegmentIndex),
+    ...lines.slice(firstKeptSegmentIndex),
+  ].filter((line) => !line.startsWith("#EXT-X-START:"));
+  const nextMediaSequence = originalMediaSequence + droppedSegments;
+  const trimmedMediaSequenceIndex = trimmedLines.findIndex((line) => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
+  if (trimmedMediaSequenceIndex === -1) {
+    const nextSegmentIndex = trimmedLines.findIndex((line) => line.startsWith("#EXTINF:"));
+    trimmedLines.splice(nextSegmentIndex, 0, `#EXT-X-MEDIA-SEQUENCE:${nextMediaSequence}`);
+  } else {
+    trimmedLines[trimmedMediaSequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${nextMediaSequence}`;
+  }
+
+  log.info({ resumeOffset, droppedSegments, nextMediaSequence }, "[plex] trimmed resume placeholders");
+  const trimmed = trimmedLines.join("\n");
+  return hadTrailingNewline && !trimmed.endsWith("\n") ? `${trimmed}\n` : trimmed;
+}
+
+async function fetchPlexSegmentWithRetry(url) {
+  let response;
+  for (let attempt = 0; attempt < PLEX_SEGMENT_RETRY_DELAYS_MS.length; attempt += 1) {
+    const delayMs = PLEX_SEGMENT_RETRY_DELAYS_MS[attempt];
+    if (delayMs) await sleep(delayMs);
+    response = await fetch(url);
+    if (response.status !== 404 || attempt === PLEX_SEGMENT_RETRY_DELAYS_MS.length - 1) break;
+    await response.arrayBuffer().catch(() => {});
+  }
+  return response;
+}
+
+async function prewarmPlexHlsSegments(masterBody, masterUrl, count) {
+  const mediaPath = masterBody
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith("#") && /\.m3u8(?:\?|$)/i.test(line));
+  if (!mediaPath) throw new Error("Plex ABR prewarm could not find media playlist");
+
+  const mediaUrl = new URL(mediaPath, masterUrl);
+  mediaUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
+  const mediaResponse = await fetch(mediaUrl);
+  if (!mediaResponse.ok) throw new Error(`Plex ABR media playlist failed with ${mediaResponse.status}`);
+  const trimmedBody = trimPlexHlsResumePlaceholders(await mediaResponse.text());
+  const segmentUrls = trimmedBody
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .slice(0, Math.max(1, Math.floor(count)))
+    .map((line) => {
+      const url = new URL(line, mediaUrl);
+      url.searchParams.set("X-Plex-Token", PLEX_TOKEN);
+      return url;
+    });
+  if (!segmentUrls.length) throw new Error("Plex ABR prewarm found no media segments");
+
+  const startedAt = Date.now();
+  const results = await Promise.all(segmentUrls.map(async (url) => {
+    const response = await fetchPlexSegmentWithRetry(url);
+    const bytes = (await response.arrayBuffer()).byteLength;
+    return { status: response.status, bytes };
+  }));
+  if (results.some((result) => result.status < 200 || result.status >= 300)) {
+    throw new Error(`Plex ABR segment prewarm failed: ${results.map((result) => result.status).join(",")}`);
+  }
+  log.info({ count: results.length, durationMs: Date.now() - startedAt, results }, "[plex-abr] rendition prewarmed");
+}
 
 function rewritePlexHlsManifest(body) {
-  return body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
+  const rewritten = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
+  return trimPlexHlsResumePlaceholders(rewritten);
 }
 
 app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
@@ -2715,10 +2868,48 @@ app.use("/api/plex/hls/*path", async (req, res) => {
   const metric = beginProxyMetric("/api/plex/hls/*segment");
   metric.range = req.headers.range || null;
   metric.url = truncateUrl(`${PLEX_URL}${plexPath}`, 300);
-  req.driveInProxyMetric = metric;
   trackProxyMetricLifecycle(res, metric);
-  req.url = tokenizedPath;
-  plexProxy.web(req, res, { target: PLEX_URL });
+  const upstreamUrl = `${PLEX_URL}${tokenizedPath}`;
+  const startedAt = Date.now();
+
+  try {
+    let upstream;
+    for (let attempt = 0; attempt < PLEX_SEGMENT_RETRY_DELAYS_MS.length; attempt += 1) {
+      const delayMs = PLEX_SEGMENT_RETRY_DELAYS_MS[attempt];
+      if (delayMs) await sleep(delayMs);
+      upstream = await fetch(upstreamUrl, {
+        headers: req.headers.range ? { Range: req.headers.range } : {},
+      });
+      if (upstream.status !== 404 || attempt === PLEX_SEGMENT_RETRY_DELAYS_MS.length - 1) break;
+      await upstream.arrayBuffer().catch(() => {});
+    }
+
+    setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
+    const headersToCopy = [
+      "accept-ranges",
+      "cache-control",
+      "content-length",
+      "content-range",
+      "content-type",
+      "x-plex-protocol",
+    ];
+    for (const header of headersToCopy) {
+      const value = upstream.headers.get(header);
+      if (value) res.set(header, value);
+    }
+    res.set("Access-Control-Allow-Origin", "*");
+    res.status(upstream.status);
+    if (!upstream.body) return res.end();
+
+    const source = Readable.fromWeb(upstream.body);
+    source.on("data", (chunk) => {
+      recordProxyMetricBytes(metric, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    });
+    await pipeline(source, res);
+  } catch (error) {
+    metric.error = error.message || String(error);
+    if (!res.headersSent) res.status(502).json({ error: error.message });
+  }
 });
 // Plex API routes
 app.get("/api/plex/libraries", async (_req, res) => {
@@ -2830,7 +3021,15 @@ app.get("/api/plex/audio/:id", async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-async function playPlexNow({ ratingKey, subtitleStreamID, audioStreamID, offset } = {}) {
+async function playPlexNow({
+  ratingKey,
+  subtitleStreamID,
+  audioStreamID,
+  preferredSubtitleLanguages,
+  preferredAudioLanguage,
+  estimatedThroughputKbps,
+  offset,
+} = {}) {
   if (!ratingKey) {
     const err = new Error("ratingKey required");
     err.status = 400;
@@ -2853,53 +3052,92 @@ async function playPlexNow({ ratingKey, subtitleStreamID, audioStreamID, offset 
   const meta = data.MediaContainer.Metadata[0];
   const media = meta.Media[0];
   const part = media.Part[0];
+  const partStreams = part.Stream || [];
+  const subtitleLanguages = Array.isArray(preferredSubtitleLanguages)
+    ? preferredSubtitleLanguages.map(String)
+    : [];
+  const selectedSubtitleStreamID = subtitleStreamID || subtitleLanguages
+    .map((language) => partStreams.find((stream) => stream.streamType === 3 && stream.language === language)?.id)
+    .find(Boolean);
+  const selectedAudioStreamID = audioStreamID || (preferredAudioLanguage
+    ? partStreams.find((stream) => (
+      stream.streamType === 2
+      && stream.language === String(preferredAudioLanguage)
+      && !stream.selected
+    ))?.id
+    : null);
   const title = meta.grandparentTitle
     ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
     : meta.title;
 
   // Set subtitle and audio selection on the Plex part before transcoding
   const partParams = new URLSearchParams({ "X-Plex-Token": PLEX_TOKEN, allParts: "1" });
-  if (subtitleStreamID) {
-    partParams.set("subtitleStreamID", subtitleStreamID);
+  if (selectedSubtitleStreamID) {
+    partParams.set("subtitleStreamID", selectedSubtitleStreamID);
   } else {
     partParams.set("subtitleStreamID", "0");
   }
-  if (audioStreamID) {
-    partParams.set("audioStreamID", audioStreamID);
+  if (selectedAudioStreamID) {
+    partParams.set("audioStreamID", selectedAudioStreamID);
   }
   const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, { method: "PUT" });
-  log.info({ status: putRes.status, partId: part.id, subtitleStreamID: subtitleStreamID || 0 }, "[plex] PUT subtitle/audio on part");
+  log.info({
+    status: putRes.status,
+    partId: part.id,
+    subtitleStreamID: selectedSubtitleStreamID || 0,
+    audioStreamID: selectedAudioStreamID || null,
+  }, "[plex] PUT subtitle/audio on part");
 
   resetDashSegmentSession();
   await killPipeline();
+  await stopActivePlexTranscode();
 
   // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
   const resumeMs = offset || meta.viewOffset || 0;
   const resumeSec = resumeMs ? Math.floor(resumeMs / 1000) : 0;
-  const playerUrl = await plexTranscodeUrl(ratingKey, { subtitleStreamID, audioStreamID, offsetSec: resumeSec });
+  const safeInitialBudget = Number(estimatedThroughputKbps) / 1.5;
+  const selectedVideoBitrate = Number.isFinite(safeInitialBudget) && safeInitialBudget > 0
+    ? PLEX_ABR_BITRATES.filter((bitrate) => bitrate <= safeInitialBudget).pop() || PLEX_INITIAL_VIDEO_BITRATE
+    : PLEX_INITIAL_VIDEO_BITRATE;
+  const playerUrl = await plexTranscodeUrl(ratingKey, {
+    subtitleStreamID: selectedSubtitleStreamID,
+    audioStreamID: selectedAudioStreamID,
+    offsetSec: resumeSec,
+    videoBitrate: selectedVideoBitrate,
+  });
 
   updateState({ status: "playing", title, resolvedUrl: `plex://${ratingKey}`, isLive: false });
 
   // Collect subtitle and audio tracks for player UI
-  const subtitles = (part.Stream || [])
+  const subtitles = partStreams
     .filter((s) => s.streamType === 3)
     .map((s) => ({ id: s.id, codec: s.codec, language: s.language, title: s.title || s.displayTitle, displayTitle: s.displayTitle }));
-  const audioTracks = (part.Stream || [])
+  const audioTracks = partStreams
     .filter((s) => s.streamType === 2)
     .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));
 
   broadcast({
     type: "play",
     url: playerUrl,
-    mediaSource: { type: "hls", url: playerUrl },
+    mediaSource: {
+      type: "hls",
+      url: playerUrl,
+      abr: {
+        session: activePlexTranscode.session,
+        bitrates: PLEX_ABR_BITRATES,
+        currentBitrate: activePlexTranscode.videoBitrate,
+        advertisedBitrate: activePlexTranscode.advertisedBitrate,
+        switchUrl: "/api/plex/abr",
+      },
+    },
     title,
     isLive: false,
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
     thumbnail: meta.thumb ? `${PLEX_URL}${meta.thumb}?X-Plex-Token=${PLEX_TOKEN}` : null,
     plex: {
       ratingKey, subtitles, audioTracks,
-      activeSubtitleID: subtitleStreamID || null,
-      activeAudioID: audioStreamID || null,
+      activeSubtitleID: selectedSubtitleStreamID || null,
+      activeAudioID: selectedAudioStreamID || null,
     },
     startTime: resumeMs ? resumeMs / 1000 : 0,
   });
@@ -2922,6 +3160,70 @@ app.post("/api/plex/play", async (req, res) => {
   } catch (e) {
     updateState({ status: "idle" });
     res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.post("/api/plex/abr", async (req, res) => {
+  const { session, videoBitrate, currentTime, switchOffset } = req.body || {};
+  const targetBitrate = Number(videoBitrate);
+  const transcode = activePlexTranscode;
+
+  if (!transcode || !session || session !== transcode.session) {
+    return res.status(409).json({ error: "Plex playback session changed" });
+  }
+  if (!PLEX_ABR_BITRATES.includes(targetBitrate)) {
+    return res.status(400).json({ error: "Unsupported Plex ABR bitrate" });
+  }
+  if (targetBitrate === transcode.videoBitrate) {
+    return res.json({
+      ok: true,
+      videoBitrate: transcode.videoBitrate,
+      advertisedBitrate: transcode.advertisedBitrate,
+    });
+  }
+  if (plexAbrSwitchPromise) {
+    return res.status(409).json({ error: "Plex ABR switch already in progress" });
+  }
+
+  const playbackTime = Math.max(0, Number(currentTime) || 0);
+  // The browser keeps already-prefetched old-rendition segments. Start the
+  // replacement encoder at the end of that buffer so it works on the first
+  // segment the browser does not already own instead of racing playback.
+  const requestedSwitchOffset = Number(switchOffset);
+  const offsetSec = Number.isFinite(requestedSwitchOffset)
+    ? Math.max(playbackTime, Math.min(playbackTime + 30, requestedSwitchOffset))
+    : playbackTime;
+  const fromBitrate = transcode.videoBitrate;
+  const switchPromise = plexTranscodeUrl(transcode.ratingKey, {
+    session: transcode.session,
+    subtitleStreamID: transcode.subtitleStreamID,
+    audioStreamID: transcode.audioStreamID,
+    offsetSec,
+    videoBitrate: targetBitrate,
+    prewarmSegments: 3,
+  });
+  plexAbrSwitchPromise = switchPromise;
+
+  try {
+    await switchPromise;
+    log.info({
+      session,
+      fromBitrate,
+      toBitrate: targetBitrate,
+      advertisedBitrate: activePlexTranscode?.advertisedBitrate || null,
+      playbackTime,
+      offsetSec,
+    }, "[plex-abr] bitrate switched in place");
+    return res.json({
+      ok: true,
+      videoBitrate: activePlexTranscode.videoBitrate,
+      advertisedBitrate: activePlexTranscode.advertisedBitrate,
+    });
+  } catch (error) {
+    log.error({ session, fromBitrate, toBitrate: targetBitrate, err: error.message }, "[plex-abr] switch failed");
+    return res.status(502).json({ error: error.message });
+  } finally {
+    if (plexAbrSwitchPromise === switchPromise) plexAbrSwitchPromise = null;
   }
 });
 
@@ -3384,6 +3686,8 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
     resolved = await ytdlp(url);
   }
 
+  await stopActivePlexTranscode();
+
   let playerUrl;
   let mediaSource;
 
@@ -3516,6 +3820,7 @@ app.post("/api/control", async (req, res) => {
 
   if (action === "stop") {
     await killPipeline();
+    await stopActivePlexTranscode();
     resetDashSegmentSession();
     currentSubtitles = [];
     updateState({ status: "idle", url: null, resolvedUrl: null, title: null });
@@ -3786,6 +4091,7 @@ async function gracefulShutdown(signal) {
   log.info({ signal }, "Shutting down gracefully");
   broadcast({ type: "serverShutdown" });
   await killPipeline();
+  await stopActivePlexTranscode();
   wss.clients.forEach((ws) => { try { ws.close(1001, "Server shutting down"); } catch {} });
   server.close(() => {
     log.info("All connections drained, exiting");

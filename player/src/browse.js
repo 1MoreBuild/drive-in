@@ -1,4 +1,5 @@
 import { state } from "./state.js";
+import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
 import { fmt, timeAgo, escHtml } from "./utils.js";
 import { navigate } from "./router.js";
 import { showStatus } from "./player.js";
@@ -130,11 +131,14 @@ function selectSubtitle(id) {
       localStorage.removeItem("preferred-sub-langs");
     }
     const offsetMs = Math.floor(state.currentTime * 1000);
-    fetch(`${location.origin}/api/plex/play`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ratingKey: state.plexInfo.ratingKey, subtitleStreamID: id, offset: offsetMs }),
-    }).catch((err) => console.error("[subs] Error:", err));
+    requestPlexPlayback({
+      ratingKey: state.plexInfo.ratingKey,
+      subtitleStreamID: id,
+      offset: offsetMs,
+    }).catch((err) => {
+      console.error("[subs] Error:", err);
+      showStatus(`Plex error: ${err.message}`);
+    });
   } else {
     state.activeExternalSubs.clear();
     disableExternalSubtitle();
@@ -208,16 +212,15 @@ function selectAudioTrack(audioId) {
     localStorage.setItem("preferred-audio-lang", track.language);
   }
   const offsetMs = Math.floor(state.currentTime * 1000);
-  fetch(`${location.origin}/api/plex/play`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      ratingKey: state.plexInfo.ratingKey,
-      audioStreamID: audioId,
-      subtitleStreamID: state.plexInfo.activeSubtitleID || undefined,
-      offset: offsetMs,
-    }),
-  }).catch((err) => console.error("[audio] Error:", err));
+  requestPlexPlayback({
+    ratingKey: state.plexInfo.ratingKey,
+    audioStreamID: audioId,
+    subtitleStreamID: state.plexInfo.activeSubtitleID || undefined,
+    offset: offsetMs,
+  }).catch((err) => {
+    console.error("[audio] Error:", err);
+    showStatus(`Plex error: ${err.message}`);
+  });
 }
 
 // --- Browse screen ---------------------------------------------------
@@ -628,14 +631,13 @@ export function playItem(item) {
 }
 
 export function playPlexItem(ratingKey) {
-  fetch(`${location.origin}/api/plex/play`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ratingKey }),
-  }).catch(() => {});
   showStatus("Loading...");
   browseScreen.classList.add("hidden");
   statusScreen.style.display = "";
+  requestPlexPlayback(plexPlaybackRequest(ratingKey)).catch((err) => {
+    console.error("[plex] Playback error:", err);
+    showStatus(`Plex error: ${err.message}`);
+  });
 }
 
 // --- Episodes --------------------------------------------------------

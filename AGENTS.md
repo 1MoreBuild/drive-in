@@ -17,7 +17,7 @@ CLI / Browser UI
         │    ├─ Direct (mp4) → raw stream proxy
         │    └─ DASH split (Bilibili/YouTube) → generate fMP4 HLS + proxy segments
         │
-        ├─ Plex integration (HLS transcode + http-proxy)
+        ├─ Plex integration (buffer-based adaptive HLS + segment retry/prefetch)
         │
         ├─ WebSocket → push play/pause/stop to player
         │
@@ -37,7 +37,7 @@ Tesla browser opens http://<server>/
 | `hls` | `.m3u8` URLs, some live streams | Proxy m3u8 + rewrite segment URLs for CORS |
 | `direct` | `.mp4` with audio+video in one file | Raw stream proxy |
 | `dash_split` | Bilibili, YouTube (separate video+audio) | Probe MP4 structure, generate fMP4 HLS, proxy segments |
-| `plex` | Plex library items | HLS transcode via Plex server, proxied with http-proxy |
+| `plex` | Plex library items | Adaptive HLS transcode via Plex server, proxied with startup retry |
 
 ## Workspace structure
 
@@ -105,13 +105,14 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 
 - `PLEX_URL` — Plex server URL (default: `http://localhost:32400`)
 - `PLEX_TOKEN` — Plex auth token (auto-detected from macOS defaults if not set)
+- `PLEX_ABR_BITRATES` — Plex adaptive bitrate ladder in Kbps (default: `3000,5000,8000`); rung changes adjust bitrate while retaining the 1080p resolution ceiling
 
 ## Code style
 
 - ES modules (`"type": "module"` in all packages)
 - No TypeScript, no transpiler — plain JS
 - Player uses Vite for production build, served as source in dev mode
-- Server dependencies: express, ws, http-proxy, pino, pino-http
+- Server dependencies: express, ws, pino, pino-http
 - Player dependencies: mediabunny
 - CLI dependencies: commander
 
@@ -121,6 +122,7 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - **Player serving** — production: `player/dist/` (Vite build with hashed assets). Dev: `player/` source directly (`SERVE_SOURCE=1`).
 - **Import map** in `index.html` maps `mediabunny` to `/lib/mediabunny/mediabunny.mjs` for source-mode development.
 - **Audio autoplay** — browsers require user gesture. Player starts muted and shows a mute icon; clicking anywhere unmutes.
+- **Decoded video queue** — targets about 200 ms and is capped at 6–16 canvases based on frame duration. The 100 ms startup gate must never exceed the memory-capped queue; encoded segment buffering handles network jitter.
 - **HLS cache cleanup** — old session dirs are removed on startup and when playback stops.
 - **Proxy map TTL** — registered proxy URLs expire after 1 hour.
 - **Segment cache** — split-stream byte ranges are cached under `.segment-cache/`; the default limit is 20 GiB.
@@ -128,11 +130,15 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - **Play history** — last 30 items persisted to `.play-history.json`, used for resume on replay.
 - **Subtitles** — yt-dlp extracts subtitle URLs, server downloads and caches VTT/SRT files. Plex subtitles use burn-in via transcode.
 - **fMP4 HLS generation** — for split video+audio streams, the server probes MP4 structure and builds local HLS playlists over original byte ranges.
-- **Plex HLS proxy** — uses `http-proxy` to forward Plex playlists and transcode segments with low overhead.
+- **Plex adaptive HLS** — keeps a 30-second encoded buffer and changes among the configured bitrate rungs using buffer health and measured segment throughput. The player prefetches upcoming segments, while the proxy retries not-yet-ready startup segments.
 
 ## Testing
 
-No automated tests yet. Manual testing:
+```bash
+npm test                        # player unit tests
+```
+
+Manual integration testing:
 
 ```bash
 # HLS stream
@@ -176,7 +182,7 @@ The `release-cli.yml` GitHub Actions workflow publishes to npm automatically usi
 
 ## CI/CD
 
-- **CI** (`ci.yml`): runs on push/PR — `npm ci`, build player, smoke test server + CLI. Node 20 + 22.
+- **CI** (`ci.yml`): runs on push/PR — `npm ci`, player tests, build player, smoke test server + CLI. Node 20 + 22.
 - **Release** (`release-cli.yml`): triggered by GitHub Release — validates tag matches `cli/package.json` version, publishes to npm with OIDC + provenance.
 - **Claude Code** (`claude.yml`, `claude-code-review.yml`): AI-assisted PR review and issue triage.
 - **Dependabot** (`dependabot.yml`): weekly npm + GitHub Actions dependency updates.

@@ -6,15 +6,28 @@ import {
   UrlSource,
 } from "mediabunny";
 import { AudioRingBuffer } from "./audio-ring-buffer.js";
+import { HlsSegmentPrefetcher } from "./hls-segment-prefetcher.js";
 import { PresentationClock } from "./presentation-clock.js";
 
 const AUDIO_CAPACITY_SECONDS = 3;
 const AUDIO_START_SECONDS = 0.75;
 const AUDIO_REBUFFER_SECONDS = 0.15;
-const VIDEO_QUEUE_CAPACITY = 12;
-const VIDEO_START_SECONDS = 0.25;
+// Network resilience belongs in the encoded segment buffer. Keep only a short
+// decoded-frame queue here to absorb decoder and render scheduling jitter.
+const VIDEO_QUEUE_MIN_CAPACITY = 6;
+const VIDEO_QUEUE_MAX_CAPACITY = 16;
+const VIDEO_QUEUE_TARGET_SECONDS = 0.2;
+const VIDEO_START_SECONDS = 0.1;
 const VIDEO_REBUFFER_SECONDS = 0.08;
 const TIME_EVENT_INTERVAL_MS = 250;
+const ABR_EVALUATION_INTERVAL_MS = 1_000;
+const ABR_STARTUP_HOLD_MS = 12_000;
+const ABR_DOWNSHIFT_COOLDOWN_MS = 8_000;
+const ABR_UPSHIFT_COOLDOWN_MS = 30_000;
+const ABR_UPSHIFT_BUFFER_SECONDS = 20;
+const ABR_DOWNSHIFT_BUFFER_SECONDS = 10;
+const ABR_UPSHIFT_SAFETY_FACTOR = 1.35;
+const ABR_DOWNSHIFT_SAFETY_FACTOR = 1.15;
 // Large enough to keep a 1080p video queue fed across Cloudflare, while still
 // preventing UrlSource's open-ended ranges from extending to multi-GB EOFs.
 const NETWORK_RANGE_CHUNK_BYTES = 2 * 1024 * 1024;
@@ -46,6 +59,7 @@ export class MediabunnyPlayer {
     onFirstVideo = () => {},
     onEnded = () => {},
     onError = () => {},
+    onAbrSwitch = async () => null,
     faultInjection = null,
   }) {
     this.container = container;
@@ -54,6 +68,7 @@ export class MediabunnyPlayer {
     this.onFirstVideo = onFirstVideo;
     this.onEnded = onEnded;
     this.onError = onError;
+    this.onAbrSwitch = onAbrSwitch;
     this.faultInjection = faultInjection;
 
     this.input = null;
@@ -81,6 +96,7 @@ export class MediabunnyPlayer {
     this.duration = 0;
     this.firstTimestamp = 0;
     this.videoQueue = [];
+    this.videoQueueCapacity = VIDEO_QUEUE_MIN_CAPACITY;
     this.videoEnded = false;
     this.audioEnded = false;
     this.generation = 0;
@@ -95,6 +111,15 @@ export class MediabunnyPlayer {
     this.videoDropCount = 0;
     this.videoStutterCount = 0;
     this.audioBufferCount = 0;
+    this.hlsSegmentPrefetcher = null;
+    this.abr = null;
+    this.abrSwitching = false;
+    this.abrStartedAt = 0;
+    this.lastAbrEvaluationAt = 0;
+    this.lastAbrSwitchAt = 0;
+    this.lastAbrRiskAt = 0;
+    this.lastAbrEstimatePersistedAt = 0;
+    this.lastAbrVideoStutterCount = 0;
     this.videoCodec = null;
     this.audioCodec = null;
     this.width = 0;
@@ -124,7 +149,9 @@ export class MediabunnyPlayer {
       const url = typeof source === "string" ? source : source?.url;
       if (!url) throw new Error("Missing MP4/HLS source URL");
       const isHls = source?.type === "hls" || /\.m3u8(?:[?#]|$)/i.test(url);
-      this.input = this.createInput(url, { boundedRanges: !isHls });
+      const useAdaptiveHls = isHls && Boolean(source?.abr);
+      if (useAdaptiveHls) this.configureAbr(source.abr);
+      this.input = this.createInput(url, { boundedRanges: !isHls, prefetchHls: useAdaptiveHls });
       this.inputs.push(this.input);
       if (!await this.input.canRead()) {
         throw new Error("Mediabunny could not recognize this MP4/HLS source");
@@ -170,7 +197,7 @@ export class MediabunnyPlayer {
       this.canvas.width = this.width;
       this.canvas.height = this.height;
       this.videoSink = new CanvasSink(this.videoTrack, {
-        poolSize: VIDEO_QUEUE_CAPACITY + 2,
+        poolSize: VIDEO_QUEUE_MAX_CAPACITY + 2,
         fit: "contain",
         decoderOptions: {
           hardwareAcceleration: "prefer-hardware",
@@ -192,10 +219,12 @@ export class MediabunnyPlayer {
     return this;
   }
 
-  createInput(url, { boundedRanges = true } = {}) {
+  createInput(url, { boundedRanges = true, prefetchHls = false } = {}) {
+    if (prefetchHls) this.hlsSegmentPrefetcher = new HlsSegmentPrefetcher({ ahead: 6, maxConcurrent: 1 });
     return new Input({
       source: new UrlSource(new URL(url, location.href).href, {
         ...(boundedRanges ? { fetchFn: boundedRangeFetch } : {}),
+        ...(prefetchHls ? { fetchFn: this.hlsSegmentPrefetcher.fetch.bind(this.hlsSegmentPrefetcher) } : {}),
         maxCacheSize: 16 * 1024 * 1024,
         parallelism: 2,
       }),
@@ -257,6 +286,7 @@ export class MediabunnyPlayer {
     this.videoIterator?.return?.().catch?.(() => {});
     this.audioIterator?.return?.().catch?.(() => {});
     this.videoQueue.length = 0;
+    this.videoQueueCapacity = VIDEO_QUEUE_MIN_CAPACITY;
     this.videoEnded = !this.videoTrack;
     this.audioEnded = !this.audioTrack;
     this.audioRing?.reset();
@@ -277,7 +307,7 @@ export class MediabunnyPlayer {
   async produceVideo(generation) {
     try {
       while (generation === this.generation && !this.destroyed) {
-        while (this.videoQueue.length >= VIDEO_QUEUE_CAPACITY) {
+        while (this.videoQueue.length >= this.videoQueueCapacity) {
           if (generation !== this.generation || this.destroyed) return;
           await wait(10);
         }
@@ -288,6 +318,14 @@ export class MediabunnyPlayer {
         if (result.done) {
           this.videoEnded = true;
           return;
+        }
+        const frameDuration = Number(result.value.duration);
+        if (Number.isFinite(frameDuration) && frameDuration > 0) {
+          this.videoQueueCapacity = clamp(
+            Math.ceil(VIDEO_QUEUE_TARGET_SECONDS / frameDuration),
+            VIDEO_QUEUE_MIN_CAPACITY,
+            VIDEO_QUEUE_MAX_CAPACITY,
+          );
         }
         this.videoQueue.push(result.value);
         this.videoDecodeCount += 1;
@@ -353,6 +391,7 @@ export class MediabunnyPlayer {
     this.audioRing?.setRunning(false);
     this.clock.stop();
     this.setState("seeking");
+    this.hlsSegmentPrefetcher?.handleSeek();
     await this.restartProducers(target);
     if (this.wantsPlayback) this.enterBuffering("seek");
     else this.setState("paused");
@@ -377,6 +416,8 @@ export class MediabunnyPlayer {
     ].filter(Boolean));
     for (const input of this.inputs) input.dispose();
     this.inputs.length = 0;
+    this.hlsSegmentPrefetcher?.destroy();
+    this.hlsSegmentPrefetcher = null;
     try { this.audioNode?.disconnect(); } catch {}
     try { this.gainNode?.disconnect(); } catch {}
     try { this.compressorNode?.disconnect(); } catch {}
@@ -397,6 +438,7 @@ export class MediabunnyPlayer {
     this.maybeTriggerScheduledFault(mediaTime);
     this.updatePlaybackBarrier();
     this.renderVideo(mediaTime);
+    void this.evaluateAbr(now);
 
     if (now - this.lastTimeEventAt >= TIME_EVENT_INTERVAL_MS) {
       this.lastTimeEventAt = now;
@@ -458,6 +500,9 @@ export class MediabunnyPlayer {
       || (this.audioEnded && this.audioRing.availableFrames > 0);
     const videoReady = !this.videoTrack
       || this.videoSecondsAhead(mediaTime) >= VIDEO_START_SECONDS
+      // A high-frame-rate stream can hit the strict memory cap before reaching
+      // the time target. A full queue is still enough decoded work to start.
+      || this.videoQueue.length >= this.videoQueueCapacity
       || (this.videoEnded && this.videoQueue.length > 0);
     return audioReady && videoReady;
   }
@@ -483,6 +528,7 @@ export class MediabunnyPlayer {
     if (this.state === "buffering") return;
     if (reason.startsWith("video") || (reason === "queue-low" && this.videoTrack)) {
       this.videoStutterCount += 1;
+      this.lastAbrRiskAt = performance.now();
     }
     this.audioRing?.setRunning(false);
     this.clock.stop();
@@ -498,6 +544,128 @@ export class MediabunnyPlayer {
   get audioSeconds() {
     if (!this.audioRing || !this.audioContext) return 0;
     return this.audioRing.availableFrames / this.audioContext.sampleRate;
+  }
+
+  configureAbr(config) {
+    const bitrates = Array.isArray(config.bitrates)
+      ? [...new Set(config.bitrates.map(Number).filter((value) => Number.isFinite(value) && value > 0))]
+        .sort((a, b) => a - b)
+      : [];
+    const currentBitrate = Number(config.currentBitrate);
+    if (!config.session || !config.switchUrl || bitrates.length < 2 || !bitrates.includes(currentBitrate)) return;
+    const now = performance.now();
+    this.abr = {
+      session: String(config.session),
+      switchUrl: String(config.switchUrl),
+      bitrates,
+      currentBitrate,
+      advertisedBitrate: Number(config.advertisedBitrate) || null,
+      lastDecision: null,
+    };
+    this.abrStartedAt = now;
+    this.lastAbrSwitchAt = now;
+    this.lastAbrRiskAt = now;
+    this.lastAbrVideoStutterCount = this.videoStutterCount;
+  }
+
+  async evaluateAbr(now) {
+    if (
+      !this.abr
+      || !this.hlsSegmentPrefetcher
+      || this.abrSwitching
+      || this.destroyed
+      || now - this.lastAbrEvaluationAt < ABR_EVALUATION_INTERVAL_MS
+    ) return;
+    this.lastAbrEvaluationAt = now;
+
+    const network = this.hlsSegmentPrefetcher.getStats();
+    this.persistAbrEstimate(network, now);
+    if (network.sampleCount < 3 || now - this.abrStartedAt < ABR_STARTUP_HOLD_MS) return;
+
+    const currentIndex = this.abr.bitrates.indexOf(this.abr.currentBitrate);
+    if (currentIndex === -1) return;
+    const sawNewStutter = this.videoStutterCount > this.lastAbrVideoStutterCount;
+    if (sawNewStutter) {
+      this.lastAbrVideoStutterCount = this.videoStutterCount;
+      this.lastAbrRiskAt = now;
+    }
+
+    const latestThroughputKbps = Number(network.lastDownload?.bitsPerSecond) / 1000;
+    const responsiveThroughputKbps = Number.isFinite(latestThroughputKbps) && latestThroughputKbps > 0
+      ? Math.min(network.throughputKbps, latestThroughputKbps)
+      : network.throughputKbps;
+    const lowBuffer = network.bufferedAheadSeconds <= ABR_DOWNSHIFT_BUFFER_SECONDS;
+    const insufficientThroughput = responsiveThroughputKbps
+      < this.abr.currentBitrate * ABR_DOWNSHIFT_SAFETY_FACTOR;
+    const canDownshift = currentIndex > 0 && now - this.lastAbrSwitchAt >= ABR_DOWNSHIFT_COOLDOWN_MS;
+    if (canDownshift && (sawNewStutter || (lowBuffer && insufficientThroughput))) {
+      const safeBudget = responsiveThroughputKbps / ABR_DOWNSHIFT_SAFETY_FACTOR;
+      const safeTarget = [...this.abr.bitrates]
+        .reverse()
+        .find((bitrate) => bitrate < this.abr.currentBitrate && bitrate <= safeBudget);
+      const target = safeTarget || this.abr.bitrates[0];
+      await this.switchAbrBitrate(target, sawNewStutter ? "rebuffer-risk" : "low-buffer");
+      return;
+    }
+
+    const nextBitrate = this.abr.bitrates[currentIndex + 1];
+    const stableLongEnough = now - Math.max(this.lastAbrSwitchAt, this.lastAbrRiskAt) >= ABR_UPSHIFT_COOLDOWN_MS;
+    const hasUpshiftBuffer = network.bufferedAheadSeconds >= ABR_UPSHIFT_BUFFER_SECONDS;
+    const hasUpshiftThroughput = nextBitrate
+      && network.throughputKbps >= nextBitrate * ABR_UPSHIFT_SAFETY_FACTOR;
+    if (this.state === "playing" && stableLongEnough && hasUpshiftBuffer && hasUpshiftThroughput) {
+      await this.switchAbrBitrate(nextBitrate, "sustained-headroom");
+    }
+  }
+
+  async switchAbrBitrate(targetBitrate, reason) {
+    if (!this.abr || this.abrSwitching || targetBitrate === this.abr.currentBitrate) return;
+    const fromBitrate = this.abr.currentBitrate;
+    const network = this.hlsSegmentPrefetcher?.getStats() || {};
+    this.abrSwitching = true;
+    try {
+      const result = await this.onAbrSwitch({
+        session: this.abr.session,
+        switchUrl: this.abr.switchUrl,
+        fromBitrate,
+        videoBitrate: targetBitrate,
+        currentTime: this.clock.currentTime,
+        reason,
+        network,
+      });
+      if (!result?.ok) throw new Error(result?.error || "ABR switch rejected");
+      this.abr.currentBitrate = Number(result.videoBitrate) || targetBitrate;
+      this.abr.advertisedBitrate = Number(result.advertisedBitrate) || null;
+      this.abr.lastDecision = {
+        fromBitrate,
+        toBitrate: this.abr.currentBitrate,
+        reason,
+        at: Date.now(),
+        throughputKbps: network.throughputKbps || 0,
+        bufferedAheadSeconds: network.bufferedAheadSeconds || 0,
+      };
+      this.lastAbrSwitchAt = performance.now();
+      this.lastAbrRiskAt = this.lastAbrSwitchAt;
+      this.hlsSegmentPrefetcher?.handleBitrateSwitch();
+      console.info("[plex-abr] bitrate switched", this.abr.lastDecision);
+    } catch (error) {
+      this.lastAbrRiskAt = performance.now();
+      console.warn("[plex-abr] bitrate switch failed", error);
+    } finally {
+      this.abrSwitching = false;
+    }
+  }
+
+  persistAbrEstimate(network, now) {
+    if (!network.throughputKbps || now - this.lastAbrEstimatePersistedAt < 5_000) return;
+    this.lastAbrEstimatePersistedAt = now;
+    try {
+      localStorage.setItem("drivein-plex-abr-estimate", JSON.stringify({
+        throughputKbps: network.throughputKbps,
+        videoBitrate: this.abr?.currentBitrate || null,
+        updatedAt: Date.now(),
+      }));
+    } catch {}
   }
 
   injectVideoStall(durationMs) {
@@ -562,6 +730,7 @@ export class MediabunnyPlayer {
 
   getStats() {
     const currentTimeMs = Math.round(this.clock.currentTime * 1000);
+    const hlsNetwork = this.hlsSegmentPrefetcher?.getStats() || null;
     return {
       audioFrameRenderCount: this.audioRing
         ? Math.floor(this.audioRing.consumedFrames / 128)
@@ -580,8 +749,13 @@ export class MediabunnyPlayer {
       width: this.width,
       height: this.height,
       engine: "mediabunny",
+      bandwidth: hlsNetwork?.throughputKbps ? hlsNetwork.throughputKbps * 1000 : null,
       audioBufferedMs: Math.round(this.audioSeconds * 1000),
       videoBufferedMs: Math.round(this.videoSecondsAhead() * 1000),
+      hlsBufferedAheadSeconds: hlsNetwork?.bufferedAheadSeconds ?? null,
+      abrCurrentBitrate: this.abr?.currentBitrate || null,
+      abrAdvertisedBitrate: this.abr?.advertisedBitrate || null,
+      abrLastDecision: this.abr?.lastDecision || null,
     };
   }
 }

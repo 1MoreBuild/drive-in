@@ -34,7 +34,7 @@ CLI / Browser UI
         |    +-- Direct (mp4) -> raw stream proxy
         |    +-- DASH split (Bilibili/YouTube) -> generate fMP4 HLS + proxy segments
         |
-        +-- Plex integration (HLS transcode + http-proxy)
+        +-- Plex integration (buffer-based adaptive HLS + segment retry/prefetch)
         |
         +-- WebSocket -> push play/pause/stop to player
         |
@@ -54,7 +54,7 @@ Tesla browser opens http://<server>/
 | `hls` | `.m3u8` URLs, live streams | Proxy m3u8 + rewrite segment URLs for CORS |
 | `direct` | `.mp4` with audio+video | Raw stream proxy |
 | `dash_split` | Bilibili, YouTube | Probe MP4 `sidx`, generate fMP4 HLS, proxy segments |
-| `plex` | Plex library items | HLS transcode via Plex server, proxied |
+| `plex` | Plex library items | Adaptive HLS transcode via Plex server, proxied |
 
 ## Prerequisites
 
@@ -213,6 +213,7 @@ drive-in/              (npm workspaces monorepo)
 |----------|---------|-------------|
 | `PLEX_URL` | `http://localhost:32400` | Plex server URL |
 | `PLEX_TOKEN` | (auto-detected on macOS) | Plex authentication token |
+| `PLEX_ABR_BITRATES` | `3000,5000,8000` | Plex adaptive bitrate ladder in Kbps; rung changes adjust bitrate while retaining the 1080p resolution ceiling |
 | `PORT` | `9090` | HTTP and WebSocket port |
 | `LOG_LEVEL` | `info` in production | Pino log level |
 | `DRIVEIN_DB` | `.drive-in.sqlite` | Queue and playlist database path |
