@@ -4,13 +4,13 @@ Drive-In depends on the following third-party software. Their licenses are liste
 
 ## Runtime Dependencies
 
-### @libmedia/avplayer
+### Mediabunny
 
-- **License**: LGPL-3.0-or-later
-- **Source**: https://github.com/zhaohappy/libmedia
-- **Usage**: WebAssembly + WebGL media player used for canvas-based video rendering
+- **License**: MPL-2.0
+- **Source**: https://github.com/Vanilagy/mediabunny
+- **Usage**: Browser media demuxing and WebCodecs decoding for canvas playback
 
-This project dynamically loads `@libmedia/avplayer` as an ES module at runtime. Under the LGPL-3.0, you are free to use this library without affecting the license of your own code, provided that you do not modify the library itself. If you modify the library, you must release those modifications under the LGPL-3.0.
+Mediabunny is bundled with the player for production and loaded as an ES module in source-mode development. Modified MPL-covered files must remain available under MPL-2.0.
 
 ### yt-dlp
 
@@ -47,4 +47,5 @@ All Node.js dependencies are listed in `package.json` files across the monorepo 
 | http-proxy | MIT | Plex transcode proxy |
 | pino | MIT | Logging |
 | commander | MIT | CLI framework |
+| mediabunny | MPL-2.0 | Media demuxing and WebCodecs decoding |
 | vite | MIT | Player build tool (dev dependency) |

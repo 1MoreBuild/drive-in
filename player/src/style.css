@@ -654,12 +654,52 @@ html, body {
   letter-spacing: 0.02em;
 }
 
+/* --- Home toolbar ---------------------------------------------------- */
+
+#home-toolbar {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 4;
+  min-height: 104px;
+  padding: 20px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 32px;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--surface-base) 96%, transparent),
+    color-mix(in oklch, var(--surface-base) 82%, transparent) 72%,
+    transparent
+  );
+}
+
+.home-identity {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.home-wordmark {
+  font-size: 1.125rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+}
+
+.home-tagline {
+  color: var(--text-tertiary);
+  font-size: 0.75rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
 /* --- Browse screen --------------------------------------------------- */
 
 #browse-screen {
   position: absolute;
   inset: 0;
-  padding: 0;
+  padding: 112px 0 0;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: oklch(30% 0 0) transparent;
@@ -688,7 +728,22 @@ html, body {
 }
 
 .browse-section:first-child {
-  padding-top: 20px;
+  padding-top: 8px;
+}
+
+@media (max-width: 760px) {
+  #home-toolbar {
+    min-height: 80px;
+    padding: 16px 20px;
+  }
+
+  .home-tagline {
+    display: none;
+  }
+
+  #browse-screen {
+    padding-top: 88px;
+  }
 }
 
 .browse-section.hidden {
@@ -739,6 +794,11 @@ html, body {
 
 .browse-header button:active {
   background: oklch(100% 0 0 / 0.08);
+}
+
+.browse-header .queue-clear {
+  color: var(--text-tertiary);
+  margin-left: 4px;
 }
 
 .browse-row-wrap {
@@ -925,6 +985,37 @@ html, body {
   filter: drop-shadow(0 1px 3px oklch(0% 0 0 / 0.5));
 }
 
+.browse-card-queue {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  background: oklch(0% 0 0 / 0.7);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 150ms, background-color 150ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.browse-card:hover .browse-card-queue,
+.browse-card:focus-within .browse-card-queue,
+.episode-card:hover .browse-card-queue,
+.episode-card:focus-within .browse-card-queue,
+.browse-card-queue:active {
+  opacity: 1;
+}
+
+.browse-card-queue:active {
+  background: oklch(100% 0 0 / 0.14);
+}
+
 /* Poster-style cards for movies/shows library */
 .browse-card.poster {
   width: 130px;
@@ -932,6 +1023,103 @@ html, body {
 
 .browse-card.poster .browse-card-thumb {
   aspect-ratio: 2 / 3;
+}
+
+/* --- Queue cards ---------------------------------------------------- */
+
+.queue-card .browse-card-thumb {
+  outline: 1px solid oklch(100% 0 0 / 0.08);
+  outline-offset: -1px;
+}
+
+.queue-position {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: oklch(0% 0 0 / 0.72);
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.queue-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: oklch(0% 0 0 / 0.64);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 150ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.queue-card:hover .queue-remove,
+.queue-card:focus-within .queue-remove,
+.queue-remove:active {
+  opacity: 1;
+}
+
+/* --- Playlist cards ------------------------------------------------- */
+
+.playlist-card .playlist-card-thumb {
+  background:
+    linear-gradient(135deg, oklch(24% 0.012 250), oklch(11% 0.006 250));
+  outline: 1px solid oklch(100% 0 0 / 0.08);
+  outline-offset: -1px;
+}
+
+.playlist-card .playlist-card-thumb img {
+  opacity: 0.72;
+  filter: saturate(0.9);
+}
+
+.playlist-card-icon {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.playlist-card-icon svg {
+  opacity: 0.22;
+}
+
+.playlist-play-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: oklch(0% 0 0 / 0.72);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@media (hover: none) {
+  .queue-remove,
+  .browse-card-queue {
+    opacity: 1;
+  }
 }
 
 /* --- Watched badge --------------------------------------------------- */

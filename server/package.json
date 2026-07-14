@@ -18,6 +18,7 @@
     "dev": "SERVE_SOURCE=1 node --watch index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^12.10.0",
     "express": "^5.2.1",
     "http-proxy": "^1.18.1",
     "pino": "^10.3.1",

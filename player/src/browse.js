@@ -4,9 +4,18 @@ import { navigate } from "./router.js";
 import { showStatus } from "./player.js";
 import { loadSubtitleTrack, disableExternalSubtitle, removeSubtitleTrack } from "./subtitles.js";
 
+function escAttr(value) {
+  return escHtml(String(value || "")).replace(/"/g, "&quot;");
+}
+
 // --- DOM elements ----------------------------------------------------
 
 const browseScreen = document.getElementById("browse-screen");
+const queueSection = document.getElementById("queue-section");
+const queueList = document.getElementById("queue-list");
+const queueClear = document.getElementById("queue-clear");
+const playlistsSection = document.getElementById("playlists-section");
+const playlistsList = document.getElementById("playlists-list");
 const historySection = document.getElementById("history-section");
 const historyList = document.getElementById("history-list");
 const moviesSection = document.getElementById("movies-section");
@@ -214,15 +223,37 @@ function selectAudioTrack(audioId) {
 // --- Browse screen ---------------------------------------------------
 
 export async function loadBrowseScreen() {
-  const [historyRes, libsRes] = await Promise.allSettled([
+  const [queueRes, playlistsRes, historyRes, libsRes] = await Promise.allSettled([
+    fetch(`${location.origin}/api/queue`).then((r) => r.json()),
+    fetch(`${location.origin}/api/playlists`).then((r) => r.json()),
     fetch(`${location.origin}/api/history`).then((r) => r.json()),
     fetch(`${location.origin}/api/plex/libraries`).then((r) => r.json()),
   ]);
 
+  const queue = queueRes.status === "fulfilled" ? queueRes.value : [];
+  const playlists = playlistsRes.status === "fulfilled" ? playlistsRes.value : [];
   const history = historyRes.status === "fulfilled" ? historyRes.value : [];
   const libs = libsRes.status === "fulfilled" ? libsRes.value : [];
 
   let hasContent = false;
+
+  if (queue.length) {
+    renderQueue(queue);
+    queueSection.classList.remove("hidden");
+    hasContent = true;
+  } else {
+    renderQueue([]);
+    queueSection.classList.add("hidden");
+  }
+
+  if (playlists.length) {
+    renderPlaylists(playlists);
+    playlistsSection.classList.remove("hidden");
+    hasContent = true;
+  } else {
+    renderPlaylists([]);
+    playlistsSection.classList.add("hidden");
+  }
 
   if (history.length) {
     renderCardRow(historyList, history, { type: "history" });
@@ -267,6 +298,167 @@ export async function loadBrowseScreen() {
 
   // Reset episodes view
   episodesSection.classList.add("hidden");
+}
+
+// --- Playlist rendering ----------------------------------------------
+
+export function renderPlaylists(playlists = []) {
+  state.playlists = playlists;
+  if (!playlistsSection || !playlistsList) return;
+  playlistsList.innerHTML = "";
+  const episodesOpen = episodesSection && !episodesSection.classList.contains("hidden");
+  playlistsSection.classList.toggle("hidden", playlists.length === 0 || episodesOpen);
+
+  playlists.forEach((playlist) => {
+    const el = document.createElement("div");
+    el.className = "browse-card playlist-card";
+    const thumbHtml = playlist.thumbnail
+      ? `<img src="${escAttr(playlist.thumbnail)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'playlist-card-icon',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'30\\' height=\\'30\\'><path d=\\'M4 6h14v2H4V6zm0 5h14v2H4v-2zm0 5h10v2H4v-2zm16-7v10l-7-5 7-5z\\'/></svg>'}))">`
+      : `<div class="playlist-card-icon"><svg viewBox="0 0 24 24" fill="white" width="30" height="30"><path d="M4 6h14v2H4V6zm0 5h14v2H4v-2zm0 5h10v2H4v-2zm16-7v10l-7-5 7-5z"/></svg></div>`;
+    const meta = [
+      `${playlist.itemCount || 0} item${playlist.itemCount === 1 ? "" : "s"}`,
+      playlist.duration ? fmt(playlist.duration) : null,
+    ].filter(Boolean).join(" \u00B7 ");
+    el.innerHTML = `
+      <div class="browse-card-thumb playlist-card-thumb">
+        ${thumbHtml}
+        <div class="playlist-play-badge">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M8 5v14l11-7z"/></svg>
+        </div>
+      </div>
+      <div class="browse-card-title">${escHtml(playlist.name)}</div>
+      ${meta ? `<div class="browse-card-meta">${meta}</div>` : ""}
+    `;
+    el.addEventListener("click", () => enqueuePlaylist(playlist.id));
+    playlistsList.appendChild(el);
+  });
+}
+
+async function enqueuePlaylist(id) {
+  try {
+    const res = await fetch(`${location.origin}/api/playlists/${encodeURIComponent(id)}/enqueue`, { method: "POST" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.queue) renderQueue(data.queue);
+  } catch (err) {
+    console.error("[playlist] Enqueue failed:", err);
+  }
+}
+
+// --- Queue rendering -------------------------------------------------
+
+export function renderQueue(queue = []) {
+  state.queue = queue;
+  if (!queueSection || !queueList) return;
+  queueList.innerHTML = "";
+  queueClear?.classList.toggle("hidden", queue.length === 0);
+  const episodesOpen = episodesSection && !episodesSection.classList.contains("hidden");
+  queueSection.classList.toggle("hidden", queue.length === 0 || episodesOpen);
+
+  queue.forEach((item, index) => {
+    const el = document.createElement("div");
+    el.className = "browse-card queue-card";
+    const thumbHtml = item.thumbnail
+      ? `<img src="${escAttr(item.thumbnail)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'28\\' height=\\'28\\'><path d=\\'M8 5v14l11-7z\\'/></svg>'}))">`
+      : `<div class="browse-card-thumb-empty"><svg viewBox="0 0 24 24" fill="white" width="28" height="28"><path d="M8 5v14l11-7z"/></svg></div>`;
+    const meta = [
+      item.sourceType === "plex" ? "Plex" : "URL",
+      item.duration ? fmt(item.duration) : null,
+    ].filter(Boolean).join(" \u00B7 ");
+    el.innerHTML = `
+      <div class="browse-card-thumb">
+        ${thumbHtml}
+        <div class="queue-position">${index + 1}</div>
+        <button class="queue-remove" type="button" aria-label="Remove from queue">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </div>
+      <div class="browse-card-title">${escHtml(item.title)}</div>
+      ${meta ? `<div class="browse-card-meta">${meta}</div>` : ""}
+    `;
+    el.querySelector(".queue-remove")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeQueueItem(item.id);
+    });
+    el.addEventListener("click", () => playQueueItem(item.id));
+    queueList.appendChild(el);
+  });
+}
+
+async function playQueueItem(id) {
+  showStatus("Loading...");
+  browseScreen.classList.add("hidden");
+  statusScreen.style.display = "";
+  try {
+    await fetch(`${location.origin}/api/queue/${encodeURIComponent(id)}/play`, { method: "POST" });
+  } catch (err) {
+    console.error("[queue] Play failed:", err);
+  }
+}
+
+async function removeQueueItem(id) {
+  const current = state.queue.slice();
+  renderQueue(current.filter((item) => item.id !== id));
+  try {
+    const res = await fetch(`${location.origin}/api/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok) renderQueue(current);
+  } catch (err) {
+    renderQueue(current);
+  }
+}
+
+queueClear?.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  const current = state.queue.slice();
+  renderQueue([]);
+  try {
+    const res = await fetch(`${location.origin}/api/queue`, { method: "DELETE" });
+    if (!res.ok) renderQueue(current);
+  } catch {
+    renderQueue(current);
+  }
+});
+
+async function addToQueue(body, { playNext = false } = {}) {
+  try {
+    await fetch(`${location.origin}/api/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, playNext }),
+    });
+  } catch (err) {
+    console.error("[queue] Add failed:", err);
+  }
+}
+
+function queuePayloadForItem(item, type) {
+  if (type === "history") {
+    if (item.plex?.ratingKey) {
+      return {
+        ratingKey: item.plex.ratingKey,
+        title: item.title,
+        thumbnail: item.thumbnail,
+        duration: item.duration,
+      };
+    }
+    if (item.url) {
+      return {
+        url: item.url,
+        title: item.title,
+        thumbnail: item.thumbnail,
+        duration: item.duration,
+      };
+    }
+  }
+  if (type === "plex-movie") {
+    return {
+      ratingKey: item.ratingKey,
+      title: item.title,
+      thumbnail: item.thumb ? `/api/plex/thumb?path=${encodeURIComponent(item.thumb)}` : null,
+      duration: item.duration ? item.duration * 60 : null,
+    };
+  }
+  return null;
 }
 
 // --- Card rendering --------------------------------------------------
@@ -325,6 +517,20 @@ function renderCardRow(container, items, { type }) {
       <div class="browse-card-title">${escHtml(item.title)}</div>
       ${meta ? `<div class="browse-card-meta">${meta}</div>` : ""}
     `;
+
+    const queuePayload = queuePayloadForItem(item, type);
+    if (queuePayload) {
+      const queueBtn = document.createElement("button");
+      queueBtn.className = "browse-card-queue";
+      queueBtn.type = "button";
+      queueBtn.setAttribute("aria-label", "Add to queue");
+      queueBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M13 5h-2v6H5v2h6v6h2v-6h6v-2h-6V5z"/></svg>`;
+      queueBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        addToQueue(queuePayload);
+      });
+      el.querySelector(".browse-card-thumb").appendChild(queueBtn);
+    }
 
     if (type === "history") {
       // Delete badge
@@ -439,6 +645,8 @@ export async function openEpisodes(show) {
   epsShowTitle.textContent = show.title;
   episodesList.innerHTML = "";
   episodesSection.classList.remove("hidden");
+  queueSection.classList.add("hidden");
+  playlistsSection.classList.add("hidden");
   historySection.classList.add("hidden");
   moviesSection.classList.add("hidden");
   showsSection.classList.add("hidden");
@@ -487,6 +695,21 @@ export async function openEpisodes(show) {
           <div class="episode-card-title">${escHtml(ep.title)}</div>
           <div class="episode-card-meta">${metaParts.join(" \u00B7 ")}</div>
         `;
+        const queueBtn = document.createElement("button");
+        queueBtn.className = "browse-card-queue";
+        queueBtn.type = "button";
+        queueBtn.setAttribute("aria-label", "Add to queue");
+        queueBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M13 5h-2v6H5v2h6v6h2v-6h6v-2h-6V5z"/></svg>`;
+        queueBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          addToQueue({
+            ratingKey: ep.ratingKey,
+            title: `${show.title} S${ep.season}E${ep.episode} — ${ep.title}`,
+            thumbnail: thumbUrl,
+            duration: ep.duration ? ep.duration * 60 : null,
+          });
+        });
+        el.querySelector(".episode-card-thumb").appendChild(queueBtn);
 
         el.addEventListener("click", () => playPlexItem(ep.ratingKey));
         grid.appendChild(el);
@@ -501,6 +724,8 @@ export async function openEpisodes(show) {
 
 export function showBrowseFromEpisodes() {
   episodesSection.classList.add("hidden");
+  queueSection.classList.toggle("hidden", state.queue.length === 0);
+  playlistsSection.classList.toggle("hidden", state.playlists.length === 0);
   historySection.classList.remove("hidden");
   moviesSection.classList.remove("hidden");
   showsSection.classList.remove("hidden");

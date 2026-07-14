@@ -8,9 +8,6 @@ export const state = {
   playLock: false,
   audioUnlocked: false,
   audioGain: DEFAULT_AUDIO_GAIN,
-  audioBoostNode: null,
-  audioCompressorNode: null,
-  audioOutputNode: null,
   isPlaying: false,
   isMuted: false,
   isBuffering: false,
@@ -18,6 +15,8 @@ export const state = {
   currentTime: 0,
   plexInfo: null,
   sourceUrl: null,       // original URL (YouTube/Bilibili) for the current playback
+  queue: [],
+  playlists: [],
   progressInterval: null,
   externalSubs: [],
   activeExternalSubs: new Set(),

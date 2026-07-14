@@ -8,6 +8,7 @@ dist/
 .subs-cache/
 .env
 .play-history.json
+.drive-in.sqlite*
 .DS_Store
 *.log
 

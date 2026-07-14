@@ -6,6 +6,7 @@ import {
 } from "./controls.js";
 import { renderSubtitle, disableExternalSubtitle } from "./subtitles.js";
 import { navigate } from "./router.js";
+import { MediabunnyPlayer } from "./engine/mediabunny-player.js";
 
 // --- Callbacks (set by main.js to avoid circular deps) ---------------
 
@@ -17,50 +18,35 @@ export function setPlayerCallbacks({ updateSubsUI, updateAudioUI }) {
   onUpdateAudioUI = updateAudioUI;
 }
 
-// --- AVPlayer class loader -------------------------------------------
-
-let AVPlayerClass = null;
-let AVPlayerEvents = null;
-let currentPlayerBindings = null;
 let lastUiPaintAt = 0;
 
 const UI_PAINT_INTERVAL_MS = 250;
 const DEFAULT_AUDIO_GAIN = 12.0;
 const MIN_AUDIO_GAIN = 1.0;
 const MAX_AUDIO_GAIN = 10.0;
-// Minimal WASM module using a v128.const SIMD instruction.
-// Compiling this module will fail at runtime when SIMD is disabled (e.g. Tesla
-// browser), whereas WebAssembly.validate() may still accept the bytecode.
-const WASM_SIMD_MODULE = new Uint8Array([
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,  // magic + version
-  0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,          // type section: () -> v128
-  0x03, 0x02, 0x01, 0x00,                              // function section
-  0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x00,            // code section
-  0xfd, 0x0f, 0xfd, 0x0c, 0x0b,                        // v128.const + end
-]);
 const CAPABILITY_PROFILE = detectCapabilityProfile();
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
 const DECODE_HEALTH_INTERVAL_MS = 60_000;
 const DECODE_JANK_RECHECK_COOLDOWN_MS = 15_000;
 const STUTTER_EVENT_CAPACITY = 100;
 const STUTTER_REPORT_INTERVAL_MS = 30_000;
-// libmedia TIME events fire at ~1000ms intervals (not per-frame), so threshold must be well above that
 const STUTTER_JANK_THRESHOLD_MS = 2000;
 const STUTTER_LONG_TASK_THRESHOLD_MS = 50;
 const STUTTER_MEMORY_SAMPLE_INTERVAL_MS = 15_000;
 const STUTTER_AUDIO_SAMPLE_INTERVAL_MS = 1_000;
 const STUTTER_FLUSH_IDLE_TIMEOUT_MS = 1_000;
 const PLAYER_HEALTH_HEARTBEAT_INTERVAL_MS = 30_000;
+const PLAYER_RECOVERY_MAX_ATTEMPTS = 2;
+const PLAYER_RECOVERY_STABLE_MS = 60_000;
+const PLAYER_RECOVERY_BACKOFF_MS = [1_000, 3_000];
+const VIDEO_FREEZE_THRESHOLD_MS = 8_000;
+const VIDEO_FREEZE_DRIFT_MS = 5_000;
 const PLAYER_LOG_ENDPOINT = "/api/dev/player-log";
 const SLOW_SEGMENT_FETCH_MS = 3_000;
 const PLAYBACK_RATE_DROP_COOLDOWN_MS = 5_000;
 const AUDIO_UNDERRUN_COOLDOWN_MS = 2_000;
 const MEMORY_PRESSURE_GROWTH_BYTES = 8 * 1024 * 1024;
 const MEMORY_PRESSURE_GROWTH_RATIO = 0.15;
-// libmedia's VideoDecodePipeline blocks packet pulls while WebVideoDecoder
-// decodeQueueSize is above 20, but AVPlayer does not expose the per-task
-// decoder instance or queue depth through its public thread/proxy APIs.
-const LIBMEDIA_WEB_CODECS_QUEUE_LIMIT = 20;
 const PLAYER_CANVAS_DIAGNOSTICS_KEY = "__driveInCanvasDiagnostics";
 const playerMetricsState = createPlayerMetricsState();
 const stutterEventBuffer = Array.from({ length: STUTTER_EVENT_CAPACITY }, () => ({
@@ -91,7 +77,24 @@ let longTaskObserver = null;
 let decodeHealthInterval = null;
 let canvasMonitorObserver = null;
 let playerHealthHeartbeatInterval = null;
+const playbackRecoveryState = {
+  attempts: 0,
+  retryTimer: null,
+  stableTimer: null,
+  request: null,
+};
 const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+
+function getMediabunnyFaultInjection() {
+  const params = new URLSearchParams(location.search);
+  const durationMs = Number(params.get("videoStallMs"));
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return null;
+  const atSeconds = Number(params.get("videoStallAt"));
+  return {
+    durationMs,
+    atSeconds: Number.isFinite(atSeconds) && atSeconds >= 0 ? atSeconds : 10,
+  };
+}
 
 function defaultDecodePath() {
   return CAPABILITY_PROFILE.hasVideoDecoder
@@ -114,7 +117,105 @@ function createPlayerMetricsState() {
     totalStallDurationMs: 0,
     stallStartedAt: 0,
     decodePath: defaultDecodePath(),
+    lastVideoCurrentTimeMs: 0,
+    lastVideoProgressAt: 0,
+    freezeRecoveryTriggered: false,
   };
+}
+
+function clearPlaybackRecoveryTimers() {
+  if (playbackRecoveryState.retryTimer) {
+    clearTimeout(playbackRecoveryState.retryTimer);
+    playbackRecoveryState.retryTimer = null;
+  }
+  if (playbackRecoveryState.stableTimer) {
+    clearTimeout(playbackRecoveryState.stableTimer);
+    playbackRecoveryState.stableTimer = null;
+  }
+}
+
+function resetPlaybackRecovery({ clearRequest = false } = {}) {
+  clearPlaybackRecoveryTimers();
+  playbackRecoveryState.attempts = 0;
+  if (clearRequest) playbackRecoveryState.request = null;
+}
+
+function getPlaybackRecoveryPosition(player) {
+  const stats = summarizePlayerStats(player);
+  const videoSeconds = stats?.videoCurrentTimeMs != null ? stats.videoCurrentTimeMs / 1000 : null;
+  if (Number.isFinite(videoSeconds) && videoSeconds > 0) {
+    return Math.max(0, Math.min(state.duration || Infinity, state.currentTime || videoSeconds, videoSeconds));
+  }
+  return Math.max(0, Math.min(state.duration || Infinity, state.currentTime || 0));
+}
+
+function isRecoverablePlaybackError(error) {
+  const message = error?.message || String(error || "");
+  return /demux error|decod|encodingerror|network|fetch|timeout|connection|video.*(stall|frozen)|stream.*(closed|ended)/i.test(message);
+}
+
+function markPlaybackStable(player) {
+  if (playbackRecoveryState.stableTimer) clearTimeout(playbackRecoveryState.stableTimer);
+  playbackRecoveryState.stableTimer = setTimeout(() => {
+    playbackRecoveryState.stableTimer = null;
+    if (state.player !== player || !state.isPlaying) return;
+    playbackRecoveryState.attempts = 0;
+    postPlayerRuntimeLog("playback_recovery_stable", {
+      currentTime: state.currentTime,
+    });
+  }, PLAYER_RECOVERY_STABLE_MS);
+}
+
+function schedulePlaybackRecovery(player, error) {
+  if (state.player !== player || !playbackRecoveryState.request || !isRecoverablePlaybackError(error)) {
+    return false;
+  }
+  if (playbackRecoveryState.retryTimer) return true;
+  if (playbackRecoveryState.attempts >= PLAYER_RECOVERY_MAX_ATTEMPTS) {
+    state.isPlaying = false;
+    showStatus("Video stream failed. Reload to try again.");
+    postPlayerRuntimeLog("playback_recovery_exhausted", {
+      error: error?.message || String(error),
+      attempts: playbackRecoveryState.attempts,
+    });
+    return false;
+  }
+
+  if (playbackRecoveryState.stableTimer) {
+    clearTimeout(playbackRecoveryState.stableTimer);
+    playbackRecoveryState.stableTimer = null;
+  }
+  const attempt = playbackRecoveryState.attempts + 1;
+  const delayMs = PLAYER_RECOVERY_BACKOFF_MS[Math.min(attempt - 1, PLAYER_RECOVERY_BACKOFF_MS.length - 1)];
+  const startTime = getPlaybackRecoveryPosition(player);
+  playbackRecoveryState.attempts = attempt;
+  state.isPlaying = false;
+  player.pause?.().catch(() => {});
+  showStatus(`Recovering video (${attempt}/${PLAYER_RECOVERY_MAX_ATTEMPTS})...`);
+  postPlayerRuntimeLog("playback_recovery_scheduled", {
+    error: error?.message || String(error),
+    attempt,
+    delayMs,
+    startTime,
+  });
+
+  const runRecovery = async () => {
+    playbackRecoveryState.retryTimer = null;
+    if (state.player !== player) return;
+    if (state.playLock) {
+      playbackRecoveryState.retryTimer = setTimeout(runRecovery, 500);
+      return;
+    }
+    const request = playbackRecoveryState.request;
+    if (!request) return;
+    await play(request.url, request.title, {
+      ...request.meta,
+      startTime,
+      __recovery: true,
+    });
+  };
+  playbackRecoveryState.retryTimer = setTimeout(runRecovery, delayMs);
+  return true;
 }
 
 function createStutterTelemetryState() {
@@ -171,6 +272,9 @@ function resetPlayerMetrics() {
   playerMetricsState.totalStallDurationMs = 0;
   playerMetricsState.stallStartedAt = 0;
   playerMetricsState.decodePath = defaultDecodePath();
+  playerMetricsState.lastVideoCurrentTimeMs = 0;
+  playerMetricsState.lastVideoProgressAt = 0;
+  playerMetricsState.freezeRecoveryTriggered = false;
 }
 
 function resetStutterTelemetry() {
@@ -619,7 +723,7 @@ function safeRound(value, digits = 3) {
   return Number(value.toFixed(digits));
 }
 
-function readLibmediaStats(player) {
+function readPlayerStats(player) {
   try {
     const stats = player?.getStats?.();
     return stats && typeof stats === "object" ? stats : null;
@@ -628,8 +732,8 @@ function readLibmediaStats(player) {
   }
 }
 
-function summarizeLibmediaStats(player) {
-  const stats = readLibmediaStats(player);
+function summarizePlayerStats(player) {
+  const stats = readPlayerStats(player);
   if (!stats) return null;
 
   const jitterBuffer = stats.jitterBuffer && typeof stats.jitterBuffer === "object"
@@ -670,38 +774,6 @@ function summarizeLibmediaStats(player) {
     height: normalizeMetricNumber(stats.height),
     jitterBuffer,
   };
-}
-
-function getVideoDecodePipeline(player) {
-  const pipelineProxy = player?.VideoPipelineProxy?.VideoDecodePipeline;
-  if (pipelineProxy && typeof pipelineProxy.getTasksInfo === "function") return pipelineProxy;
-
-  const decoderThread = player?.VideoDecoderThread;
-  if (decoderThread && typeof decoderThread.getTasksInfo === "function") return decoderThread;
-
-  return null;
-}
-
-async function readVideoDecodeTasks(player) {
-  const pipeline = getVideoDecodePipeline(player);
-  if (!pipeline || typeof pipeline.getTasksInfo !== "function") return null;
-
-  try {
-    const tasks = await pipeline.getTasksInfo();
-    return Array.isArray(tasks) ? tasks : null;
-  } catch (error) {
-    console.warn("[player] Failed to inspect video decode tasks:", error);
-    return null;
-  }
-}
-
-function readPlayerOptions(player) {
-  try {
-    const options = player?.getOptions?.();
-    return options && typeof options === "object" ? options : null;
-  } catch {
-    return null;
-  }
 }
 
 function describePlayerCanvas() {
@@ -1041,19 +1113,68 @@ function ensureLongTaskObserver() {
   }
 }
 
+function detectVideoFreeze(playerStats) {
+  const now = performance.now();
+  const videoCurrentTimeMs = playerStats?.videoCurrentTimeMs;
+  const audioCurrentTimeMs = playerStats?.audioCurrentTimeMs;
+  const hasRenderedVideo = (playerStats?.videoFrameRenderCount || 0) > 0;
+
+  if (!state.isPlaying || !hasRenderedVideo || !Number.isFinite(videoCurrentTimeMs)) {
+    playerMetricsState.lastVideoCurrentTimeMs = videoCurrentTimeMs || 0;
+    playerMetricsState.lastVideoProgressAt = now;
+    playerMetricsState.freezeRecoveryTriggered = false;
+    return;
+  }
+
+  if (videoCurrentTimeMs > playerMetricsState.lastVideoCurrentTimeMs + 50) {
+    playerMetricsState.lastVideoCurrentTimeMs = videoCurrentTimeMs;
+    playerMetricsState.lastVideoProgressAt = now;
+    playerMetricsState.freezeRecoveryTriggered = false;
+    return;
+  }
+
+  if (!playerMetricsState.lastVideoProgressAt) {
+    playerMetricsState.lastVideoProgressAt = now;
+    return;
+  }
+
+  const driftMs = Number.isFinite(audioCurrentTimeMs)
+    ? audioCurrentTimeMs - videoCurrentTimeMs
+    : 0;
+  const frozenForMs = now - playerMetricsState.lastVideoProgressAt;
+  if (
+    driftMs >= VIDEO_FREEZE_DRIFT_MS
+    && frozenForMs >= VIDEO_FREEZE_THRESHOLD_MS
+    && !playerMetricsState.freezeRecoveryTriggered
+  ) {
+    playerMetricsState.freezeRecoveryTriggered = true;
+    const error = new Error(`video stalled for ${Math.round(frozenForMs)}ms with ${Math.round(driftMs)}ms A/V drift`);
+    postPlayerRuntimeLog("video_freeze_detected", {
+      videoCurrentTimeMs,
+      audioCurrentTimeMs,
+      frozenForMs: Math.round(frozenForMs),
+      driftMs: Math.round(driftMs),
+    });
+    schedulePlaybackRecovery(state.player, error);
+  }
+}
+
 function reportPlayerMetrics() {
   const activeStallDurationMs = playerMetricsState.stallStartedAt
     ? performance.now() - playerMetricsState.stallStartedAt
     : 0;
   const bufferHealthSeconds = readBufferHealthSeconds(state.player);
   const droppedFrames = readDroppedFrames(state.player);
-  const libmediaStats = summarizeLibmediaStats(state.player);
+  const playerStats = summarizePlayerStats(state.player);
+  detectVideoFreeze(playerStats);
+  const reportedCurrentTime = getReportedCurrentTime();
 
   fetch("/api/metrics/player", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      currentTime: state.currentTime,
+      currentTime: reportedCurrentTime,
+      mediaClockTime: state.currentTime,
       duration: state.duration,
       isPlaying: state.isPlaying,
       isMuted: state.isMuted,
@@ -1062,40 +1183,16 @@ function reportPlayerMetrics() {
       totalStallDurationMs: Math.round(playerMetricsState.totalStallDurationMs + activeStallDurationMs),
       decodePath: playerMetricsState.decodePath,
       droppedFrames,
-      libmediaStats,
+      playerStats,
       playbackState: getPlaybackState(),
       capabilityProfile: {
         hasWebCodecs: CAPABILITY_PROFILE.hasWebCodecs,
         hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
-        enableWorker: CAPABILITY_PROFILE.enableWorker,
         hasAudioWorklet: CAPABILITY_PROFILE.hasAudioWorklet,
         teslaLikeEnv: CAPABILITY_PROFILE.teslaLikeEnv,
       },
     }),
   }).catch(() => {});
-}
-
-function detectWasmSIMD() {
-  try {
-    // Actually compile a SIMD module rather than just validating bytecode.
-    // WebAssembly.validate() can return true even when the engine disables SIMD
-    // at runtime (observed on Tesla's Chromium 136 browser).
-    return !!new WebAssembly.Module(WASM_SIMD_MODULE);
-  } catch {
-    return false;
-  }
-}
-
-function detectWasmThreads() {
-  try {
-    if (typeof SharedArrayBuffer === "undefined" || typeof WebAssembly?.Memory !== "function") {
-      return false;
-    }
-    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
-    return memory.buffer instanceof SharedArrayBuffer;
-  } catch {
-    return false;
-  }
 }
 
 function detectCapabilityProfile() {
@@ -1108,11 +1205,6 @@ function detectCapabilityProfile() {
   const hasWebCodecs = hasVideoDecoder || hasAudioDecoder;
   const hasAudioContext = typeof (globalThis.AudioContext || globalThis.webkitAudioContext) === "function";
   const hasAudioWorklet = hasAudioContext && typeof globalThis.AudioWorkletNode === "function";
-  const hasWorkers = typeof globalThis.Worker === "function";
-  const hasOffscreenCanvas = typeof globalThis.OffscreenCanvas === "function";
-  const hasWasmSIMD = detectWasmSIMD();
-  const hasWasmThreads = detectWasmThreads();
-  const constrainedWebCodecsEnv = hasWebCodecs && !hasWasmSIMD;
 
   return {
     platform,
@@ -1122,35 +1214,8 @@ function detectCapabilityProfile() {
     hasAudioDecoder,
     hasWebCodecs,
     hasAudioWorklet,
-    hasWorkers,
-    hasOffscreenCanvas,
-    hasWasmSIMD,
-    hasWasmThreads,
-    constrainedWebCodecsEnv,
-    teslaLikeEnv: isLinuxX64 && constrainedWebCodecsEnv,
-    enableWorker: hasWorkers && hasOffscreenCanvas && !hasWasmThreads,
-    // libmedia's own default VOD preload is 4 seconds. Keep this override much
-    // closer to that baseline so long videos do not build oversized packet
-    // queues before decode/render catches up on constrained Chromium builds.
-    preLoadTime: constrainedWebCodecsEnv ? 8 : hasWebCodecs ? 12 : 20,
-    audioWorkletBufferLength: hasAudioWorklet && constrainedWebCodecsEnv ? 24 : undefined,
-  };
-}
-
-function getPlayerOptions(container) {
-  return {
-    container,
-    enableHardware: CAPABILITY_PROFILE.hasVideoDecoder,
-    enableWebGPU: false,
-    enableWebCodecs: CAPABILITY_PROFILE.hasWebCodecs,
-    // In no-thread environments, worker mode still moves demux/render work off the UI thread.
-    enableWorker: CAPABILITY_PROFILE.enableWorker,
-    enableAudioWorklet: CAPABILITY_PROFILE.hasAudioWorklet,
-    // Keep VOD buffering tighter when WebCodecs is the preferred path to avoid excess memory pressure.
-    preLoadTime: CAPABILITY_PROFILE.preLoadTime,
-    ...(CAPABILITY_PROFILE.audioWorkletBufferLength
-      ? { audioWorkletBufferLength: CAPABILITY_PROFILE.audioWorkletBufferLength }
-      : {}),
+    crossOriginIsolated: globalThis.crossOriginIsolated === true,
+    teslaLikeEnv: isLinuxX64,
   };
 }
 
@@ -1176,86 +1241,20 @@ function reportDecodeInfo(data) {
 }
 
 async function logDecodePath(player, phase, extra = {}) {
-  const options = readPlayerOptions(player);
-  const requested = {
-    enableHardware: options?.enableHardware ?? CAPABILITY_PROFILE.hasVideoDecoder,
-    enableWebCodecs: options?.enableWebCodecs ?? CAPABILITY_PROFILE.hasWebCodecs,
-    enableWorker: options?.enableWorker ?? CAPABILITY_PROFILE.enableWorker,
-    enableAudioWorklet: options?.enableAudioWorklet ?? CAPABILITY_PROFILE.hasAudioWorklet,
-    preLoadTime: options?.preLoadTime ?? CAPABILITY_PROFILE.preLoadTime,
-  };
-  const summary = {
+  const playerStats = summarizePlayerStats(player);
+  const decodeInfo = {
     phase,
+    path: "mediabunny-webcodecs",
     playbackState: getPlaybackState(),
     currentTime: state.currentTime,
     duration: state.duration,
-    webCodecsEnabled: requested.enableWebCodecs,
-    hardwareAccelerationRequested: requested.enableHardware,
-    constrainedWebCodecsEnv: CAPABILITY_PROFILE.constrainedWebCodecsEnv,
-    requested,
-    ...extra,
-  };
-  const libmediaStats = summarizeLibmediaStats(player);
-  const bufferHealthSeconds = readBufferHealthSeconds(player);
-  const droppedFrames = readDroppedFrames(player);
-  const { bufferedAudioMs, underrunCount } = readAudioBufferStats(player);
-  const tasks = await readVideoDecodeTasks(player);
-
-  if (Array.isArray(tasks) && tasks.length > 0) {
-    const usesHardwareDecoder = tasks.some((task) => task?.hardware === true);
-    const decodeInfo = {
-      ...summary,
-      path: usesHardwareDecoder
-        ? "webcodecs-hardware"
-        : requested.enableWebCodecs
-          ? "software-decode"
-          : "wasm",
-      softDecodePathVisibility: usesHardwareDecoder
-        ? "exact"
-        : requested.enableWebCodecs
-          ? "ambiguous"
-          : "exact",
-      backpressure: {
-        webCodecsQueueLimit: LIBMEDIA_WEB_CODECS_QUEUE_LIMIT,
-        queueDepthExposed: false,
-      },
-      notes: usesHardwareDecoder || !requested.enableWebCodecs
-        ? undefined
-        : "libmedia AVPlayer exposes hardware=false for soft decode but not whether the active decoder is WebCodecs or WASM.",
-      tasks: tasks.map((task) => ({
-        codecId: task.codecId,
-        width: task.width,
-        height: task.height,
-        framerate: task.framerate,
-        hardware: task.hardware,
-      })),
-      stats: libmediaStats,
-      bufferHealthSeconds,
-      droppedFrames,
-      bufferedAudioMs,
-      audioUnderrunCount: underrunCount,
-      isMSE: typeof player?.isMSE === "function" ? player.isMSE() : null,
-      canvas: describePlayerCanvas(),
-    };
-    console.log("[player] Decode health:", decodeInfo);
-    reportDecodeInfo(decodeInfo);
-    return decodeInfo;
-  }
-
-  const decodeInfo = {
-    ...summary,
-    path: requested.enableWebCodecs ? "webcodecs-requested" : "wasm-only",
-    backpressure: {
-      webCodecsQueueLimit: LIBMEDIA_WEB_CODECS_QUEUE_LIMIT,
-      queueDepthExposed: false,
-    },
-    stats: libmediaStats,
-    bufferHealthSeconds,
-    droppedFrames,
-    bufferedAudioMs,
-    audioUnderrunCount: underrunCount,
-    isMSE: typeof player?.isMSE === "function" ? player.isMSE() : null,
+    capabilities: CAPABILITY_PROFILE,
+    stats: playerStats,
+    bufferHealthSeconds: readBufferHealthSeconds(player),
+    droppedFrames: readDroppedFrames(player),
+    audio: readAudioBufferStats(player),
     canvas: describePlayerCanvas(),
+    ...extra,
   };
   console.log("[player] Decode health:", decodeInfo);
   reportDecodeInfo(decodeInfo);
@@ -1292,65 +1291,6 @@ function stopDecodeHealthMonitoring() {
   detachCanvasDiagnostics();
 }
 
-// Intercept console to capture libmedia internal logs and forward to server
-// libmedia logs format: console.log("[file][line N] [level]", message)
-const libmediaLogBuffer = [];
-let libmediaLogFlushTimer = null;
-const LIBMEDIA_TAG_RE = /\[.*\]\[line \d+\] \[(trace|debug|info|warn|error|fatal)\]/;
-
-function installLibmediaLogCapture() {
-  const originalWarn = console.warn;
-  const originalError = console.error;
-  const originalLog = console.log;
-
-  function captureLog(level, args) {
-    // libmedia passes tag as first arg, message as second
-    const tag = typeof args[0] === "string" ? args[0] : "";
-    const isLibmedia = LIBMEDIA_TAG_RE.test(tag);
-    if (!isLibmedia) return;
-    const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-    libmediaLogBuffer.push({ ts: Date.now(), level, msg: msg.slice(0, 500), pos: state.currentTime || 0 });
-    if (libmediaLogBuffer.length > 200) libmediaLogBuffer.shift();
-    if (!libmediaLogFlushTimer) {
-      libmediaLogFlushTimer = setTimeout(flushLibmediaLogs, 5000);
-    }
-  }
-
-  console.log = (...args) => { captureLog("log", args); originalLog.apply(console, args); };
-  console.warn = (...args) => { captureLog("warn", args); originalWarn.apply(console, args); };
-  console.error = (...args) => { captureLog("error", args); originalError.apply(console, args); };
-}
-
-function flushLibmediaLogs() {
-  libmediaLogFlushTimer = null;
-  if (!libmediaLogBuffer.length) return;
-  const batch = libmediaLogBuffer.splice(0);
-  try {
-    navigator.sendBeacon("/api/dev/player-log", new Blob(
-      [JSON.stringify({ type: "libmedia_logs", entries: batch, timestamp: Date.now() })],
-      { type: "application/json" }
-    ));
-  } catch {
-    fetch("/api/dev/player-log", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "libmedia_logs", entries: batch, timestamp: Date.now() }),
-      keepalive: true,
-    }).catch(() => {});
-  }
-}
-
-async function loadAVPlayerClass() {
-  if (AVPlayerClass) return;
-  const mod = await import("@libmedia/avplayer");
-  AVPlayerClass = mod.default || mod.AVPlayer || mod;
-  AVPlayerEvents = mod.Events;
-  // Enable libmedia internal logging — DEBUG (1) shows decoder switching, errors, pipeline state
-  try { AVPlayerClass.setLogLevel(1); } catch {}
-  installLibmediaLogCapture();
-  console.log("[player] AVPlayer class loaded (log level: DEBUG, server forwarding enabled)");
-}
-
 // --- MediaSession (Tesla steering wheel / browser media keys) --------
 
 export function updateMediaSession() {
@@ -1372,9 +1312,27 @@ export function updateMediaSession() {
 
 // --- Progress reporting ----------------------------------------------
 
+function getReportedCurrentTime(player = state.player) {
+  const stats = summarizePlayerStats(player);
+  const videoSeconds = stats?.videoCurrentTimeMs != null ? stats.videoCurrentTimeMs / 1000 : null;
+  const audioSeconds = stats?.audioCurrentTimeMs != null ? stats.audioCurrentTimeMs / 1000 : null;
+  const hasRenderedVideo = (stats?.videoFrameRenderCount || 0) > 0;
+  if (
+    hasRenderedVideo
+    && Number.isFinite(videoSeconds)
+    && videoSeconds > 0
+    && Number.isFinite(audioSeconds)
+    && audioSeconds - videoSeconds > 2
+  ) {
+    return Math.max(0, Math.min(state.duration || Infinity, videoSeconds));
+  }
+  return state.currentTime;
+}
+
 export function reportProgress() {
+  const reportedCurrentTime = getReportedCurrentTime();
   const ps = {
-    currentTime: state.currentTime,
+    currentTime: reportedCurrentTime,
     duration: state.duration,
     isPlaying: state.isPlaying,
     isMuted: state.isMuted,
@@ -1389,119 +1347,24 @@ export function reportProgress() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ratingKey: state.plexInfo.ratingKey,
-        timeMs: state.currentTime * 1000,
+        timeMs: reportedCurrentTime * 1000,
       }),
     }).catch(() => {});
   }
   reportPlayerMetrics();
 }
 
-function unbindPlayerEvents(player) {
-  if (!player || !AVPlayerEvents || !currentPlayerBindings) return;
-  for (const [event, handler] of currentPlayerBindings) {
-    player.off(event, handler);
-  }
-  currentPlayerBindings = null;
-}
-
 async function disposePlayer(player) {
   if (!player) return;
-  // Fully destroy old AVPlayer instances so canvases, audio nodes, and worker state do not leak across plays.
-  unbindPlayerEvents(player);
   stopDecodeHealthMonitoring();
-  teardownAudioBoost();
-  try { await player.stop(true); } catch {}
+  try { await player.stop(); } catch {}
   try { await player.destroy(); } catch {}
-}
-
-async function resumePlayerAudioContext() {
-  try {
-    if (AVPlayerClass?.audioContext?.state === "suspended") {
-      await AVPlayerClass.audioContext.resume();
-    }
-  } catch {}
-}
-
-function teardownAudioBoost() {
-  const { audioBoostNode, audioOutputNode, audioCompressorNode } = state;
-  state.audioBoostNode = null;
-  state.audioOutputNode = null;
-  state.audioCompressorNode = null;
-
-  try { audioBoostNode?.disconnect(); } catch {}
-  try { audioCompressorNode?.disconnect(); } catch {}
-  try { audioOutputNode?.disconnect(); } catch {}
-}
-
-async function attachAudioBoost(player) {
-  if (!player || typeof player.getAudioOutputNode !== "function") return;
-
-  await resumePlayerAudioContext();
-
-  const audioContext = AVPlayerClass?.audioContext;
-  if (!audioContext || typeof audioContext.createGain !== "function") return;
-  if (typeof player.isMediaStreamMode === "function" && player.isMediaStreamMode()) return;
-
-  let outputNode = null;
-  try {
-    outputNode = player.getAudioOutputNode();
-  } catch (error) {
-    console.warn("[player] Failed to inspect audio output node:", error);
-    return;
-  }
-  if (!outputNode || typeof outputNode.connect !== "function") return;
-
-  if (state.audioOutputNode === outputNode && state.audioBoostNode) {
-    state.audioBoostNode.gain.value = state.audioGain;
-    return;
-  }
-
-  teardownAudioBoost();
-
-  const boostNode = audioContext.createGain();
-  boostNode.gain.value = state.audioGain;
-
-  // Compressor prevents clipping when gain is high — louder without distortion
-  const compressor = audioContext.createDynamicsCompressor();
-  compressor.threshold.value = -24;  // start compressing at -24dB
-  compressor.knee.value = 12;        // soft knee for natural sound
-  compressor.ratio.value = 8;        // strong compression on peaks
-  compressor.attack.value = 0.003;   // fast attack to catch transients
-  compressor.release.value = 0.15;   // moderate release
-
-  try {
-    outputNode.disconnect();
-  } catch {}
-
-  try {
-    outputNode.connect(boostNode);
-    boostNode.connect(compressor);
-    compressor.connect(audioContext.destination);
-    state.audioOutputNode = outputNode;
-    state.audioBoostNode = boostNode;
-    state.audioCompressorNode = compressor;
-    console.log("[player] Audio boost + compressor connected", { gain: state.audioGain });
-  } catch (error) {
-    console.warn("[player] Failed to connect audio boost:", error);
-    try {
-      outputNode.connect(audioContext.destination);
-    } catch {}
-    try {
-      boostNode.disconnect();
-    } catch {}
-  }
 }
 
 export async function setAudioGain(value) {
   state.audioGain = clampAudioGain(value);
   persistAudioGain();
-  if (state.audioBoostNode) {
-    if (state.audioBoostNode.gain.value !== state.audioGain) {
-      state.audioBoostNode.gain.value = state.audioGain;
-    }
-  } else if (state.player) {
-    await attachAudioBoost(state.player);
-  }
+  state.player?.setAudioGain(state.audioGain);
   onUpdateAudioUI();
 }
 
@@ -1536,7 +1399,7 @@ export async function togglePlayPause() {
   if (!state.player) return;
   try {
     const status = state.player.getStatus();
-    const actuallyPlaying = status === 5 || status === 6;
+    const actuallyPlaying = status === "playing" || status === "buffering";
     if (actuallyPlaying) {
       await state.player.pause();
       state.isPlaying = false;
@@ -1552,148 +1415,81 @@ export async function togglePlayPause() {
 
 // --- Player event bindings -------------------------------------------
 
-function bindPlayerEvents(p) {
-  if (!AVPlayerEvents) return;
-
-  const onLoading = () => {
-    beginStall();
-    showBuffering();
-  };
-  const onLoaded = () => {
-    endStall();
-    hideBuffering();
-  };
-  const onFirstVideoRendered = () => {
-    endStall();
-    hideBuffering();
-    queueDecodeHealthCheck(p, "first-video-frame");
-  };
-  const onFirstAudioRendered = () => {
-    attachAudioBoost(p).catch(() => {});
-  };
-  const onSeeking = () => showBuffering();
-  const onSeeked = () => hideBuffering();
-  const onTime = (pts) => {
+function createMediabunnyPlayer(meta) {
+  const updateTime = (seconds) => {
     if (isDraggingProgress()) return;
-    playerRuntimeLogState.frameCount += 1;
-    const ptsMs = Number(pts);
-    state.currentTime = ptsMs / 1000;
-    if (state.duration > 0) state.currentTime = Math.min(state.currentTime, state.duration);
-
+    state.currentTime = Math.max(0, Math.min(state.duration || Infinity, seconds));
     const now = performance.now();
-    if (stutterTelemetryState.lastTimeCallbackAt) {
-      const actualDeltaMs = now - stutterTelemetryState.lastTimeCallbackAt;
-      const ptsDeltaMs = Math.max(0, ptsMs - stutterTelemetryState.lastTimePtsMs);
-      const expectedDeltaMs = inferExpectedFrameDeltaMs(ptsDeltaMs);
-      stutterTelemetryState.lastExpectedDeltaMs = expectedDeltaMs;
-
-      if (actualDeltaMs > STUTTER_JANK_THRESHOLD_MS) {
-        playerRuntimeLogState.jankCount += 1;
-        recordStutterEvent("frame_jank", {
-          playbackPosition: state.currentTime,
-          expectedDeltaMs,
-          actualDeltaMs,
-        });
-        queueStutterTelemetryReport("frame-jank");
-        queueDecodeHealthCheck(p, "time-jank", {
-          actualDeltaMs: Math.round(actualDeltaMs),
-          expectedDeltaMs: Math.round(expectedDeltaMs),
-          ptsDeltaMs: Math.round(ptsDeltaMs),
-        }, {
-          jankCooldownMs: DECODE_JANK_RECHECK_COOLDOWN_MS,
-        });
-      }
-
-      if (state.isPlaying && ptsDeltaMs > 0 && actualDeltaMs >= 250) {
-        const effectiveRate = ptsDeltaMs / actualDeltaMs;
-        if (
-          effectiveRate < 0.99
-          && now - stutterTelemetryState.lastRateDropLoggedAt >= PLAYBACK_RATE_DROP_COOLDOWN_MS
-        ) {
-          stutterTelemetryState.lastRateDropLoggedAt = now;
-          recordStutterEvent("playback_rate_drop", {
-            playbackPosition: state.currentTime,
-            effectiveRate,
-            actualDeltaMs,
-          });
-        }
-      }
-    }
-    stutterTelemetryState.lastTimeCallbackAt = now;
-    stutterTelemetryState.lastTimePtsMs = ptsMs;
-    sampleMemoryUsage(now);
-    sampleAudioUnderruns(p, now);
-
     if (now - lastUiPaintAt >= UI_PAINT_INTERVAL_MS) {
-      // Throttle control repaint work so the TIME event does not force DOM writes on every decoded frame.
-      if (state.duration > 0) {
-        updateProgress(state.currentTime / state.duration);
-      }
+      if (state.duration > 0) updateProgress(state.currentTime / state.duration);
       updateTimeDisplay();
       lastUiPaintAt = now;
     }
-
     renderSubtitle(state.currentTime);
-    if (state.isBuffering) hideBuffering();
-  };
-  const onPlaying = () => {
-    endStall();
-    state.isPlaying = true;
-    attachAudioBoost(p).catch(() => {});
-    updatePlayButton();
-    updateMediaSession();
-    hideBuffering();
-  };
-  const onPaused = () => {
-    endStall();
-    state.isPlaying = false;
-    updatePlayButton();
-    updateMediaSession();
-  };
-  const onEnded = () => {
-    endStall();
-    state.isPlaying = false;
-    state.currentTime = 0;
-    reportProgress();
-    updatePlayButton();
-    updateMediaSession();
-    showControls();
-  };
-  const onError = (err) => {
-    endStall();
-    console.error("[player] Error event:", err);
-    queueDecodeHealthCheck(p, "player-error", {
-      errorMessage: err?.message || String(err),
-    });
-    hideBuffering();
-  };
-  const onTimeout = () => {
-    console.warn("[player] Timeout — network may be slow");
-    queueDecodeHealthCheck(p, "player-timeout");
-  };
-  const onAudioContextRunning = () => {
-    attachAudioBoost(p).catch(() => {});
   };
 
-  currentPlayerBindings = [
-    [AVPlayerEvents.LOADING, onLoading],
-    [AVPlayerEvents.LOADED, onLoaded],
-    [AVPlayerEvents.FIRST_VIDEO_RENDERED, onFirstVideoRendered],
-    [AVPlayerEvents.FIRST_AUDIO_RENDERED, onFirstAudioRendered],
-    [AVPlayerEvents.SEEKING, onSeeking],
-    [AVPlayerEvents.SEEKED, onSeeked],
-    [AVPlayerEvents.TIME, onTime],
-    [AVPlayerEvents.PLAYING, onPlaying],
-    [AVPlayerEvents.PAUSED, onPaused],
-    [AVPlayerEvents.ENDED, onEnded],
-    [AVPlayerEvents.ERROR, onError],
-    [AVPlayerEvents.TIMEOUT, onTimeout],
-    [AVPlayerEvents.AUDIO_CONTEXT_RUNNING, onAudioContextRunning],
-  ].filter(([event]) => !!event);
+  const player = new MediabunnyPlayer({
+    container,
+    faultInjection: getMediabunnyFaultInjection(),
+    onStateChange: (nextState, detail) => {
+      if (state.player !== player) return;
+      if (["loading", "seeking", "buffering"].includes(nextState)) {
+        beginStall();
+        showBuffering();
+        if (nextState === "buffering") state.isPlaying = true;
+      } else if (nextState === "playing") {
+        endStall();
+        hideBuffering();
+        state.isPlaying = true;
+        updatePlayButton();
+        updateMediaSession();
+      } else if (nextState === "paused") {
+        endStall();
+        hideBuffering();
+        state.isPlaying = false;
+        updatePlayButton();
+        updateMediaSession();
+      }
+      postPlayerRuntimeLog("mediabunny_state", {
+        state: nextState,
+        reason: detail.reason || null,
+        buffer: collectBufferState(player),
+      });
+    },
+    onTime: updateTime,
+    onFirstVideo: () => {
+      endStall();
+      markPlaybackStable(player);
+    },
+    onEnded: () => {
+      endStall();
+      hideBuffering();
+      state.isPlaying = false;
+      state.currentTime = 0;
+      reportProgress();
+      if (state.ws?.readyState === WebSocket.OPEN) {
+        state.ws.send(JSON.stringify({ type: "ended" }));
+      }
+      updatePlayButton();
+      updateMediaSession();
+      showControls();
+    },
+    onError: (error) => {
+      endStall();
+      console.error("[mediabunny] Playback error:", error);
+      if (!schedulePlaybackRecovery(player, error)) {
+        hideBuffering();
+        showStatus(`Error: ${error.message}`);
+      }
+    },
+  });
 
-  for (const [event, handler] of currentPlayerBindings) {
-    p.on(event, handler);
-  }
+  player.setAudioGain(state.audioGain);
+  globalThis.__driveInMediabunny = {
+    player,
+    injectVideoStall: (durationMs = 15_000) => player.injectVideoStall(durationMs),
+  };
+  return player;
 }
 
 // --- Play / Stop -----------------------------------------------------
@@ -1802,9 +1598,15 @@ export function showStatus(text) {
 export async function play(url, title, meta = {}) {
   if (state.playLock) return;
   state.playLock = true;
+  const isRecovery = meta.__recovery === true;
+  if (!isRecovery) {
+    resetPlaybackRecovery();
+    const requestMeta = { ...meta };
+    delete requestMeta.__recovery;
+    playbackRecoveryState.request = { url, title, meta: requestMeta };
+  }
 
   try {
-    await loadAVPlayerClass();
     ensureLongTaskObserver();
     resetPlayerMetrics();
     resetStutterTelemetry();
@@ -1840,55 +1642,35 @@ export async function play(url, title, meta = {}) {
         : "/play";
     navigate(playPath);
 
-    const playerOptions = getPlayerOptions(container);
-    state.player = new AVPlayerClass(playerOptions);
-    const decodeInfo = {
-      options: {
-        enableHardware: playerOptions.enableHardware,
-        enableWebCodecs: playerOptions.enableWebCodecs,
-        enableWorker: playerOptions.enableWorker,
-        enableAudioWorklet: playerOptions.enableAudioWorklet,
-        preLoadTime: playerOptions.preLoadTime,
-        audioWorkletBufferLength: playerOptions.audioWorkletBufferLength ?? "default",
-      },
-      capabilities: {
-        isLinuxX64: CAPABILITY_PROFILE.isLinuxX64,
-        teslaLikeEnv: CAPABILITY_PROFILE.teslaLikeEnv,
-        hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
-        hasAudioDecoder: CAPABILITY_PROFILE.hasAudioDecoder,
-        hasWasmSIMD: CAPABILITY_PROFILE.hasWasmSIMD,
-        hasWasmThreads: CAPABILITY_PROFILE.hasWasmThreads,
-      },
-      decodePreference: CAPABILITY_PROFILE.hasVideoDecoder
-        ? "prefer-webcodecs-hardware"
-        : CAPABILITY_PROFILE.hasWebCodecs
-          ? "prefer-webcodecs"
-          : "wasm-fallback",
-    };
-    console.log("[player] AVPlayer created", decodeInfo);
-    reportDecodeInfo(decodeInfo);
-
-    bindPlayerEvents(state.player);
+    const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
+    state.player = createMediabunnyPlayer(meta);
     startProgressReporting();
     startStutterTelemetryReporting();
     startPlayerHealthHeartbeat();
     startDecodeHealthMonitoring(state.player);
 
-    const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
-    console.log("[player] Loading:", absUrl);
-    await state.player.load(absUrl, { isLive: meta.isLive || false });
-    await attachAudioBoost(state.player);
-    await logDecodePath(state.player, "post-load");
+    console.log("[player] Loading with Mediabunny:", absUrl);
+    reportDecodeInfo({
+      options: { engine: "mediabunny", clock: "audio-consumed-samples" },
+      capabilities: {
+        crossOriginIsolated: globalThis.crossOriginIsolated,
+        hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
+        hasAudioDecoder: CAPABILITY_PROFILE.hasAudioDecoder,
+        hasAudioWorklet: typeof AudioWorkletNode === "function",
+      },
+      decodePreference: "webcodecs-hardware-with-drivein-coordinator",
+    });
+    await state.player.load(meta.mediaSource || absUrl, {
+      isLive: meta.isLive || false,
+      startTime: state.currentTime,
+      duration: state.duration,
+    });
 
     if (!state.duration) {
-      try {
-        const d = state.player.getDuration();
-        if (d && d > 0n) {
-          state.duration = Number(d) / 1000;
-          updateTimeDisplay();
-        }
-      } catch {}
+      const duration = state.player.getDuration();
+      if (duration > 0n) state.duration = Number(duration) / 1000;
     }
+    updateTimeDisplay();
 
     if (!state.audioUnlocked) {
       state.player.setVolume(0);
@@ -1897,15 +1679,9 @@ export async function play(url, title, meta = {}) {
     }
 
     await state.player.play();
-    await attachAudioBoost(state.player);
-    if (state.currentTime > 5) {
-      const seekMs = BigInt(Math.floor(state.currentTime * 1000));
-      try { await state.player.seek(seekMs); } catch (e) { console.warn("[player] Seek failed:", e); }
-    }
     state.isPlaying = true;
     onUpdateAudioUI();
     updatePlayButton();
-    hideBuffering();
     showControls();
     updateMediaSession();
 
@@ -1925,6 +1701,7 @@ export async function play(url, title, meta = {}) {
 }
 
 export async function stop() {
+  resetPlaybackRecovery({ clearRequest: true });
   endStall();
   clearScheduledStutterTelemetryFlush();
   flushStutterTelemetry("stop", { keepalive: true });
@@ -1935,7 +1712,6 @@ export async function stop() {
   stopDecodeHealthMonitoring();
   const player = state.player;
   state.player = null;
-  teardownAudioBoost();
   await disposePlayer(player);
   container.innerHTML = "";
   state.isPlaying = false;

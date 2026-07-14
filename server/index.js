@@ -11,6 +11,24 @@ import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
 import httpProxy from "http-proxy";
 import log from "./logger.js";
+import {
+  addPlaylistItem,
+  createPlaylist,
+  addQueueItem,
+  clearQueue,
+  deletePlaylist,
+  enqueuePlaylist,
+  getPlaylist,
+  getQueueItem,
+  listPlaylists,
+  listQueue,
+  removeQueueItem,
+  removePlaylistItem,
+  reorderQueue,
+  reorderPlaylistItems,
+  shiftQueueItem,
+  updatePlaylist,
+} from "./queue-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -26,7 +44,13 @@ const SEGMENT_CACHE_MAX_BYTES = (() => {
 const SEGMENT_CACHE_MIN_BYTES = 10 * 1024;
 const SEGMENT_CACHE_TARGET_BYTES = Math.floor(SEGMENT_CACHE_MAX_BYTES * 0.9);
 const SEGMENT_CACHE_EVICT_DEBOUNCE_MS = 60_000;
-const SEGMENT_CACHE_MAX_PREFETCHES = 5;
+const SEGMENT_CACHE_MAX_PREFETCHES = 3;
+// Keep roughly 30 seconds of split-stream media warm. The canvas player only
+// holds a small decoded-frame queue, so network jitter must be absorbed here.
+const SEGMENT_PREFETCH_AHEAD = 6;
+const DASH_SEGMENT_INACTIVITY_TIMEOUT_MS = 6_000;
+const DASH_SEGMENT_FETCH_RETRIES = 2;
+const DASH_SEGMENT_MAX_BYTES = 32 * 1024 * 1024;
 const PLEX_TOKEN = process.env.PLEX_TOKEN || (() => {
   try { return execSync("defaults read com.plexapp.plexmediaserver PlexOnlineToken 2>/dev/null").toString().trim(); }
   catch { return ""; }
@@ -68,7 +92,7 @@ function addToHistory(entry) {
 const app = express();
 app.use(express.json());
 
-// COOP/COEP headers — required for SharedArrayBuffer (libmedia WebAssembly)
+// COOP/COEP headers — required by the shared audio ring buffer.
 app.use((req, res, next) => {
   res.set("Cross-Origin-Opener-Policy", "same-origin");
   res.set("Cross-Origin-Embedder-Policy", "credentialless");
@@ -89,11 +113,8 @@ app.use(pinoHttp({
   },
 }));
 
-// Serve libmedia dist files
-// Use local build (lib/libmedia) when available for DASH support, otherwise npm package
-// libmedia dist: npm package for now; local build (lib/libmedia) available for DASH but needs version alignment
-const libmediaDist = resolve(__dirname, "../node_modules/@libmedia/avplayer/dist/esm");
-app.use("/lib/avplayer", express.static(libmediaDist));
+const mediabunnyDist = resolve(__dirname, "../node_modules/mediabunny/dist/bundles");
+app.use("/lib/mediabunny", express.static(mediabunnyDist));
 
 // Serve player: use dist in production, source in dev
 const playerDist = resolve(__dirname, "../player/dist");
@@ -321,6 +342,9 @@ function getMetricsSnapshot() {
         hashKeyHits: segmentCacheState.hashKeyHits,
         prefetchCount: segmentCacheState.prefetchCount,
         prefetchQueueDepth: segmentCachePrefetchQueue.length + segmentCachePrefetchActive,
+        coalescedRequests: segmentCacheState.coalescedRequests,
+        integrityFailures: segmentCacheState.integrityFailures,
+        retryCount: segmentCacheState.retryCount,
         evictionCount: segmentCacheState.evictionCount,
         cacheUtilizationPercent: getSegmentCacheUtilizationPercent(),
       },
@@ -336,6 +360,14 @@ function broadcast(msg) {
   wss.clients.forEach((c) => {
     if (c.readyState === 1) c.send(data);
   });
+}
+
+function broadcastQueue() {
+  broadcast({ type: "queueUpdated", queue: listQueue() });
+}
+
+function broadcastPlaylists() {
+  broadcast({ type: "playlistsUpdated", playlists: listPlaylists() });
 }
 
 function updateState(patch) {
@@ -370,6 +402,34 @@ function ytdlpJson(url) {
       }
     );
   });
+}
+
+function ytdlpFlatPlaylist(url) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "yt-dlp",
+      [
+        ...YTDLP_COMMON,
+        "--no-warnings", "--flat-playlist", "--dump-single-json",
+        url,
+      ],
+      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        try { resolve(JSON.parse(stdout)); }
+        catch { reject(new Error("Failed to parse yt-dlp playlist output")); }
+      }
+    );
+  });
+}
+
+function playlistEntryUrl(entry) {
+  if (entry.webpage_url) return entry.webpage_url;
+  if (entry.url && /^https?:\/\//i.test(entry.url)) return entry.url;
+  const extractor = String(entry.ie_key || entry.extractor_key || "").toLowerCase();
+  if (extractor.includes("youtube") && entry.id) return `https://www.youtube.com/watch?v=${entry.id}`;
+  if (entry.url) return entry.url;
+  return null;
 }
 
 function srtToVtt(srt) {
@@ -484,7 +544,8 @@ let ffmpegProc = null;
 let ytdlpProc = null;
 let currentHlsDir = null;
 let currentTranscodeDir = null;
-const DASH_TRANSCODE = String(process.env.DASH_TRANSCODE ?? "").trim().toLowerCase() !== "false";
+const DASH_TRANSCODE = ["1", "true", "yes", "on"]
+  .includes(String(process.env.DASH_TRANSCODE ?? "").trim().toLowerCase());
 const DASH_TRANSCODE_STARTUP_TIMEOUT_MS = 18_000;
 
 let transcodeState = {
@@ -544,8 +605,8 @@ function buildFfmpegHeadersArg(url, sourceHeaders) {
   const headerLines = Object.entries(headers)
     .filter(([, value]) => typeof value === "string" && value.length > 0)
     .map(([name, value]) => `${name}: ${value}`)
-    .join("\\r\\n");
-  return headerLines ? `${headerLines}\\r\\n` : null;
+    .join("\r\n");
+  return headerLines ? `${headerLines}\r\n` : null;
 }
 
 function resetTranscodeState() {
@@ -1028,10 +1089,12 @@ app.get("/api/transcode/segment", (req, res) => {
   res.sendFile(filePath, { dotfiles: "allow" });
 });
 
-// --- DASH MPD generation (for YouTube/Bilibili split streams) --------
+// --- fMP4 HLS generation (for YouTube/Bilibili split streams) --------
 
-let currentDashMpd = null; // generated MPD XML string
-const dashMpdRequestCounts = new Map();
+// Keep each generated playlist addressable by its own session ID. A browser can
+// briefly overlap two play requests while reconnecting; a global playlist would
+// make the newer request invalidate segments still needed by the older player.
+const dashHlsSessions = new Map();
 
 // Probe MP4 structure: find init segment end, parse sidx for segment byte ranges
 async function probeMP4Structure(proxyId) {
@@ -1105,85 +1168,101 @@ async function probeMP4Structure(proxyId) {
   return { initEnd, segments, totalSize, timescale };
 }
 
-function generateMpd(videoFormat, audioFormat, duration, videoProxyId, audioProxyId, videoInfo, audioInfo) {
-  const dur = duration || 0;
-  const hours = Math.floor(dur / 3600);
-  const mins = Math.floor((dur % 3600) / 60);
-  const secs = dur % 60;
-  const isoDuration = `PT${hours}H${mins}M${secs.toFixed(1)}S`;
+function generateDashHls(sessionId, videoFormat, audioFormat, videoProxyId, audioProxyId, videoInfo, audioInfo) {
+  if (!videoInfo.segments.length || !audioInfo.segments.length) return null;
 
-  const vCodec = videoFormat.vcodec || "avc1.640028";
-  const aCodec = audioFormat.acodec || "mp4a.40.2";
+  const videoMapId = `seg-${videoProxyId}`;
+  const audioMapId = `seg-${audioProxyId}`;
+  dashSegmentMaps.set(videoMapId, {
+    proxyId: videoProxyId,
+    initEnd: videoInfo.initEnd,
+    segments: videoInfo.segments,
+    createdAt: Date.now(),
+  });
+  dashSegmentMaps.set(audioMapId, {
+    proxyId: audioProxyId,
+    initEnd: audioInfo.initEnd,
+    segments: audioInfo.segments,
+    createdAt: Date.now(),
+  });
+  const videoCodec = videoFormat.vcodec || "avc1.640028";
+  const audioCodec = audioFormat.acodec || "mp4a.40.2";
+  const videoBandwidth = Math.round((videoFormat.tbr || 2000) * 1000);
+  const audioBandwidth = Math.round((audioFormat.tbr || 128) * 1000);
   const width = videoFormat.width || 1920;
   const height = videoFormat.height || 1080;
   const fps = videoFormat.fps || 30;
-  const vBandwidth = Math.round((videoFormat.tbr || 2000) * 1000);
-  const aBandwidth = Math.round((audioFormat.tbr || 128) * 1000);
-  const asr = audioFormat.asr || 44100;
 
-  // Must use full URL — libmedia's DASH BaseURL resolver concatenates (not path-resolves)
-  const videoUrl = `http://localhost:${PORT}/api/proxy?id=${videoProxyId}`;
-  const audioUrl = `http://localhost:${PORT}/api/proxy?id=${audioProxyId}`;
+  const mediaPlaylist = (mapId, segments) => {
+    const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map((segment) => segment.duration))));
+    const body = segments.flatMap((segment, index) => [
+      `#EXTINF:${segment.duration.toFixed(6)},`,
+      `/api/dash/${mapId}/${index}.mp4`,
+    ]).join("\n");
+    return `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:${targetDuration}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-MAP:URI="/api/dash/${mapId}/init.mp4"
+${body}
+#EXT-X-ENDLIST
+`;
+  };
 
-  function buildSegmentTemplate(info, proxyId) {
-    if (!info.segments.length) return "";
-    const mapId = `seg-${proxyId}`;
-    dashSegmentMaps.set(mapId, { proxyId, initEnd: info.initEnd, segments: info.segments });
-    const timeline = [];
-    let run = null;
-    for (const seg of info.segments) {
-      const durationTicks = seg.durationTicks || Math.round(seg.duration * (info.timescale || 1000));
-      if (run?.d === durationTicks) {
-        run.r += 1;
-      } else {
-        if (run) timeline.push(run);
-        run = { d: durationTicks, r: 0 };
-      }
-    }
-    if (run) timeline.push(run);
-    const segmentTimeline = timeline
-      .map(({ d, r }) => (r ? `<S d="${d}" r="${r}"/>` : `<S d="${d}"/>`))
-      .join("");
-    // Use path-based URLs (no query params) to avoid &amp; XML escaping issues
-    return `<SegmentTemplate timescale="${info.timescale || 1000}"
-                          initialization="api/dash/${mapId}/init.mp4"
-                          media="api/dash/${mapId}/$Number$.mp4"
-                          startNumber="0">
-                  <SegmentTimeline>${segmentTimeline}</SegmentTimeline>
-                </SegmentTemplate>`;
-  }
+  const master = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="/api/dash/hls/${sessionId}/audio.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=${videoBandwidth + audioBandwidth},RESOLUTION=${width}x${height},FRAME-RATE=${fps},CODECS="${videoCodec},${audioCodec}",AUDIO="audio"
+/api/dash/hls/${sessionId}/video.m3u8
+`;
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
-     mediaPresentationDuration="${isoDuration}"
-     minBufferTime="PT1.5S"
-     profiles="urn:mpeg:dash:profile:full:2011">
-  <BaseURL>http://localhost:${PORT}/</BaseURL>
-  <Period duration="${isoDuration}">
-    <AdaptationSet contentType="video" mimeType="video/mp4" startWithSAP="1" subsegmentAlignment="true">
-      <Representation id="video" bandwidth="${vBandwidth}" codecs="${vCodec}"
-                      width="${width}" height="${height}" frameRate="${fps}">
-        ${buildSegmentTemplate(videoInfo, videoProxyId)}
-      </Representation>
-    </AdaptationSet>
-    <AdaptationSet contentType="audio" mimeType="audio/mp4" startWithSAP="1" subsegmentAlignment="true">
-      <Representation id="audio" bandwidth="${aBandwidth}" codecs="${aCodec}"
-                      audioSamplingRate="${asr}">
-        ${buildSegmentTemplate(audioInfo, audioProxyId)}
-      </Representation>
-    </AdaptationSet>
-  </Period>
-</MPD>`;
+  return {
+    master,
+    video: mediaPlaylist(videoMapId, videoInfo.segments),
+    audio: mediaPlaylist(audioMapId, audioInfo.segments),
+  };
 }
 
 // DASH segment maps: mapId → { proxyId, initEnd, segments: [{start,end,duration}] }
 const dashSegmentMaps = new Map();
+let dashPlaybackGeneration = 0;
+
+function resetDashSegmentSession() {
+  dashPlaybackGeneration += 1;
+  segmentCachePrefetchQueue.length = 0;
+  segmentCachePrefetchSet.clear();
+  pruneDashSessions();
+}
+
+function pruneDashSessions(now = Date.now()) {
+  for (const [mapId, map] of dashSegmentMaps) {
+    if (now - (map.lastAccessAt || map.createdAt) > PROXY_TTL_MS) dashSegmentMaps.delete(mapId);
+  }
+  for (const [sessionId, session] of dashHlsSessions) {
+    if (now - (session.lastAccessAt || session.createdAt) > PROXY_TTL_MS) dashHlsSessions.delete(sessionId);
+  }
+}
+
+app.get("/api/dash/hls/:sessionId/:playlist", (req, res) => {
+  const session = dashHlsSessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Unknown HLS session" });
+  session.lastAccessAt = Date.now();
+  const playlistName = String(req.params.playlist || "").replace(/\.m3u8$/i, "");
+  const body = session[playlistName];
+  if (!body) return res.status(404).json({ error: "Unknown HLS playlist" });
+  res.set("Content-Type", "application/vnd.apple.mpegurl");
+  res.set("Cache-Control", "no-cache");
+  res.set("Access-Control-Allow-Origin", "*");
+  res.send(body);
+});
 
 // Serve DASH segments: /api/dash/:mapId/init.mp4 or /api/dash/:mapId/:number.mp4
 app.get("/api/dash/:mapId/:segment", async (req, res) => {
-  if (req.params.mapId === "manifest.mpd") return; // skip, handled below
   const map = dashSegmentMaps.get(req.params.mapId);
   if (!map) return res.status(404).json({ error: "Unknown segment map" });
+  map.lastAccessAt = Date.now();
   const metric = beginProxyMetric("/api/dash/:mapId/:segment");
   trackProxyMetricLifecycle(res, metric);
 
@@ -1212,9 +1291,14 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
       if (cacheEntry.kind === "hash") segmentCacheState.hashKeyHits += 1;
       else segmentCacheState.logicalKeyHits += 1;
       logSegmentCacheHit({ cacheKey: cacheEntry, cacheEntry, proxyId: map.proxyId, rangeHeader: rangeStr });
-      await serveSegmentCacheToResponse(cacheEntry, res, (bytes) => recordProxyMetricBytes(metric, bytes));
+      await serveSegmentCacheToResponse(
+        cacheEntry,
+        res,
+        (bytes) => recordProxyMetricBytes(metric, bytes),
+        { statusOverride: 200, includeRangeHeaders: false },
+      );
       if (segmentIndex !== null) {
-        for (let offset = 1; offset <= 3; offset++) {
+        for (let offset = 1; offset <= SEGMENT_PREFETCH_AHEAD; offset++) {
           const next = map.segments[segmentIndex + offset];
           if (!next) break;
           enqueueSegmentPrefetch(map.proxyId, `bytes=${next.start}-${next.end}`, segmentIndex + offset);
@@ -1230,22 +1314,20 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
       upstreamUrl: entry.url,
       rangeHeader: rangeStr,
     });
-    const proxied = await fetchProxyUpstream(map.proxyId, {
-      rangeHeader: rangeStr,
-      label: "dash-seg",
-      req,
-      metric,
-    });
-    if (!proxied) return res.status(404).json({ error: "Proxy expired" });
-    await maybeCacheSegmentResponse(proxied.upstream, proxied.entry.url, rangeStr, req, res, {
-      passStatus: false,
-      passRangeHeaders: false,
-      onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
-      metric,
-      cacheContext: proxied.entry,
-    });
+    const result = await getOrFetchDashSegment(map.proxyId, rangeStr, { label: "dash-seg" });
+    if (req.destroyed || res.destroyed) return;
+    if (result.cacheEntry) {
+      await serveSegmentCacheToResponse(
+        result.cacheEntry,
+        res,
+        (bytes) => recordProxyMetricBytes(metric, bytes),
+        { statusOverride: 200, includeRangeHeaders: false },
+      );
+    } else {
+      serveDashSegmentBuffer(result, res, (bytes) => recordProxyMetricBytes(metric, bytes));
+    }
     if (segmentIndex !== null) {
-      for (let offset = 1; offset <= 3; offset++) {
+      for (let offset = 1; offset <= SEGMENT_PREFETCH_AHEAD; offset++) {
         const next = map.segments[segmentIndex + offset];
         if (!next) break;
         enqueueSegmentPrefetch(map.proxyId, `bytes=${next.start}-${next.end}`, segmentIndex + offset);
@@ -1257,28 +1339,6 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
       res.status(502).json({ error: e.message });
     }
   }
-});
-
-app.get("/api/dash/manifest.mpd", (req, res) => {
-  if (!currentDashMpd) return res.status(404).json({ error: "No DASH manifest" });
-  const key = "/api/dash/manifest.mpd";
-  const requestCount = (dashMpdRequestCounts.get(key) || 0) + 1;
-  dashMpdRequestCounts.set(key, requestCount);
-  log.info({
-    endpoint: key,
-    requestCount,
-    currentTime: playerState.currentTime ?? null,
-    userAgent: req.headers["user-agent"] || null,
-  }, "DASH MPD requested");
-  // Replace localhost BaseURL with the actual request origin so tunnel/remote access works
-  const proto = req.headers["x-forwarded-proto"] || req.protocol;
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  const origin = `${proto}://${host}`;
-  const mpd = currentDashMpd.replaceAll(`http://localhost:${PORT}`, origin);
-  res.set("Content-Type", "application/dash+xml");
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Cache-Control", "no-cache");
-  res.send(mpd);
 });
 
 // --- Stream proxy (bypass CORS) --------------------------------------
@@ -1304,6 +1364,7 @@ setInterval(() => {
     totalBytesServed: metricsState.totalBytesServed,
     removedExpired,
   }, "Proxy map health");
+  pruneDashSessions(now);
 }, 60_000).unref();
 
 function proxyRegister(url, headers = null, meta = {}) {
@@ -1331,7 +1392,9 @@ function proxyRegister(url, headers = null, meta = {}) {
 function parseProxyUrlExpiry(url) {
   try {
     const parsed = new URL(url);
-    const raw = parsed.searchParams.get("expire") || parsed.searchParams.get("expires");
+    const raw = parsed.searchParams.get("expire")
+      || parsed.searchParams.get("expires")
+      || parsed.searchParams.get("deadline");
     if (!raw) return null;
     const value = Number(raw);
     if (!Number.isFinite(value) || value <= 0) return null;
@@ -1437,10 +1500,14 @@ const segmentCacheState = {
   logicalKeyHits: 0,
   hashKeyHits: 0,
   prefetchCount: 0,
+  coalescedRequests: 0,
+  integrityFailures: 0,
+  retryCount: 0,
   evictionCount: 0,
 };
 
 const segmentCachePrefetchQueue = [];
+const dashSegmentFetches = new Map();
 let segmentCachePrefetchActive = 0;
 const segmentCachePrefetchSet = new Set();
 let segmentCacheEvictionTimer = null;
@@ -1507,6 +1574,18 @@ function computeCacheKey(upstreamUrl, rangeHeader = "", cacheContext = null) {
         filenameKey: sha256Hex(logicalKey),
       };
     }
+  }
+
+  const isBilibiliSource = hostCandidates.some((host) => host.includes("bilivideo.com"));
+  if (isBilibiliSource && /\.m4s$/i.test(urlInfo.pathname)) {
+    const range = normalizeRangeForCacheKey(rangeHeader);
+    const logicalKey = `bili:${urlInfo.pathname}:${range.start}-${range.end}`;
+    return {
+      kind: "logical",
+      sourceType: "bilibili",
+      logicalKey,
+      filenameKey: sha256Hex(logicalKey),
+    };
   }
 
   const hlsPath = urlInfo.pathname || cacheContext?.registeredUrlPathname || cacheContext?.originalUrlPathname || "";
@@ -1799,18 +1878,181 @@ function shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader) {
   return true;
 }
 
-async function serveSegmentCacheToResponse(cacheEntry, res, onChunk) {
+async function serveSegmentCacheToResponse(cacheEntry, res, onChunk, options = {}) {
+  const { statusOverride = null, includeRangeHeaders = true } = options;
   const meta = cacheEntry.meta || {};
-  res.status(meta.status || 200);
+  res.status(statusOverride ?? meta.status ?? 200);
   if (meta.contentType) res.set("Content-Type", meta.contentType);
   if (meta.contentLength) res.set("Content-Length", String(meta.contentLength));
-  if (meta.contentRange) res.set("Content-Range", meta.contentRange);
+  if (includeRangeHeaders && meta.contentRange) res.set("Content-Range", meta.contentRange);
   res.set("Access-Control-Allow-Origin", "*");
   const source = createReadStream(cacheEntry.dataPath);
   if (onChunk) {
     source.on("data", (chunk) => onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
   }
   await pipeline(source, res);
+}
+
+function expectedRangeBytes(rangeHeader) {
+  const match = String(rangeHeader || "").match(/^bytes=(\d+)-(\d+)$/i);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start) return null;
+  return end - start + 1;
+}
+
+async function readDashSegmentBody(upstream, expectedBytes) {
+  if (!upstream.body) throw new Error("DASH segment response has no body");
+  if (expectedBytes != null && expectedBytes > DASH_SEGMENT_MAX_BYTES) {
+    throw new Error(`DASH segment exceeds ${DASH_SEGMENT_MAX_BYTES} byte safety limit`);
+  }
+
+  const declaredBytes = Number.parseInt(upstream.headers.get("content-length") || "", 10);
+  if (expectedBytes != null && Number.isFinite(declaredBytes) && declaredBytes !== expectedBytes) {
+    const error = new Error(`DASH segment content-length mismatch: expected ${expectedBytes}, got ${declaredBytes}`);
+    error.code = "DASH_SEGMENT_INTEGRITY";
+    throw error;
+  }
+
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      let timer = null;
+      const readResult = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`DASH segment body stalled for ${DASH_SEGMENT_INACTIVITY_TIMEOUT_MS}ms`);
+            error.code = "DASH_SEGMENT_TIMEOUT";
+            reject(error);
+          }, DASH_SEGMENT_INACTIVITY_TIMEOUT_MS);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (readResult.done) break;
+      const chunk = Buffer.from(readResult.value);
+      total += chunk.length;
+      if (total > DASH_SEGMENT_MAX_BYTES) {
+        const error = new Error(`DASH segment exceeded ${DASH_SEGMENT_MAX_BYTES} byte safety limit`);
+        error.code = "DASH_SEGMENT_INTEGRITY";
+        throw error;
+      }
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    try { await reader.cancel(error); } catch {}
+    throw error;
+  }
+
+  if (expectedBytes != null && total !== expectedBytes) {
+    const error = new Error(`Incomplete DASH segment: expected ${expectedBytes} bytes, got ${total}`);
+    error.code = "DASH_SEGMENT_INTEGRITY";
+    throw error;
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function fetchDashSegmentBuffer(proxyId, rangeHeader, { label }) {
+  const expectedBytes = expectedRangeBytes(rangeHeader);
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= DASH_SEGMENT_FETCH_RETRIES; attempt++) {
+    const controller = new AbortController();
+    let proxied = null;
+    try {
+      proxied = await fetchProxyUpstream(proxyId, {
+        rangeHeader,
+        label: `${label}-attempt-${attempt + 1}`,
+        signal: controller.signal,
+      });
+      if (!proxied) throw new Error("Proxy expired");
+      if (proxied.upstream.status !== 200 && proxied.upstream.status !== 206) {
+        throw new Error(`Unexpected DASH segment status ${proxied.upstream.status}`);
+      }
+      const buffer = await readDashSegmentBody(proxied.upstream, expectedBytes);
+      return { buffer, upstream: proxied.upstream, entry: proxied.entry };
+    } catch (error) {
+      lastError = error;
+      controller.abort(error);
+      try { await proxied?.upstream?.body?.cancel?.(error); } catch {}
+      if (error.code === "DASH_SEGMENT_INTEGRITY" || error.code === "DASH_SEGMENT_TIMEOUT") {
+        segmentCacheState.integrityFailures += 1;
+      }
+      if (attempt >= DASH_SEGMENT_FETCH_RETRIES) break;
+      segmentCacheState.retryCount += 1;
+      log.warn({
+        proxyId,
+        range: rangeHeader,
+        attempt: attempt + 1,
+        retries: DASH_SEGMENT_FETCH_RETRIES,
+        err: error.message || String(error),
+      }, "Retrying incomplete DASH segment");
+      if (proxied?.entry?.originalUrl) {
+        try {
+          await reResolveProxy(proxyId);
+        } catch (refreshError) {
+          log.warn({
+            proxyId,
+            err: refreshError.message || String(refreshError),
+          }, "Failed to refresh DASH source before retry");
+        }
+      }
+      await sleep(250 * 2 ** attempt);
+    }
+  }
+  throw lastError || new Error("DASH segment fetch failed");
+}
+
+async function getOrFetchDashSegment(proxyId, rangeHeader, { label = "dash-segment" } = {}) {
+  const entry = proxyMap.get(proxyId);
+  if (!entry) throw new Error("Proxy expired");
+  const cached = getSegmentCacheEntry(entry.url, rangeHeader, entry);
+  if (cached) return { cacheEntry: cached, buffer: null };
+  const initialPaths = getSegmentCachePaths(entry.url, rangeHeader, entry);
+  const inFlight = dashSegmentFetches.get(initialPaths.filenameKey);
+  if (inFlight) {
+    segmentCacheState.coalescedRequests += 1;
+    return inFlight;
+  }
+
+  const fetchPromise = (async () => {
+    const fetched = await fetchDashSegmentBuffer(proxyId, rangeHeader, { label });
+    const paths = getSegmentCachePaths(fetched.entry.url, rangeHeader, fetched.entry);
+    if (fetched.buffer.length >= SEGMENT_CACHE_MIN_BYTES) {
+      const startedAt = Date.now();
+      writeFileSync(paths.dataPath, fetched.buffer);
+      finalizeSegmentCacheWrite(paths, fetched.upstream, fetched.buffer.length, startedAt);
+      const cacheEntry = getSegmentCacheEntry(fetched.entry.url, rangeHeader, fetched.entry);
+      if (!cacheEntry) throw new Error("DASH segment cache publication failed");
+      return { cacheEntry, buffer: null };
+    }
+    return {
+      cacheEntry: null,
+      buffer: fetched.buffer,
+      contentType: fetched.upstream.headers.get("content-type") || "video/mp4",
+    };
+  })();
+
+  dashSegmentFetches.set(initialPaths.filenameKey, fetchPromise);
+  try {
+    return await fetchPromise;
+  } finally {
+    if (dashSegmentFetches.get(initialPaths.filenameKey) === fetchPromise) {
+      dashSegmentFetches.delete(initialPaths.filenameKey);
+    }
+  }
+}
+
+function serveDashSegmentBuffer(result, res, onChunk) {
+  const buffer = result.buffer || Buffer.alloc(0);
+  res.status(200);
+  res.set("Content-Type", result.contentType || "video/mp4");
+  res.set("Content-Length", String(buffer.length));
+  res.set("Access-Control-Allow-Origin", "*");
+  if (onChunk && buffer.length) onChunk(buffer.length);
+  res.end(buffer);
 }
 
 function finalizeSegmentCacheWrite(paths, upstream, bytesWritten, startedAt) {
@@ -1833,40 +2075,6 @@ function finalizeSegmentCacheWrite(paths, upstream, bytesWritten, startedAt) {
     writeDurationMs: Date.now() - startedAt,
   });
   return { cached: true, bytes: bytesWritten };
-}
-
-async function writeSegmentResponseToCache(upstream, upstreamUrl, rangeHeader = "", cacheContext = null) {
-  const paths = getSegmentCachePaths(upstreamUrl, rangeHeader, cacheContext);
-  if (!shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader)) return { cached: false, reason: "disabled", cacheKey: paths };
-  if (!upstream.body) return { cached: false, reason: "no-body", cacheKey: paths };
-
-  const source = Readable.fromWeb(upstream.body);
-  const cacheStream = createWriteStream(paths.dataPath);
-  let downloaded = 0;
-  let failed = false;
-  const startedAt = Date.now();
-
-  source.on("data", (chunk) => {
-    downloaded += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
-  });
-  source.once("error", () => { failed = true; });
-  cacheStream.once("error", () => { failed = true; });
-
-  try {
-    await pipeline(source, cacheStream);
-  } catch (e) {
-    failed = true;
-    logSegmentCacheError("write", paths, e);
-    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext);
-    throw e;
-  }
-
-  if (failed || downloaded < SEGMENT_CACHE_MIN_BYTES) {
-    if (failed) logSegmentCacheError("write", paths, new Error("Segment cache write failed"));
-    purgeSegmentCacheCandidate(upstreamUrl, rangeHeader, cacheContext);
-    return { cached: false, cacheKey: paths };
-  }
-  return finalizeSegmentCacheWrite(paths, upstream, downloaded, startedAt);
 }
 
 async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req, res, options = {}) {
@@ -1902,6 +2110,7 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
   const startedAt = Date.now();
 
   const abort = () => {
+    if (res.writableFinished) return;
     closedByClient = true;
     if (metric) metric.error = "Client closed connection";
     if (cacheStream.writable) cacheStream.destroy();
@@ -1917,7 +2126,7 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
     if (!ok) source.pause();
   };
 
-  req?.once("close", abort);
+  req?.once("aborted", abort);
   res.once("close", abort);
   source.on("data", onSourceData);
   source.once("end", () => {
@@ -1942,7 +2151,7 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
     logSegmentCacheError("write", paths, err);
     if (!isAbortLikeError(err) || !(req.destroyed || res.destroyed)) throw err;
   } finally {
-    req?.off("close", abort);
+    req?.off("aborted", abort);
     res.off("close", abort);
     source.off("data", onSourceData);
   }
@@ -1957,11 +2166,27 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
 
 function enqueueSegmentPrefetch(proxyId, range, segmentIndex = null) {
   const entry = proxyMap.get(proxyId);
+  if (!entry || getSegmentCacheEntry(entry.url, range || "", entry)) return;
   const cacheKey = getSegmentCachePaths(entry?.url || "", range || "", entry);
   const key = `${cacheKey.filenameKey}|${range || ""}`;
-  if (segmentCachePrefetchSet.has(key)) return;
+  if (segmentCachePrefetchSet.has(key) || dashSegmentFetches.has(cacheKey.filenameKey)) return;
   segmentCachePrefetchSet.add(key);
-  segmentCachePrefetchQueue.push({ proxyId, range: range || "", key, segmentIndex, cacheKey });
+  const item = {
+    proxyId,
+    range: range || "",
+    key,
+    segmentIndex,
+    cacheKey,
+    role: entry.role || null,
+    generation: dashPlaybackGeneration,
+  };
+  if (item.role === "video") {
+    const firstNonVideo = segmentCachePrefetchQueue.findIndex((queued) => queued.role !== "video");
+    if (firstNonVideo === -1) segmentCachePrefetchQueue.push(item);
+    else segmentCachePrefetchQueue.splice(firstNonVideo, 0, item);
+  } else {
+    segmentCachePrefetchQueue.push(item);
+  }
   segmentCacheState.prefetchCount += 1;
   runSegmentPrefetchQueue();
 }
@@ -1969,29 +2194,19 @@ function enqueueSegmentPrefetch(proxyId, range, segmentIndex = null) {
 function runSegmentPrefetchQueue() {
   while (segmentCachePrefetchActive < SEGMENT_CACHE_MAX_PREFETCHES && segmentCachePrefetchQueue.length) {
     const item = segmentCachePrefetchQueue.shift();
+    if (item.generation !== dashPlaybackGeneration) {
+      segmentCachePrefetchSet.delete(item.key);
+      continue;
+    }
     segmentCachePrefetchActive += 1;
     (async () => {
       const startedAt = Date.now();
       try {
         logSegmentPrefetchStart({ cacheKey: item.cacheKey, segmentIndex: item.segmentIndex });
-        const proxied = await fetchProxyUpstream(item.proxyId, {
-          rangeHeader: item.range,
-          label: "segment-prefetch",
-          req: null,
-          metric: null,
-        });
-        if (!proxied) return;
-
-        const entry = proxied.entry?.url ? getSegmentCacheEntry(proxied.entry.url, item.range, proxied.entry) : null;
-        if (entry) {
-          logSegmentPrefetchComplete({ cacheKey: item.cacheKey, bytesCached: 0, durationMs: Date.now() - startedAt });
-          return;
-        }
-
-        const result = await writeSegmentResponseToCache(proxied.upstream, proxied.entry.url, item.range, proxied.entry);
+        const result = await getOrFetchDashSegment(item.proxyId, item.range, { label: "segment-prefetch" });
         logSegmentPrefetchComplete({
           cacheKey: item.cacheKey,
-          bytesCached: result?.bytes || 0,
+          bytesCached: result.cacheEntry?.sizeBytes || result.buffer?.length || 0,
           durationMs: Date.now() - startedAt,
         });
       } catch (err) {
@@ -2067,26 +2282,36 @@ async function pipeUpstream(upstream, req, res, { passStatus = true, passRangeHe
   }
 
   const abortUpstream = () => {
+    if (res.writableFinished) return;
     nodeStream.destroy();
     const cancelPromise = upstream.body?.cancel?.();
     if (cancelPromise && typeof cancelPromise.catch === "function") cancelPromise.catch(() => {});
   };
 
-  req.once("close", abortUpstream);
+  req.once("aborted", abortUpstream);
   res.once("close", abortUpstream);
   try {
     await pipeline(nodeStream, res);
   } catch (err) {
     if (!isAbortLikeError(err) && !req.destroyed && !res.destroyed) throw err;
   } finally {
-    req.off("close", abortUpstream);
+    req.off("aborted", abortUpstream);
     res.off("close", abortUpstream);
   }
 }
 
 function buildProxyRequestHeaders(entry, rangeHeader) {
   const headers = proxyHeaders(entry);
-  if (rangeHeader) headers.Range = rangeHeader;
+  if (rangeHeader) {
+    headers.Range = rangeHeader;
+    // Byte offsets are defined against the original representation. Undici's
+    // automatic compression negotiation can make large Bilibili range bodies
+    // terminate early, and compression also makes Content-Length ambiguous.
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === "accept-encoding") delete headers[name];
+    }
+    headers["Accept-Encoding"] = "identity";
+  }
   return headers;
 }
 
@@ -2165,10 +2390,6 @@ app.get("/api/proxy", async (req, res) => {
   if (!proxyMap.has(req.query.id)) return res.status(404).json({ error: "Unknown stream" });
   const metric = beginProxyMetric("/api/proxy");
   trackProxyMetricLifecycle(res, metric);
-  const upstreamController = new AbortController();
-  const abortFetch = () => upstreamController.abort();
-  req.once("close", abortFetch);
-  res.once("close", abortFetch);
   const entry = proxyMap.get(req.query.id);
   const rangeHeader = req.headers.range || "";
 
@@ -2193,7 +2414,6 @@ app.get("/api/proxy", async (req, res) => {
     const proxied = await fetchProxyUpstream(req.query.id, {
       rangeHeader: rangeHeader || null,
       label: "proxy",
-      signal: upstreamController.signal,
       req,
       metric,
     });
@@ -2208,9 +2428,6 @@ app.get("/api/proxy", async (req, res) => {
     if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
       res.status(502).json({ error: e.message });
     }
-  } finally {
-    req.off("close", abortFetch);
-    res.off("close", abortFetch);
   }
 });
 
@@ -2246,6 +2463,16 @@ app.get("/api/proxy/range", async (req, res) => {
 
 // Max bitrate for HLS variant filtering (matches FORMAT_SELECTOR cap)
 const HLS_MAX_BANDWIDTH = 4800_000;
+
+function proxyHlsResourceUrl(resourceUrl, baseUrl, headers = null) {
+  const absoluteUrl = /^https?:\/\//i.test(resourceUrl)
+    ? resourceUrl
+    : new URL(resourceUrl, baseUrl).href;
+  const id = proxyRegister(absoluteUrl, headers);
+  return /\.m3u8(?:[?#]|$)/i.test(absoluteUrl)
+    ? `/api/proxy/hls?id=${id}`
+    : `/api/proxy?id=${id}`;
+}
 
 // HLS proxy — fetch m3u8 and rewrite all URLs to go through our proxy
 app.get("/api/proxy/hls", async (req, res) => {
@@ -2291,15 +2518,18 @@ app.get("/api/proxy/hls", async (req, res) => {
       body = filtered.join("\n");
     }
 
-    // Rewrite each non-comment, non-empty line
+    // URI attributes live inside tags such as EXT-X-MAP, EXT-X-KEY, and
+    // EXT-X-MEDIA. Leaving them untouched makes the browser resolve them
+    // relative to /api/proxy/hls instead of the upstream playlist.
+    body = body.replace(/URI="([^"]+)"/g, (match, resourceUrl) => {
+      return `URI="${proxyHlsResourceUrl(resourceUrl, baseUrl, entry.headers)}"`;
+    });
+
+    // Rewrite each non-comment, non-empty line.
     body = body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
       const trimmed = line.trim();
       if (!trimmed) return match;
-
-      const absUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href;
-      const isM3u8 = /\.m3u8?(\?|$)/i.test(absUrl);
-      const id = proxyRegister(absUrl);
-      return isM3u8 ? `/api/proxy/hls?id=${id}` : `/api/proxy?id=${id}`;
+      return proxyHlsResourceUrl(trimmed, baseUrl, entry.headers);
     });
 
     recordProxyMetricBytes(metric, Buffer.byteLength(body));
@@ -2329,7 +2559,7 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     path: `/library/metadata/${ratingKey}`,
     mediaIndex: "0",
     partIndex: "0",
-    protocol: "dash",
+    protocol: "hls",
     fastSeek: "1",
     directPlay: "0",
     directStream: "1",
@@ -2345,6 +2575,7 @@ function plexTranscodeParams(ratingKey, { subtitleStreamID, audioStreamID, offse
     autoAdjustSubtitle: "0",
     mediaBufferSize: "102400",
     ...(audioStreamID ? { audioStreamID } : {}),
+    ...(offsetSec ? { offset: String(offsetSec) } : {}),
     session,
     "X-Plex-Incomplete-Segments": "1",
     "X-Plex-Client-Identifier": "drive-in-player",
@@ -2378,43 +2609,33 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
     transcodeDecisionText: mc?.transcodeDecisionText,
     subtitleDecision: subStreams.map((s) => ({ id: s.id, codec: s.codec, decision: s.decision, burn: s.burn })),
   }, "[plex] transcode decision");
-  // Fetch start.mpd eagerly — this triggers the actual transcode and takes ~10s.
-  // Cache the MPD so the player's manifest request is instant.
-  const startMpdUrl = `${PLEX_URL}/video/:/transcode/universal/start.mpd?${params}`;
-  plexDashMpdUrl = startMpdUrl;
-  plexDashMpdCache = null;
+  // Fetch the master playlist eagerly so Plex starts transcoding before the
+  // browser asks for its first media segment.
+  const startHlsUrl = `${PLEX_URL}/video/:/transcode/universal/start.m3u8?${params}`;
+  plexHlsManifestUrl = startHlsUrl;
+  plexHlsManifestCache = null;
 
   try {
-    log.info({ session }, "[plex] Fetching start.mpd (this triggers transcode)...");
-    const mpdRes = await fetch(startMpdUrl);
-    if (mpdRes.ok) {
-      let body = await mpdRes.text();
-      body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/dash/");
-      plexDashMpdCache = body;
-      log.info({ session, bodyLength: body.length }, "[plex] start.mpd cached, transcode ready");
-
-      // Pre-warm: fetch video+audio headers to keep the session alive until player connects
-      const sessionMatch = body.match(/session\/([^/]+)\//);
-      if (sessionMatch) {
-        const sid = sessionMatch[1];
-        const headerBase = `${PLEX_URL}/video/:/transcode/universal/session/${sid}`;
-        fetch(`${headerBase}/0/header?X-Plex-Token=${PLEX_TOKEN}`).catch(() => {});
-        fetch(`${headerBase}/1/header?X-Plex-Token=${PLEX_TOKEN}`).catch(() => {});
-        log.info({ session: sid }, "[plex] Pre-warmed video+audio headers");
-      }
+    log.info({ session }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
+    const manifestRes = await fetch(startHlsUrl);
+    if (manifestRes.ok) {
+      let body = await manifestRes.text();
+      body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
+      plexHlsManifestCache = body;
+      log.info({ session, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
     } else {
-      log.warn({ session, status: mpdRes.status }, "[plex] start.mpd failed");
+      log.warn({ session, status: manifestRes.status }, "[plex] start.m3u8 failed");
     }
   } catch (e) {
-    log.error({ session, err: e.message }, "[plex] start.mpd fetch error");
+    log.error({ session, err: e.message }, "[plex] start.m3u8 fetch error");
   }
 
-  return `/api/plex/dash/manifest.mpd`;
+  return `/api/plex/hls/master.m3u8`;
 }
 
-// --- Plex DASH proxy (http-proxy for low-overhead streaming) ---------
-let plexDashMpdUrl = null;
-let plexDashMpdCache = null; // Cache the rewritten MPD body so we don't re-fetch start.mpd
+// --- Plex HLS proxy ---------------------------------------------------
+let plexHlsManifestUrl = null;
+let plexHlsManifestCache = null;
 const plexProxy = httpProxy.createProxyServer({
   changeOrigin: true,
   secure: false,
@@ -2438,60 +2659,67 @@ plexProxy.on("proxyRes", (proxyRes, req) => {
   });
 });
 
-app.get("/api/plex/dash/manifest.mpd", async (req, res) => {
-  if (!plexDashMpdUrl) return res.status(404).json({ error: "No active Plex transcode" });
-  const key = "/api/plex/dash/manifest.mpd";
-  const requestCount = (dashMpdRequestCounts.get(key) || 0) + 1;
-  dashMpdRequestCounts.set(key, requestCount);
-  log.info({
-    endpoint: key,
-    requestCount,
-    cached: !!plexDashMpdCache,
-    currentTime: playerState.currentTime ?? null,
-  }, "DASH MPD requested");
+function rewritePlexHlsManifest(body) {
+  return body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
+}
 
-  // Serve cached MPD if available (Plex start.mpd only works once per session)
-  if (plexDashMpdCache) {
-    res.set("Content-Type", "application/dash+xml");
+app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
+  if (!plexHlsManifestUrl) return res.status(404).json({ error: "No active Plex transcode" });
+  if (plexHlsManifestCache) {
+    res.set("Content-Type", "application/vnd.apple.mpegurl");
+    res.set("Cache-Control", "no-cache");
     res.set("Access-Control-Allow-Origin", "*");
-    return res.send(plexDashMpdCache);
+    return res.send(plexHlsManifestCache);
   }
 
-  const metric = beginProxyMetric(key);
-  metric.url = truncateUrl(plexDashMpdUrl, 300);
-  trackProxyMetricLifecycle(res, metric);
   try {
-    const upstreamStartedAt = Date.now();
-    const mpdRes = await fetch(plexDashMpdUrl);
-    setProxyMetricUpstream(metric, mpdRes, Date.now() - upstreamStartedAt);
-    if (!mpdRes.ok) return res.status(mpdRes.status).json({ error: `Plex MPD ${mpdRes.status}` });
-    let body = await mpdRes.text();
-    recordProxyMetricBytes(metric, Buffer.byteLength(body));
-    body = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/dash/");
-    plexDashMpdCache = body; // Cache for subsequent requests
-    res.set("Content-Type", "application/dash+xml");
+    const upstream = await fetch(plexHlsManifestUrl);
+    if (!upstream.ok) return res.status(upstream.status).json({ error: `Plex HLS ${upstream.status}` });
+    plexHlsManifestCache = rewritePlexHlsManifest(await upstream.text());
+    res.set("Content-Type", "application/vnd.apple.mpegurl");
+    res.set("Cache-Control", "no-cache");
     res.set("Access-Control-Allow-Origin", "*");
-    res.send(body);
-  } catch (e) {
-    if (metric) metric.error = e.message || String(e);
-    if (!res.headersSent) res.status(502).json({ error: e.message });
+    res.send(plexHlsManifestCache);
+  } catch (error) {
+    if (!res.headersSent) res.status(502).json({ error: error.message });
   }
 });
 
-app.use("/api/plex/dash/*path", (req, res) => {
-  // Reconstruct full original path (Express 5 may null originalUrl in sub-routes)
+app.use("/api/plex/hls/*path", async (req, res) => {
   const fullPath = req.originalUrl || (req.baseUrl + req.url) || req.url;
-  const metric = beginProxyMetric("/api/plex/dash/*path");
+  const plexPath = fullPath.replace("/api/plex/hls/", "/video/:/transcode/universal/");
+  const tokenizedPath = `${plexPath}${plexPath.includes("?") ? "&" : "?"}X-Plex-Token=${PLEX_TOKEN}`;
+
+  if (/\.m3u8(?:\?|$)/i.test(plexPath)) {
+    const metric = beginProxyMetric("/api/plex/hls/*manifest");
+    metric.url = truncateUrl(`${PLEX_URL}${plexPath}`, 300);
+    trackProxyMetricLifecycle(res, metric);
+    try {
+      const startedAt = Date.now();
+      const upstream = await fetch(`${PLEX_URL}${tokenizedPath}`);
+      setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
+      if (!upstream.ok) return res.status(upstream.status).json({ error: `Plex HLS ${upstream.status}` });
+      const body = rewritePlexHlsManifest(await upstream.text());
+      recordProxyMetricBytes(metric, Buffer.byteLength(body));
+      res.set("Content-Type", "application/vnd.apple.mpegurl");
+      res.set("Cache-Control", "no-cache");
+      res.set("Access-Control-Allow-Origin", "*");
+      return res.send(body);
+    } catch (error) {
+      metric.error = error.message || String(error);
+      if (!res.headersSent) return res.status(502).json({ error: error.message });
+      return;
+    }
+  }
+
+  const metric = beginProxyMetric("/api/plex/hls/*segment");
   metric.range = req.headers.range || null;
+  metric.url = truncateUrl(`${PLEX_URL}${plexPath}`, 300);
   req.driveInProxyMetric = metric;
   trackProxyMetricLifecycle(res, metric);
-  // Rewrite path back to Plex's original URL structure
-  const plexPath = fullPath.replace("/api/plex/dash/", "/video/:/transcode/universal/");
-  metric.url = truncateUrl(`${PLEX_URL}${plexPath}`, 300);
-  req.url = `${plexPath}${plexPath.includes("?") ? "&" : "?"}X-Plex-Token=${PLEX_TOKEN}`;
+  req.url = tokenizedPath;
   plexProxy.web(req, res, { target: PLEX_URL });
 });
-
 // Plex API routes
 app.get("/api/plex/libraries", async (_req, res) => {
   if (!PLEX_TOKEN) return res.status(503).json({ error: "Plex token not configured" });
@@ -2602,83 +2830,98 @@ app.get("/api/plex/audio/:id", async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-app.post("/api/plex/play", async (req, res) => {
-  const { ratingKey, subtitleStreamID, audioStreamID, offset } = req.body;
-  if (!ratingKey) return res.status(400).json({ error: "ratingKey required" });
-  if (!PLEX_TOKEN) return res.status(503).json({ error: "Plex token not configured" });
+async function playPlexNow({ ratingKey, subtitleStreamID, audioStreamID, offset } = {}) {
+  if (!ratingKey) {
+    const err = new Error("ratingKey required");
+    err.status = 400;
+    throw err;
+  }
+  if (!PLEX_TOKEN) {
+    const err = new Error("Plex token not configured");
+    err.status = 503;
+    throw err;
+  }
   if (!playerWs || playerWs.readyState !== 1) {
-    return res.status(503).json({ error: "No player connected" });
+    const err = new Error("No player connected");
+    err.status = 503;
+    throw err;
   }
 
   updateState({ status: "resolving", url: `plex://${ratingKey}` });
 
+  const data = await plexApi(`/library/metadata/${ratingKey}`);
+  const meta = data.MediaContainer.Metadata[0];
+  const media = meta.Media[0];
+  const part = media.Part[0];
+  const title = meta.grandparentTitle
+    ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
+    : meta.title;
+
+  // Set subtitle and audio selection on the Plex part before transcoding
+  const partParams = new URLSearchParams({ "X-Plex-Token": PLEX_TOKEN, allParts: "1" });
+  if (subtitleStreamID) {
+    partParams.set("subtitleStreamID", subtitleStreamID);
+  } else {
+    partParams.set("subtitleStreamID", "0");
+  }
+  if (audioStreamID) {
+    partParams.set("audioStreamID", audioStreamID);
+  }
+  const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, { method: "PUT" });
+  log.info({ status: putRes.status, partId: part.id, subtitleStreamID: subtitleStreamID || 0 }, "[plex] PUT subtitle/audio on part");
+
+  resetDashSegmentSession();
+  await killPipeline();
+
+  // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
+  const resumeMs = offset || meta.viewOffset || 0;
+  const resumeSec = resumeMs ? Math.floor(resumeMs / 1000) : 0;
+  const playerUrl = await plexTranscodeUrl(ratingKey, { subtitleStreamID, audioStreamID, offsetSec: resumeSec });
+
+  updateState({ status: "playing", title, resolvedUrl: `plex://${ratingKey}`, isLive: false });
+
+  // Collect subtitle and audio tracks for player UI
+  const subtitles = (part.Stream || [])
+    .filter((s) => s.streamType === 3)
+    .map((s) => ({ id: s.id, codec: s.codec, language: s.language, title: s.title || s.displayTitle, displayTitle: s.displayTitle }));
+  const audioTracks = (part.Stream || [])
+    .filter((s) => s.streamType === 2)
+    .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));
+
+  broadcast({
+    type: "play",
+    url: playerUrl,
+    mediaSource: { type: "hls", url: playerUrl },
+    title,
+    isLive: false,
+    duration: meta.duration ? Math.round(meta.duration / 1000) : null,
+    thumbnail: meta.thumb ? `${PLEX_URL}${meta.thumb}?X-Plex-Token=${PLEX_TOKEN}` : null,
+    plex: {
+      ratingKey, subtitles, audioTracks,
+      activeSubtitleID: subtitleStreamID || null,
+      activeAudioID: audioStreamID || null,
+    },
+    startTime: resumeMs ? resumeMs / 1000 : 0,
+  });
+
+  addToHistory({
+    title,
+    plex: { ratingKey },
+    thumbnail: meta.art
+      ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
+      : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
+    duration: meta.duration ? Math.round(meta.duration / 1000) : null,
+  });
+
+  return { ok: true, title };
+}
+
+app.post("/api/plex/play", async (req, res) => {
   try {
-    const data = await plexApi(`/library/metadata/${ratingKey}`);
-    const meta = data.MediaContainer.Metadata[0];
-    const media = meta.Media[0];
-    const part = media.Part[0];
-    const title = meta.grandparentTitle
-      ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
-      : meta.title;
-
-    // Set subtitle and audio selection on the Plex part before transcoding
-    const partParams = new URLSearchParams({ "X-Plex-Token": PLEX_TOKEN, allParts: "1" });
-    if (subtitleStreamID) {
-      partParams.set("subtitleStreamID", subtitleStreamID);
-    } else {
-      partParams.set("subtitleStreamID", "0");
-    }
-    if (audioStreamID) {
-      partParams.set("audioStreamID", audioStreamID);
-    }
-    const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, { method: "PUT" });
-    log.info({ status: putRes.status, partId: part.id, subtitleStreamID: subtitleStreamID || 0 }, "[plex] PUT subtitle/audio on part");
-
-    await killPipeline();
-
-    // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
-    const resumeMs = offset || meta.viewOffset || 0;
-    const resumeSec = resumeMs ? Math.floor(resumeMs / 1000) : 0;
-    const playerUrl = await plexTranscodeUrl(ratingKey, { subtitleStreamID, audioStreamID, offsetSec: resumeSec });
-
-    updateState({ status: "playing", title, resolvedUrl: `plex://${ratingKey}`, isLive: false });
-
-    // Collect subtitle and audio tracks for player UI
-    const subtitles = (part.Stream || [])
-      .filter((s) => s.streamType === 3)
-      .map((s) => ({ id: s.id, codec: s.codec, language: s.language, title: s.title || s.displayTitle, displayTitle: s.displayTitle }));
-    const audioTracks = (part.Stream || [])
-      .filter((s) => s.streamType === 2)
-      .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));
-
-    broadcast({
-      type: "play",
-      url: playerUrl,
-      title,
-      isLive: false,
-      duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-      thumbnail: meta.thumb ? `${PLEX_URL}${meta.thumb}?X-Plex-Token=${PLEX_TOKEN}` : null,
-      plex: {
-        ratingKey, subtitles, audioTracks,
-        activeSubtitleID: subtitleStreamID || null,
-        activeAudioID: audioStreamID || null,
-      },
-      startTime: resumeMs ? resumeMs / 1000 : 0,
-    });
-
-    addToHistory({
-      title,
-      plex: { ratingKey },
-      thumbnail: meta.art
-        ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
-        : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
-      duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-    });
-
-    res.json({ ok: true, title });
+    res.json(await playPlexNow(req.body));
   } catch (e) {
     updateState({ status: "idle" });
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -2817,6 +3060,234 @@ app.get("/api/history", async (_req, res) => {
   }
 });
 
+// --- Playlist API ----------------------------------------------------
+
+async function buildPlaylistItemInput(body = {}) {
+  return buildQueueItemInput(body);
+}
+
+async function playlistItemsFromUrl(url) {
+  const info = await ytdlpFlatPlaylist(url);
+  const entries = Array.isArray(info.entries) ? info.entries : [];
+  const items = entries.map((entry) => {
+    const entryUrl = playlistEntryUrl(entry);
+    if (!entryUrl) return null;
+    const thumb = Array.isArray(entry.thumbnails) && entry.thumbnails.length
+      ? entry.thumbnails[entry.thumbnails.length - 1]?.url
+      : entry.thumbnail || null;
+    return {
+      url: entryUrl,
+      title: entry.title || entry.fulltitle || entryUrl,
+      thumbnail: thumb,
+      duration: Number.isFinite(Number(entry.duration)) ? Math.floor(Number(entry.duration)) : null,
+      metadata: {
+        importedFrom: url,
+        extractor: entry.extractor_key || entry.ie_key || info.extractor_key || null,
+        playlistTitle: info.title || null,
+      },
+    };
+  }).filter(Boolean);
+  return {
+    title: info.title || info.playlist_title || "Imported Playlist",
+    items,
+  };
+}
+
+app.get("/api/playlists", (_req, res) => {
+  res.json(listPlaylists());
+});
+
+app.post("/api/playlists", (req, res) => {
+  try {
+    const playlist = createPlaylist(req.body || {});
+    broadcastPlaylists();
+    res.status(201).json({ ok: true, playlist });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/playlists/import-url", async (req, res) => {
+  const { url, name, enqueue } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+  try {
+    const imported = await playlistItemsFromUrl(url);
+    if (!imported.items.length) return res.status(400).json({ error: "No playlist entries found" });
+    const playlist = createPlaylist({ name: name || imported.title, description: `Imported from ${url}` });
+    for (const item of imported.items) addPlaylistItem(playlist.id, item);
+    const hydrated = getPlaylist(playlist.id);
+    broadcastPlaylists();
+    if (enqueue) {
+      enqueuePlaylist(playlist.id);
+      broadcastQueue();
+    }
+    res.status(201).json({ ok: true, playlist: hydrated, imported: imported.items.length, queue: listQueue() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/playlists/:id", (req, res) => {
+  const playlist = getPlaylist(req.params.id);
+  if (!playlist) return res.status(404).json({ error: "playlist not found" });
+  res.json(playlist);
+});
+
+app.patch("/api/playlists/:id", (req, res) => {
+  try {
+    const playlist = updatePlaylist(req.params.id, req.body || {});
+    if (!playlist) return res.status(404).json({ error: "playlist not found" });
+    broadcastPlaylists();
+    res.json({ ok: true, playlist });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/playlists/:id", (req, res) => {
+  const playlist = deletePlaylist(req.params.id);
+  if (!playlist) return res.status(404).json({ error: "playlist not found" });
+  broadcastPlaylists();
+  res.json({ ok: true, playlist });
+});
+
+app.post("/api/playlists/:id/items", async (req, res) => {
+  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
+  try {
+    const item = addPlaylistItem(req.params.id, await buildPlaylistItemInput(req.body || {}));
+    broadcastPlaylists();
+    res.status(201).json({ ok: true, item, playlist: getPlaylist(req.params.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/playlists/:id/items/:itemId", (req, res) => {
+  const item = removePlaylistItem(req.params.id, req.params.itemId);
+  if (!item) return res.status(404).json({ error: "playlist item not found" });
+  broadcastPlaylists();
+  res.json({ ok: true, item, playlist: getPlaylist(req.params.id) });
+});
+
+app.post("/api/playlists/:id/reorder", (req, res) => {
+  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
+  if (!ids) return res.status(400).json({ error: "ids array required" });
+  const playlist = reorderPlaylistItems(req.params.id, ids);
+  broadcastPlaylists();
+  res.json({ ok: true, playlist });
+});
+
+app.post("/api/playlists/:id/enqueue", (req, res) => {
+  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
+  const added = enqueuePlaylist(req.params.id, { playNext: !!req.body?.playNext });
+  broadcastQueue();
+  res.json({ ok: true, added, queue: listQueue() });
+});
+
+// --- Queue API -------------------------------------------------------
+
+async function buildQueueItemInput(body = {}) {
+  const ratingKey = body.ratingKey ? String(body.ratingKey) : null;
+  if (!ratingKey || body.title || !PLEX_TOKEN) return body;
+
+  try {
+    const data = await plexApi(`/library/metadata/${ratingKey}`);
+    const meta = data.MediaContainer.Metadata[0];
+    const title = meta.grandparentTitle
+      ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
+      : meta.title;
+    return {
+      ...body,
+      title,
+      thumbnail: meta.art
+        ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
+        : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
+      duration: meta.duration ? Math.round(meta.duration / 1000) : null,
+    };
+  } catch (err) {
+    log.warn({ err: err?.message, ratingKey }, "Failed to enrich queued Plex item");
+    return body;
+  }
+}
+
+async function playQueueItem(item) {
+  if (item.sourceType === "plex") {
+    return playPlexNow({ ratingKey: item.ratingKey });
+  }
+  return playUrlNow({ url: item.url });
+}
+
+async function playNextFromQueue(id = null) {
+  const item = shiftQueueItem(id);
+  if (!item) return null;
+  broadcastQueue();
+  try {
+    const result = await playQueueItem(item);
+    return { ok: true, item, result, queue: listQueue() };
+  } catch (err) {
+    addQueueItem(item, { playNext: true });
+    broadcastQueue();
+    throw err;
+  }
+}
+
+app.get("/api/queue", (_req, res) => {
+  res.json(listQueue());
+});
+
+app.post("/api/queue", async (req, res) => {
+  try {
+    const item = addQueueItem(await buildQueueItemInput(req.body), { playNext: !!req.body?.playNext });
+    broadcastQueue();
+    res.status(201).json({ ok: true, item, queue: listQueue() });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/queue/reorder", (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
+  if (!ids) return res.status(400).json({ error: "ids array required" });
+  const queue = reorderQueue(ids);
+  broadcastQueue();
+  res.json({ ok: true, queue });
+});
+
+app.post("/api/queue/next", async (_req, res) => {
+  try {
+    const result = await playNextFromQueue();
+    if (!result) return res.status(404).json({ error: "queue empty" });
+    res.json(result);
+  } catch (err) {
+    updateState({ status: "idle" });
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.post("/api/queue/:id/play", async (req, res) => {
+  if (!getQueueItem(req.params.id)) return res.status(404).json({ error: "queue item not found" });
+  try {
+    res.json(await playNextFromQueue(req.params.id));
+  } catch (err) {
+    updateState({ status: "idle" });
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/queue/:id", (req, res) => {
+  const item = removeQueueItem(req.params.id);
+  if (!item) return res.status(404).json({ error: "queue item not found" });
+  broadcastQueue();
+  res.json({ ok: true, item, queue: listQueue() });
+});
+
+app.delete("/api/queue", (_req, res) => {
+  const cleared = clearQueue();
+  broadcastQueue();
+  res.json({ ok: true, cleared, queue: [] });
+});
+
 // --- HTTP API --------------------------------------------------------
 
 // Resolve a URL via yt-dlp
@@ -2832,8 +3303,9 @@ app.post("/api/resolve", async (req, res) => {
   }
 });
 
-async function buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl }) {
+async function buildDashSplitSource({ resolved, sourceUrl }) {
   resolved.isLive = false;
+  resetDashSegmentSession();
   const pairId = `pair-${Date.now()}`;
   const videoProxyId = proxyRegister(resolved.videoUrl, resolved.videoHeaders, {
     originalUrl: sourceUrl, pairId, role: "video",
@@ -2847,12 +3319,26 @@ async function buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl }) {
     video: { init: videoInfo.initEnd, segs: videoInfo.segments.length, mb: Math.round(videoInfo.totalSize / 1048576) },
     audio: { init: audioInfo.initEnd, segs: audioInfo.segments.length, mb: Math.round(audioInfo.totalSize / 1048576) },
   }, "DASH probe complete");
-  currentDashMpd = generateMpd(
+  const dashHls = generateDashHls(
+    pairId,
     resolved.videoFormat, resolved.audioFormat,
-    resolved.duration, videoProxyId, audioProxyId,
+    videoProxyId, audioProxyId,
     videoInfo, audioInfo,
   );
-  return "/api/dash/manifest.mpd";
+  if (dashHls) {
+    dashHlsSessions.set(pairId, { ...dashHls, createdAt: Date.now(), lastAccessAt: Date.now() });
+  }
+  const mediaSource = dashHls
+    ? { type: "hls", url: `/api/dash/hls/${pairId}/master.m3u8` }
+    : {
+        type: "split-mp4",
+        videoUrl: `/api/proxy?id=${videoProxyId}`,
+        audioUrl: `/api/proxy?id=${audioProxyId}`,
+      };
+  return {
+    playerUrl: mediaSource.url || mediaSource.videoUrl,
+    mediaSource,
+  };
 }
 
 async function buildDashSplitTranscodeAndPlayerUrl({ resolved }) {
@@ -2872,132 +3358,152 @@ async function buildDashSplitTranscodeAndPlayerUrl({ resolved }) {
   throw new Error("DASH transcode did not produce init.mp4 and media segments within the startup window");
 }
 
-// Play a URL (resolve + push to player)
-app.post("/api/play", async (req, res) => {
-  const { url, transcode: transcodeEnabled } = req.body;
-  if (!url) return res.status(400).json({ error: "url required" });
+async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
+  if (!url) {
+    const err = new Error("url required");
+    err.status = 400;
+    throw err;
+  }
   const shouldTranscode = transcodeEnabled !== false && String(transcodeEnabled).toLowerCase() !== "false" && DASH_TRANSCODE;
 
   if (!playerWs || playerWs.readyState !== 1) {
-    return res.status(503).json({ error: "No player connected. Open the player in Tesla browser first." });
+    const err = new Error("No player connected. Open the player in Tesla browser first.");
+    err.status = 503;
+    throw err;
   }
 
   updateState({ status: "resolving", url });
 
-  try {
-    // Check if it's already a direct stream URL
-    const directPattern = /\.(m3u8|mp4|flv|ts|webm)(\?|$)/i;
-    let resolved;
+  // Check if it's already a direct stream URL
+  const directPattern = /\.(m3u8|mp4|flv|ts|webm)(\?|$)/i;
+  let resolved;
 
-    if (directPattern.test(url)) {
-      resolved = { url, title: url, isLive: false, type: /\.m3u8/i.test(url) ? "hls" : "direct", subtitles: [] };
-    } else {
-      resolved = await ytdlp(url);
-    }
+  if (directPattern.test(url)) {
+    resolved = { url, title: url, isLive: false, type: /\.m3u8/i.test(url) ? "hls" : "direct", subtitles: [] };
+  } else {
+    resolved = await ytdlp(url);
+  }
 
-    let playerUrl;
+  let playerUrl;
+  let mediaSource;
 
-    if (resolved.type === "dash_split") {
-      if (shouldTranscode) {
-        try {
-          playerUrl = await buildDashSplitTranscodeAndPlayerUrl({ resolved });
-          log.info({ url }, "Using DASH split ffmpeg transcode path");
-        } catch (err) {
-          log.error({ err: err.message }, "DASH transcode pipeline failed, falling back to MPD proxy");
-          await killPipeline();
-          playerUrl = await buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl: url });
-        }
-      } else {
-        log.info({ url }, "DASH split transcode disabled for this request");
-        playerUrl = await buildDashSplitManifestAndPlayerUrl({ resolved, sourceUrl: url });
+  if (resolved.type === "dash_split") {
+    if (shouldTranscode) {
+      try {
+        playerUrl = await buildDashSplitTranscodeAndPlayerUrl({ resolved });
+        mediaSource = { type: "hls", url: playerUrl };
+        log.info({ url }, "Using DASH split ffmpeg transcode path");
+      } catch (err) {
+        log.error({ err: err.message }, "DASH transcode pipeline failed, falling back to fMP4 HLS");
         await killPipeline();
+        const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url });
+        playerUrl = dashSplit.playerUrl;
+        mediaSource = dashSplit.mediaSource;
       }
-    } else if (resolved.type === "hls") {
-      const id = proxyRegister(resolved.url);
-      playerUrl = `/api/proxy/hls?id=${id}`;
-      await killPipeline();
     } else {
-      const id = proxyRegister(resolved.url);
-      playerUrl = `/api/proxy?id=${id}`;
+      log.info({ url }, "DASH split transcode disabled for this request");
+      const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url });
+      playerUrl = dashSplit.playerUrl;
+      mediaSource = dashSplit.mediaSource;
       await killPipeline();
     }
+  } else if (resolved.type === "hls") {
+    resetDashSegmentSession();
+    const id = proxyRegister(resolved.url);
+    playerUrl = `/api/proxy/hls?id=${id}`;
+    mediaSource = { type: "hls", url: playerUrl };
+    await killPipeline();
+  } else {
+    resetDashSegmentSession();
+    const id = proxyRegister(resolved.url);
+    playerUrl = `/api/proxy?id=${id}`;
+    mediaSource = { type: "mp4", url: playerUrl };
+    await killPipeline();
+  }
 
-    // Subtitles — check cache first, download if missing
-    currentSubtitles = [];
-    if (resolved.subtitles?.length && !directPattern.test(url)) {
-      const cacheKey = subsCacheKey(url);
-      const cached = getCachedSubs(url);
+  // Subtitles — check cache first, download if missing
+  currentSubtitles = [];
+  if (resolved.subtitles?.length && !directPattern.test(url)) {
+    const cacheKey = subsCacheKey(url);
+    const cached = getCachedSubs(url);
 
-      const broadcastSubs = (subs, cacheK) => {
-        currentSubtitles = subs;
-        currentSubsCacheKey = cacheK;
-        if (subs.length) {
-          broadcast({
-            type: "subtitlesAvailable",
-            subtitles: subs.map((s) => ({
-              lang: s.lang, name: s.name, auto: s.auto,
-              url: `/api/subs/${cacheK}/${s.filename}`,
-            })),
-          });
-        }
-      };
-
-      if (cached) {
-        log.debug({ cacheKey, count: cached.subs.length }, "Subtitle cache hit");
-        // Delay broadcast so it arrives after the "play" message
-        setTimeout(() => broadcastSubs(cached.subs, cacheKey), 500);
-      } else {
-        const subsDir = resolve(SUBS_CACHE_DIR, cacheKey);
-        const wantedPrefixes = ["en", "zh"];
-        const selected = resolved.subtitles.filter((s) => {
-          const base = s.lang.split("-")[0].toLowerCase();
-          return wantedPrefixes.includes(base);
+    const broadcastSubs = (subs, cacheK) => {
+      currentSubtitles = subs;
+      currentSubsCacheKey = cacheK;
+      if (subs.length) {
+        broadcast({
+          type: "subtitlesAvailable",
+          subtitles: subs.map((s) => ({
+            lang: s.lang, name: s.name, auto: s.auto,
+            url: `/api/subs/${cacheK}/${s.filename}`,
+          })),
         });
-        // Direct fetch from URLs already in yt-dlp JSON — no second yt-dlp call
-        downloadSubtitlesDirect(selected, subsDir).then((downloaded) => {
-          log.info({ cacheKey, count: downloaded.length }, "Subtitles cached");
-          broadcastSubs(downloaded, cacheKey);
-        }).catch((e) => log.error({ err: e.message }, "Subtitle download error"));
       }
+    };
+
+    if (cached) {
+      log.debug({ cacheKey, count: cached.subs.length }, "Subtitle cache hit");
+      // Delay broadcast so it arrives after the "play" message
+      setTimeout(() => broadcastSubs(cached.subs, cacheKey), 500);
+    } else {
+      const subsDir = resolve(SUBS_CACHE_DIR, cacheKey);
+      const wantedPrefixes = ["en", "zh"];
+      const selected = resolved.subtitles.filter((s) => {
+        const base = s.lang.split("-")[0].toLowerCase();
+        return wantedPrefixes.includes(base);
+      });
+      // Direct fetch from URLs already in yt-dlp JSON — no second yt-dlp call
+      downloadSubtitlesDirect(selected, subsDir).then((downloaded) => {
+        log.info({ cacheKey, count: downloaded.length }, "Subtitles cached");
+        broadcastSubs(downloaded, cacheKey);
+      }).catch((e) => log.error({ err: e.message }, "Subtitle download error"));
     }
+  }
 
-    updateState({
-      status: "playing",
-      resolvedUrl: resolved.url || resolved.videoUrl,
-      title: resolved.title,
-      isLive: resolved.isLive,
-    });
+  updateState({
+    status: "playing",
+    resolvedUrl: resolved.url || resolved.videoUrl,
+    title: resolved.title,
+    isLive: resolved.isLive,
+  });
 
-    const thumbUrl = resolved.thumbnail ? `/api/thumb?url=${encodeURIComponent(resolved.thumbnail)}` : null;
+  const thumbUrl = resolved.thumbnail ? `/api/thumb?url=${encodeURIComponent(resolved.thumbnail)}` : null;
 
-    // Look up saved progress from history
-    const history = loadHistory();
-    const savedEntry = history.find((h) => h.url === url);
-    const startTime = savedEntry?.progress || 0;
+  // Look up saved progress from history
+  const history = loadHistory();
+  const savedEntry = history.find((h) => h.url === url);
+  const startTime = savedEntry?.progress || 0;
 
-    broadcast({
-      type: "play",
-      url: playerUrl,
-      sourceUrl: url,
-      title: resolved.title,
-      isLive: resolved.isLive,
-      thumbnail: thumbUrl,
-      duration: resolved.duration,
-      startTime,
-    });
+  broadcast({
+    type: "play",
+    url: playerUrl,
+    mediaSource,
+    sourceUrl: url,
+    title: resolved.title,
+    isLive: resolved.isLive,
+    thumbnail: thumbUrl,
+    duration: resolved.duration,
+    startTime,
+  });
 
-    addToHistory({
-      title: resolved.title,
-      url,
-      thumbnail: thumbUrl,
-      duration: resolved.duration,
-      progress: startTime, // preserve saved progress until player reports new position
-    });
+  addToHistory({
+    title: resolved.title,
+    url,
+    thumbnail: thumbUrl,
+    duration: resolved.duration,
+    progress: startTime, // preserve saved progress until player reports new position
+  });
 
-    res.json({ ok: true, title: resolved.title, isLive: resolved.isLive });
+  return { ok: true, title: resolved.title, isLive: resolved.isLive };
+}
+
+// Play a URL (resolve + push to player)
+app.post("/api/play", async (req, res) => {
+  try {
+    res.json(await playUrlNow(req.body));
   } catch (e) {
     updateState({ status: "idle" });
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -3010,6 +3516,7 @@ app.post("/api/control", async (req, res) => {
 
   if (action === "stop") {
     await killPipeline();
+    resetDashSegmentSession();
     currentSubtitles = [];
     updateState({ status: "idle", url: null, resolvedUrl: null, title: null });
   }
@@ -3094,6 +3601,9 @@ app.delete("/api/cache", (_req, res) => {
     segmentCacheState.logicalKeyHits = 0;
     segmentCacheState.hashKeyHits = 0;
     segmentCacheState.prefetchCount = 0;
+    segmentCacheState.coalescedRequests = 0;
+    segmentCacheState.integrityFailures = 0;
+    segmentCacheState.retryCount = 0;
     segmentCacheState.evictionCount = 0;
     segmentCachePrefetchQueue.length = 0;
     segmentCachePrefetchSet.clear();
@@ -3115,10 +3625,16 @@ app.delete("/api/cache", (_req, res) => {
 
 // Current status
 app.get("/api/status", (_req, res) => {
+  const queue = listQueue();
+  const playlists = listPlaylists();
   res.json({
     ...state,
     playerConnected: !!(playerWs && playerWs.readyState === 1),
     player: playerState,
+    queue,
+    queueLength: queue.length,
+    playlists,
+    playlistCount: playlists.length,
   });
 });
 
@@ -3149,6 +3665,8 @@ wss.on("connection", (ws, req) => {
 
     // Reset state when player reconnects — old playback context is lost
     updateState({ status: "idle", url: null, resolvedUrl: null, title: null, isLive: false });
+    ws.send(JSON.stringify({ type: "queueUpdated", queue: listQueue() }));
+    ws.send(JSON.stringify({ type: "playlistsUpdated", playlists: listPlaylists() }));
 
     ws.on("close", () => {
       log.info("Player WebSocket disconnected");
@@ -3182,6 +3700,13 @@ wss.on("connection", (ws, req) => {
         }
       } else if (msg.type === "pong") {
         ws.lastPong = Date.now();
+      } else if (msg.type === "ended") {
+        playNextFromQueue().then((result) => {
+          if (!result) updateState({ status: "idle" });
+        }).catch((err) => {
+          log.error({ err: err?.message || String(err) }, "Failed to autoplay next queue item");
+          updateState({ status: "idle" });
+        });
       }
     } catch {}
   });

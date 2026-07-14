@@ -2,46 +2,25 @@
 
 ## Architecture Decisions
 
-### Why libmedia (AVPlayer) instead of native `<video>`?
-Tesla freezes `<video>` element rendering while driving. libmedia renders via WebAssembly + WebGL onto `<canvas>`, bypassing this restriction. Reverse-engineered from tesla-player.com which uses the same approach.
+### Why Mediabunny instead of native `<video>`?
+Tesla freezes `<video>` element rendering while driving. Mediabunny exposes decoded WebCodecs frames that Drive-In presents on `<canvas>`, while an AudioWorklet sample counter provides the master A/V clock.
 
-### Why not Vite build for production?
-libmedia's ESM dist has ~30 dynamic worker chunk files (`163.avplayer.js`, etc.) that Vite bundles into a single file, breaking dynamic imports. Serving the source directly via Express + import map keeps all chunks intact. Error symptom: `register io task failed, ret: -2097152`.
+### Why fMP4 HLS for YouTube/Bilibili split streams?
+YouTube and Bilibili provide separate fragmented MP4 video and audio files. Drive-In parses each file's `sidx` table, exposes the byte ranges as local fMP4 HLS playlists, and prefetches roughly 30 seconds of segments. This preserves original quality and seek support without a local transcode.
 
-### Why DASH instead of ffmpeg HLS pipeline?
-YouTube/Bilibili provide separate video+audio DASH streams. The old approach piped `yt-dlp | ffmpeg` to remux into HLS, but this was fragile (PTS sync issues, audio re-encoding, slow startup, no seek). DASH approach: proxy the original streams directly, parse `sidx` box for segment byte ranges, generate SegmentTemplate MPD. Benefits: instant start, no transcoding, proper seek support, no disk I/O.
+### Why Plex HLS instead of local ffmpeg?
+Plex's built-in HLS transcoder handles codec compatibility, subtitle burn-in, adaptive bitrate, and hardware acceleration. Drive-In proxies Plex playlists and media segments through the same HLS path used by Mediabunny.
 
-### Why Plex native transcode instead of local ffmpeg?
-Plex's built-in transcoder handles all codec compatibility (TrueHD → AAC, HEVC → H.264, PGS subtitle burn-in), adaptive bitrate, and hardware acceleration. Our ffmpeg remux failed on TrueHD audio (not supported in HLS containers).
+### SharedArrayBuffer requirement
+The audio ring buffer uses `SharedArrayBuffer`, which requires:
 
-### Why custom VTT renderer instead of libmedia subtitle API?
-libmedia's `loadExternalSubtitle()` exists but does not render subtitles in canvas mode — canvas replaces the native video element, so there's no `<track>` element for WebVTT. We parse VTT ourselves and render via an HTML overlay div synced to the TIME event.
-
-## Gotchas & Pitfalls
-
-### libmedia SharedArrayBuffer requirement
-libmedia needs `SharedArrayBuffer` for its WebAssembly workers. This requires COOP/COEP headers:
 ```
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: credentialless
 ```
-Use `credentialless` (not `require-corp`) — the latter blocks cross-origin resources without CORS headers.
 
-### libmedia DASH — Worker can't resolve relative URLs
-libmedia's DashIOLoader runs in a Worker thread. `fetch("/api/dash/manifest.mpd")` fails with `Failed to parse URL from /api/dash/manifest.mpd` because Workers have no `location.origin`. **Always pass absolute URLs** (`http://localhost:9090/...`) to `player.load()`.
+Use `credentialless` rather than `require-corp` so proxied external media remains usable.
 
-### libmedia DASH — BaseURL concatenation (not resolution)
-libmedia's MPD parser joins URLs with simple concatenation: `c(base, url) { return /^https?:\/\//.test(url) ? url : base + url }`. Relative URLs like `/api/proxy?id=x` become `http://host/api/dash//api/proxy?id=x` (broken). Fix: use absolute `http://` URLs or set MPD-level `<BaseURL>` and use relative paths without leading `/`.
-
-### libmedia DASH — XML &amp; encoding in URLs
-libmedia's XML parser does NOT decode `&amp;` → `&` in attribute values. If SegmentTemplate `media="api/seg?m=xxx&amp;s=$Number$"`, the actual fetch URL contains literal `&amp;`. **Avoid query parameters in MPD URLs entirely** — use path-based URLs like `api/dash/{mapId}/{number}.mp4`.
-
-### libmedia resume() vs play() after pause
-`player.resume()` only resumes the AudioContext (from browser autoplay suspension), it does NOT resume video playback. After `player.pause()`, use `player.play()` to resume. Symptom: `resume()` returns success but status stays at 8 (PAUSED).
-
-### libmedia getStatus() values
-- 1 = STOPPED, 2 = DESTROYING, 5 = PLAYING, 6 = PLAYED, 8 = PAUSED
-- Use `getStatus()` instead of tracking `isPlaying` manually — async events (PLAYING/PAUSED) can desync the tracked state.
 
 ### Bilibili CDN anti-hotlink 403
 Bilibili's CDN checks `Accept`, `Accept-Language`, `Sec-Fetch-Mode` headers in addition to `Referer` and `User-Agent`. Missing any of these causes intermittent 403. **Solution**: use yt-dlp's per-format `http_headers` field — it contains all correct headers. Store them in proxyMap and forward on every request.
@@ -65,7 +44,7 @@ Since yt-dlp 2025.11.12, a JavaScript runtime (Deno recommended) is required for
 Element-specific `.hidden` rules (like `#btn-subs.hidden { display: none }`) are error-prone — new elements forget to add their own rule. Use a single global `.hidden { display: none !important; }` at the top of the stylesheet. Exception: elements with transition effects (like `#overlay.hidden` using opacity fade).
 
 ### Canvas intercepts pointer events
-libmedia's canvas covers `#player-container` entirely. `#controls` sits on top with `pointer-events: none` (auto-hidden). Clicks hit the controls div (not the canvas) even when invisible. Don't filter `e.target.closest("#controls")` — it blocks all click-to-pause functionality.
+The playback canvas covers `#player-container` entirely. `#controls` sits on top with `pointer-events: none` when auto-hidden. Don't filter `e.target.closest("#controls")`; it blocks click-to-pause across the full player surface.
 
 ### Plex transcode offset is in seconds, not milliseconds
 Plex's `/video/:/transcode/universal/start.m3u8?offset=N` expects seconds. Passing milliseconds creates absurd `EXT-X-START:TIME-OFFSET`.
@@ -119,9 +98,9 @@ Passing `subtitleStreamID` in the transcode URL doesn't work. Must first `PUT /l
 |----------|--------|-------------|
 | `/api/proxy?id=` | GET | Raw stream proxy with yt-dlp headers |
 | `/api/proxy/hls?id=` | GET | HLS proxy with URL rewriting |
-| `/api/proxy/range?id=&r=` | GET | Byte-range proxy for DASH segments |
-| `/api/dash/:mapId/:seg` | GET | DASH segment serving (init.mp4 / 0.mp4 etc.) |
-| `/api/dash/manifest.mpd` | GET | Generated DASH MPD |
+| `/api/proxy/range?id=&r=` | GET | Byte-range proxy for fragmented MP4 segments |
+| `/api/dash/hls/:playlist` | GET | Generated fMP4 HLS playlists |
+| `/api/dash/:mapId/:seg` | GET | fMP4 segment serving (init.mp4 / 0.mp4 etc.) |
 | `/api/thumb?url=` | GET | External thumbnail proxy with disk cache |
 | `/api/hls/*` | GET | Serve local HLS cache (pipeline fallback) |
 
@@ -136,7 +115,7 @@ Passing `subtitleStreamID` in the transcode URL doesn't work. Must first `PUT /l
 ## Planned Features
 
 ### Completed
-- ✅ DASH playback for YouTube/Bilibili (SegmentTemplate, sidx parsing)
+- ✅ fMP4 HLS playback for YouTube/Bilibili (`sidx` parsing)
 - ✅ Dual subtitle display (select multiple languages simultaneously)
 - ✅ Subtitle caching to disk (.media-cache/subs/)
 - ✅ Thumbnail caching to disk (.media-cache/thumbs/)
@@ -156,8 +135,8 @@ Passing `subtitleStreamID` in the transcode URL doesn't work. Must first `PUT /l
 
 ### In Progress / Next
 - [ ] URL refresh on CDN expiry (Bilibili: 2hr, YouTube: 6hr) — re-resolve via yt-dlp when proxy gets 403
-- [ ] Seek for DASH content — player.seek() works but needs testing across segment boundaries
-- [ ] Buffering indicator during DASH segment loading
+- [ ] Seek for split-stream HLS content across segment boundaries
+- [ ] Buffering indicator during split-stream segment loading
 
 ### Future
 - Keyboard shortcuts (Space: pause, Left/Right: seek, M: mute)

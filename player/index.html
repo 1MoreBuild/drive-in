@@ -6,7 +6,9 @@
   <title>Drive-In Player</title>
   <link rel="stylesheet" href="/src/style.css" />
   <script type="importmap">
-    { "imports": { "@libmedia/avplayer": "/lib/avplayer/avplayer.js" } }
+    { "imports": {
+      "mediabunny": "/lib/mediabunny/mediabunny.mjs"
+    } }
   </script>
 </head>
 <body>
@@ -97,7 +99,34 @@
         <h1>DRIVE-IN</h1>
         <p id="status-text">Connecting...</p>
       </div>
+      <header id="home-toolbar">
+        <div class="home-identity" aria-label="Drive-In">
+          <span class="home-wordmark">DRIVE-IN</span>
+          <span class="home-tagline">Canvas cinema</span>
+        </div>
+      </header>
       <div id="browse-screen" class="hidden">
+        <div id="queue-section" class="browse-section hidden">
+          <div class="browse-header">
+            <span>Up Next</span>
+            <button id="queue-clear" type="button" aria-label="Clear queue" class="queue-clear hidden">
+              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM8 9h8v10H8V9zm7.5-5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+            </button>
+          </div>
+          <div class="browse-row-wrap">
+            <button class="browse-arrow left" aria-label="Scroll left"><svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+            <div id="queue-list" class="browse-row"></div>
+            <button class="browse-arrow right" aria-label="Scroll right"><svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+          </div>
+        </div>
+        <div id="playlists-section" class="browse-section hidden">
+          <div class="browse-header">Playlists</div>
+          <div class="browse-row-wrap">
+            <button class="browse-arrow left" aria-label="Scroll left"><svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+            <div id="playlists-list" class="browse-row"></div>
+            <button class="browse-arrow right" aria-label="Scroll right"><svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+          </div>
+        </div>
         <div id="history-section" class="browse-section hidden">
           <div class="browse-header">Continue Watching</div>
           <div class="browse-row-wrap">

@@ -2,7 +2,7 @@ import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
 import { initControls, updateAudioGainUI, updatePlayButton, updateVolumeButton } from "./controls.js";
 import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setAudioGain, setPlayerCallbacks } from "./player.js";
-import { loadBrowseScreen, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
+import { loadBrowseScreen, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 
 const btnAudio = document.getElementById("btn-audio");
@@ -35,20 +35,17 @@ initRouter((route) => {
 
 // --- Audio unlock via user gesture -----------------------------------
 
-function unlockAudio() {
+function unlockAudio(event) {
   if (state.audioUnlocked) return;
   state.audioUnlocked = true;
-  document.removeEventListener("click", unlockAudio);
-  document.removeEventListener("touchstart", unlockAudio);
+  if (event?.target?.closest?.("#btn-volume")) event.stopImmediatePropagation();
+  document.removeEventListener("click", unlockAudio, true);
+  document.removeEventListener("touchstart", unlockAudio, true);
   console.log("[player] Audio unlocked");
 
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctx.resume().then(() => ctx.close()).catch(() => {});
-  } catch {}
-
-  try {
-    state.player?.constructor?.audioContext?.resume?.().catch(() => {});
   } catch {}
 
   if (state.player) {
@@ -66,8 +63,8 @@ function unlockAudio() {
   }
 }
 
-document.addEventListener("click", unlockAudio);
-document.addEventListener("touchstart", unlockAudio);
+document.addEventListener("click", unlockAudio, true);
+document.addEventListener("touchstart", unlockAudio, true);
 
 // --- MediaSession ----------------------------------------------------
 
@@ -158,6 +155,7 @@ function connect() {
             plex: msg.plex || null,
             startTime: msg.startTime || 0,
             sourceUrl: msg.sourceUrl || null,
+            mediaSource: msg.mediaSource || null,
           });
           break;
         case "pause":
@@ -202,6 +200,12 @@ function connect() {
             localStorage.setItem("preferred-sub-langs", JSON.stringify([...state.activeExternalSubs]));
           } catch {}
           updateSubsUI();
+          break;
+        case "queueUpdated":
+          renderQueue(msg.queue || []);
+          break;
+        case "playlistsUpdated":
+          renderPlaylists(msg.playlists || []);
           break;
         case "reload":
           location.reload();

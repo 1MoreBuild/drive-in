@@ -14,7 +14,9 @@ In-car media player for Tesla vehicles. Renders video on `<canvas>` via WebAssem
 
 - **YouTube / Bilibili / HLS / MP4** — play almost any video URL via yt-dlp
 - **Plex integration** — browse and play your Plex library with subtitle and audio track selection
-- **Canvas rendering** — WebAssembly + WebGL via [libmedia](https://github.com/zhaohappy/libmedia), works in Tesla browser while driving
+- **Playback queue** — build an Up Next list from the browser or CLI and auto-play the next item
+- **Saved playlists** — import remote playlists, save reusable lists, and enqueue them on demand
+- **Canvas rendering** — WebCodecs frames rendered to `<canvas>` via [Mediabunny](https://github.com/Vanilagy/mediabunny)
 - **Dual subtitles** — display two subtitle languages simultaneously
 - **CLI control** — play, pause, stop, browse Plex, manage subtitles from the terminal
 - **Remote access** — Cloudflare Tunnel support for controlling from outside the local network
@@ -30,19 +32,19 @@ CLI / Discord / Phone
         +-- yt-dlp: resolve video URL, detect stream type
         |    +-- HLS -> proxy with m3u8 URL rewriting
         |    +-- Direct (mp4) -> raw stream proxy
-        |    +-- DASH split (Bilibili/YouTube) -> generate MPD + proxy segments
+        |    +-- DASH split (Bilibili/YouTube) -> generate fMP4 HLS + proxy segments
         |
-        +-- Plex integration (DASH transcode + http-proxy)
+        +-- Plex integration (HLS transcode + http-proxy)
         |
         +-- WebSocket -> push play/pause/stop to player
         |
         +-- Static file server
-             +-- /lib/avplayer/* -> libmedia ESM dist
+             +-- /lib/mediabunny/* -> Mediabunny ESM bundle
              +-- /* -> player UI
 
 Tesla browser opens http://<server>/
         |
-        +-- libmedia AVPlayer renders on <canvas> (not <video>)
+        +-- Mediabunny decodes with WebCodecs and renders on <canvas>
 ```
 
 ### Stream Types
@@ -51,8 +53,8 @@ Tesla browser opens http://<server>/
 |------|---------|-------------|
 | `hls` | `.m3u8` URLs, live streams | Proxy m3u8 + rewrite segment URLs for CORS |
 | `direct` | `.mp4` with audio+video | Raw stream proxy |
-| `dash_split` | Bilibili, YouTube | Probe MP4 structure, generate MPD, proxy segments |
-| `plex` | Plex library items | DASH transcode via Plex server, proxied |
+| `dash_split` | Bilibili, YouTube | Probe MP4 `sidx`, generate fMP4 HLS, proxy segments |
+| `plex` | Plex library items | HLS transcode via Plex server, proxied |
 
 ## Prerequisites
 
@@ -82,6 +84,18 @@ npm run build                  # build player only (Vite production build)
 npm run start                  # build player + start server + Cloudflare Tunnel
 npm run start -w server        # start server only (no tunnel, no build)
 ```
+
+### Playback Engine
+
+Mediabunny is the only playback engine. It decodes audio and video with WebCodecs, presents frames on `<canvas>`, and uses consumed AudioWorklet samples as the master clock.
+
+Mediabunny supports direct MP4, HLS, and separate video/audio MP4 sources. To test the A/V buffering barrier, open with:
+
+```text
+?videoStallAt=10&videoStallMs=15000
+```
+
+This pauses only video reads at media time 10s. Audio, video, and the presentation clock should stop together and resume from the same timestamp.
 
 ## Docker
 
@@ -122,6 +136,11 @@ Precedence: `--server` flag > `DRIVEIN_SERVER` env > config file > default (`loc
 
 ```bash
 npx drivein play <url>          # play a video (YouTube, Bilibili, HLS, mp4)
+npx drivein queue add <url>     # add a URL to Up Next
+npx drivein queue list          # show queued items
+npx drivein queue next          # play the next queued item now
+npx drivein playlist import <url> # import a YouTube/Bilibili playlist
+npx drivein playlist enqueue <id> # add a saved playlist to Up Next
 npx drivein pause               # pause playback
 npx drivein resume              # resume playback
 npx drivein stop                # stop playback
@@ -136,6 +155,7 @@ npx drivein plex movies         # list Plex movies
 npx drivein plex shows          # list Plex TV shows
 npx drivein plex search <query> # search Plex library
 npx drivein plex play <id>      # play a Plex item by rating key
+npx drivein queue plex <id>     # add a Plex item to Up Next
 
 # Output modes
 npx drivein --json status       # JSON output for scripting
@@ -168,10 +188,10 @@ drive-in/              (npm workspaces monorepo)
 |   +-- index.js       Main server, all route/proxy/pipeline logic
 |   +-- logger.js      Pino logger setup
 +-- player/            Browser frontend (Vite build for prod, source for dev)
-|   +-- index.html     Import map for @libmedia/avplayer
+|   +-- index.html     Import map for Mediabunny source-mode development
 |   +-- vite.config.js Vite config for production build
 |   +-- src/
-|       +-- main.js    AVPlayer setup, WebSocket, audio unlock, controls
+|       +-- main.js    Mediabunny setup, WebSocket, audio unlock, controls
 |       +-- style.css  Fullscreen canvas layout, UI overlay
 +-- cli/               CLI tool
 |   +-- bin/drivein.js Commander-based CLI
@@ -201,7 +221,7 @@ See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
 
 [MIT License](LICENSE)
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party dependency licenses. Notable: [@libmedia/avplayer](https://github.com/zhaohappy/libmedia) is LGPL-3.0.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party dependency licenses.
 
 ---
 

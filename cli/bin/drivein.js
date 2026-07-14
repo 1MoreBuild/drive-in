@@ -370,6 +370,184 @@ plex
     }
   });
 
+// --- Queue commands --------------------------------------------------
+
+function formatQueueItem(item, index) {
+  const id = dim(`[${item.id}]`);
+  const source = item.sourceType === "plex" ? "Plex" : "URL";
+  const duration = item.duration ? dim(formatTime(item.duration)) : "";
+  return `  ${String(index + 1).padStart(2, " ")}. ${id} ${bold(item.title)} ${dim(`(${source})`)} ${duration}`;
+}
+
+const queue = program
+  .command("queue")
+  .alias("q")
+  .description("Manage the playback queue");
+
+queue
+  .command("list")
+  .alias("ls")
+  .description("List queued items")
+  .action(async () => {
+    const items = await api("GET", "/api/queue");
+    if (jsonMode) return out(items);
+    if (!items.length) return die("Queue is empty", "drivein queue add <url>", EXIT.EMPTY);
+    items.forEach((item, index) => console.log(formatQueueItem(item, index)));
+  });
+
+queue
+  .command("add <url>")
+  .description("Add a URL to the end of the queue")
+  .option("--next", "Put it at the front of the queue")
+  .action(async (url, opts) => {
+    const result = await api("POST", "/api/queue", { url, playNext: !!opts.next });
+    if (jsonMode) return out(result);
+    out(`Queued: ${bold(result.item.title)}`);
+  });
+
+queue
+  .command("plex <ratingKey>")
+  .description("Add a Plex item to the queue")
+  .option("--next", "Put it at the front of the queue")
+  .action(async (ratingKey, opts) => {
+    const result = await api("POST", "/api/queue", { ratingKey, playNext: !!opts.next });
+    if (jsonMode) return out(result);
+    out(`Queued: ${bold(result.item.title)}`);
+  });
+
+queue
+  .command("next")
+  .description("Play the next queued item now")
+  .action(async () => {
+    const result = await api("POST", "/api/queue/next");
+    if (jsonMode) return out(result);
+    out(`Now playing: ${bold(result.item.title)}`);
+  });
+
+queue
+  .command("remove <id>")
+  .alias("rm")
+  .description("Remove an item from the queue")
+  .action(async (id) => {
+    const result = await api("DELETE", `/api/queue/${encodeURIComponent(id)}`);
+    if (jsonMode) return out(result);
+    out(`Removed: ${bold(result.item.title)}`);
+  });
+
+queue
+  .command("clear")
+  .description("Clear the queue")
+  .action(async () => {
+    const result = await api("DELETE", "/api/queue");
+    if (jsonMode) return out(result);
+    out(`Cleared ${result.cleared} queued item${result.cleared === 1 ? "" : "s"}`);
+  });
+
+// --- Playlist commands -----------------------------------------------
+
+function formatPlaylist(p) {
+  const id = dim(`[${p.id}]`);
+  const count = `${p.itemCount || 0} item${p.itemCount === 1 ? "" : "s"}`;
+  const duration = p.duration ? dim(formatTime(p.duration)) : "";
+  return `  ${id} ${bold(p.name)} ${dim(count)} ${duration}`;
+}
+
+const playlist = program
+  .command("playlist")
+  .alias("pl")
+  .description("Manage saved playlists");
+
+playlist
+  .command("list")
+  .alias("ls")
+  .description("List saved playlists")
+  .action(async () => {
+    const items = await api("GET", "/api/playlists");
+    if (jsonMode) return out(items);
+    if (!items.length) return die("No playlists found", "drivein playlist create \"Watch Later\"", EXIT.EMPTY);
+    items.forEach((p) => console.log(formatPlaylist(p)));
+  });
+
+playlist
+  .command("create <name>")
+  .description("Create a saved playlist")
+  .option("-d, --description <text>", "Playlist description")
+  .action(async (name, opts) => {
+    const result = await api("POST", "/api/playlists", { name, description: opts.description });
+    if (jsonMode) return out(result);
+    out(`Created: ${bold(result.playlist.name)} ${dim(`[${result.playlist.id}]`)}`);
+  });
+
+playlist
+  .command("show <id>")
+  .description("Show playlist contents")
+  .action(async (id) => {
+    const p = await api("GET", `/api/playlists/${encodeURIComponent(id)}`);
+    if (jsonMode) return out(p);
+    console.log(formatPlaylist(p));
+    if (!p.items.length) return;
+    p.items.forEach((item, index) => console.log(formatQueueItem(item, index)));
+  });
+
+playlist
+  .command("add <id> <url>")
+  .description("Add a URL to a playlist")
+  .action(async (id, url) => {
+    const result = await api("POST", `/api/playlists/${encodeURIComponent(id)}/items`, { url });
+    if (jsonMode) return out(result);
+    out(`Added: ${bold(result.item.title)} -> ${bold(result.playlist.name)}`);
+  });
+
+playlist
+  .command("plex <id> <ratingKey>")
+  .description("Add a Plex item to a playlist")
+  .action(async (id, ratingKey) => {
+    const result = await api("POST", `/api/playlists/${encodeURIComponent(id)}/items`, { ratingKey });
+    if (jsonMode) return out(result);
+    out(`Added: ${bold(result.item.title)} -> ${bold(result.playlist.name)}`);
+  });
+
+playlist
+  .command("import <url>")
+  .description("Import a remote playlist URL")
+  .option("-n, --name <name>", "Saved playlist name")
+  .option("--enqueue", "Also add imported items to the queue")
+  .action(async (url, opts) => {
+    if (!jsonMode) process.stderr.write("Importing playlist...\n");
+    const result = await api("POST", "/api/playlists/import-url", { url, name: opts.name, enqueue: !!opts.enqueue });
+    if (jsonMode) return out(result);
+    out(`Imported ${result.imported} items: ${bold(result.playlist.name)} ${dim(`[${result.playlist.id}]`)}`);
+  });
+
+playlist
+  .command("enqueue <id>")
+  .description("Add every item in a playlist to Up Next")
+  .option("--next", "Put playlist items at the front of the queue")
+  .action(async (id, opts) => {
+    const result = await api("POST", `/api/playlists/${encodeURIComponent(id)}/enqueue`, { playNext: !!opts.next });
+    if (jsonMode) return out(result);
+    out(`Queued ${result.added.length} item${result.added.length === 1 ? "" : "s"}`);
+  });
+
+playlist
+  .command("remove <id> <itemId>")
+  .alias("rm")
+  .description("Remove an item from a playlist")
+  .action(async (id, itemId) => {
+    const result = await api("DELETE", `/api/playlists/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}`);
+    if (jsonMode) return out(result);
+    out(`Removed: ${bold(result.item.title)}`);
+  });
+
+playlist
+  .command("delete <id>")
+  .description("Delete a saved playlist")
+  .action(async (id) => {
+    const result = await api("DELETE", `/api/playlists/${encodeURIComponent(id)}`);
+    if (jsonMode) return out(result);
+    out(`Deleted: ${bold(result.playlist.name)}`);
+  });
+
 // --- Desire-path shortcuts -------------------------------------------
 
 program.command("movies", { hidden: true }).description("Shortcut for: plex movies")
