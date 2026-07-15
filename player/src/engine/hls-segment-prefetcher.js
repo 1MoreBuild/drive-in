@@ -16,8 +16,15 @@ function responseFromCache(entry) {
 }
 
 export class HlsSegmentPrefetcher {
-  constructor({ ahead = 6, maxConcurrent = 1 } = {}) {
+  constructor({
+    ahead = 36,
+    targetAheadSeconds = 90,
+    maxBytes = 96 * 1024 * 1024,
+    maxConcurrent = 1,
+  } = {}) {
     this.ahead = ahead;
+    this.targetAheadSeconds = targetAheadSeconds;
+    this.maxBytes = maxBytes;
     this.maxConcurrent = maxConcurrent;
     this.segments = [];
     this.segmentIndexes = new Map();
@@ -29,6 +36,12 @@ export class HlsSegmentPrefetcher {
     this.throughputSamples = [];
     this.ewmaThroughputBps = 0;
     this.completedDownloads = 0;
+    this.segmentSizeSamples = [];
+    this.peakCachedBytes = 0;
+    this.peakBufferedAheadSeconds = 0;
+    this.peakManagedBytesEstimate = 0;
+    this.byteCapHitCount = 0;
+    this.atByteCap = false;
     this.generation = 0;
     this.destroyed = false;
   }
@@ -133,22 +146,31 @@ export class HlsSegmentPrefetcher {
   }
 
   scheduleAhead(startIndex) {
-    for (let index = startIndex; index < Math.min(this.segments.length, startIndex + this.ahead); index += 1) {
+    let scheduledSeconds = 0;
+    const endIndex = Math.min(this.segments.length, startIndex + this.ahead);
+    for (let index = startIndex; index < endIndex; index += 1) {
       const url = this.segments[index].url;
-      if (this.prefetches.has(url)) continue;
-      this.prefetches.set(url, {
-        url,
-        index,
-        state: "queued",
-        promise: null,
-        controller: null,
-      });
+      if (!this.prefetches.has(url)) {
+        this.prefetches.set(url, {
+          url,
+          index,
+          state: "queued",
+          promise: null,
+          controller: null,
+        });
+      }
+      scheduledSeconds += this.segments[index].duration;
+      if (scheduledSeconds >= this.targetAheadSeconds) break;
     }
     this.pumpPrefetches();
   }
 
   pumpPrefetches() {
     if (this.destroyed) return;
+    if (this.cachedBytes >= this.maxBytes) {
+      this.markByteCapReached();
+      return;
+    }
     let active = [...this.prefetches.values()].filter((entry) => entry.state === "pending").length;
     if (active >= this.maxConcurrent) return;
     const queued = [...this.prefetches.values()]
@@ -156,6 +178,16 @@ export class HlsSegmentPrefetcher {
       .sort((a, b) => a.index - b.index);
     for (const entry of queued) {
       if (active >= this.maxConcurrent) break;
+      const estimate = this.averageSegmentBytes;
+      if (
+        estimate > 0
+        && this.cachedBytes + this.pendingEstimatedBytes + estimate > this.maxBytes
+      ) {
+        this.markByteCapReached();
+        break;
+      }
+      entry.estimatedByteLength = estimate;
+      this.atByteCap = false;
       this.startPrefetchEntry(entry);
       active += 1;
     }
@@ -166,8 +198,15 @@ export class HlsSegmentPrefetcher {
     entry.state = "pending";
     entry.promise = this.prefetch(entry, this.generation).then((result) => {
       entry.state = result ? "ready" : "failed";
+      entry.byteLength = result?.bytes?.byteLength || 0;
+      entry.estimatedByteLength = 0;
+      if (result) {
+        this.updateCachePeaks();
+        this.trimReadyCacheToBudget();
+      }
       return result;
     }).finally(() => this.pumpPrefetches());
+    this.updateCachePeaks();
     return entry.promise;
   }
 
@@ -216,6 +255,8 @@ export class HlsSegmentPrefetcher {
       : bitsPerSecond;
     this.throughputSamples.push(bitsPerSecond);
     if (this.throughputSamples.length > 8) this.throughputSamples.shift();
+    this.segmentSizeSamples.push(byteLength);
+    if (this.segmentSizeSamples.length > 8) this.segmentSizeSamples.shift();
     this.completedDownloads += 1;
     this.lastDownload = {
       segmentIndex,
@@ -249,16 +290,90 @@ export class HlsSegmentPrefetcher {
         pendingSegments += 1;
       }
     }
+    const cachedBytes = this.cachedBytes;
+    const cachedSegments = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "ready").length;
+    this.updateCachePeaks(bufferedAheadSeconds);
+    const managedBytesEstimate = cachedBytes + this.pendingEstimatedBytes;
     return {
       throughputKbps: throughputBps ? Math.round(throughputBps / 1000) : 0,
       sampleCount: this.throughputSamples.length,
       bufferedAheadSeconds,
       readySegments,
       pendingSegments,
+      cachedBytes,
+      cachedSegments,
+      maxBytes: this.maxBytes,
+      targetAheadSeconds: this.targetAheadSeconds,
+      maxAheadSegments: this.ahead,
+      cacheUtilization: this.maxBytes > 0 ? cachedBytes / this.maxBytes : 0,
+      peakCachedBytes: this.peakCachedBytes,
+      peakBufferedAheadSeconds: this.peakBufferedAheadSeconds,
+      managedBytesEstimate,
+      peakManagedBytesEstimate: this.peakManagedBytesEstimate,
+      byteCapHitCount: this.byteCapHitCount,
       currentIndex: this.currentIndex,
       completedDownloads: this.completedDownloads,
       lastDownload: this.lastDownload || null,
     };
+  }
+
+  get cachedBytes() {
+    let bytes = 0;
+    for (const entry of this.prefetches.values()) {
+      if (entry.state === "ready") bytes += entry.byteLength || 0;
+    }
+    return bytes;
+  }
+
+  get pendingEstimatedBytes() {
+    let bytes = 0;
+    for (const entry of this.prefetches.values()) {
+      if (entry.state === "pending") bytes += entry.estimatedByteLength || this.averageSegmentBytes;
+    }
+    return bytes;
+  }
+
+  get averageSegmentBytes() {
+    if (!this.segmentSizeSamples.length) return 0;
+    return this.segmentSizeSamples.reduce((sum, bytes) => sum + bytes, 0) / this.segmentSizeSamples.length;
+  }
+
+  contiguousBufferedAheadSeconds() {
+    let seconds = 0;
+    for (let index = this.currentIndex + 1; index < this.segments.length; index += 1) {
+      const entry = this.prefetches.get(this.segments[index].url);
+      if (!entry || entry.state !== "ready") break;
+      seconds += this.segments[index].duration;
+    }
+    return seconds;
+  }
+
+  updateCachePeaks(bufferedAheadSeconds = this.contiguousBufferedAheadSeconds()) {
+    const cachedBytes = this.cachedBytes;
+    const managedBytesEstimate = cachedBytes + this.pendingEstimatedBytes;
+    this.peakCachedBytes = Math.max(this.peakCachedBytes, cachedBytes);
+    this.peakBufferedAheadSeconds = Math.max(this.peakBufferedAheadSeconds, bufferedAheadSeconds);
+    this.peakManagedBytesEstimate = Math.max(this.peakManagedBytesEstimate, managedBytesEstimate);
+  }
+
+  markByteCapReached() {
+    if (!this.atByteCap) this.byteCapHitCount += 1;
+    this.atByteCap = true;
+  }
+
+  trimReadyCacheToBudget() {
+    let cachedBytes = this.cachedBytes;
+    if (cachedBytes <= this.maxBytes) return;
+    this.markByteCapReached();
+    const farthestFirst = [...this.prefetches.entries()]
+      .filter(([, entry]) => entry.state === "ready")
+      .sort((a, b) => b[1].index - a[1].index);
+    for (const [url, entry] of farthestFirst) {
+      if (cachedBytes <= this.maxBytes) break;
+      this.prefetches.delete(url);
+      cachedBytes -= entry.byteLength || 0;
+    }
   }
 
   resetThroughputSamples() {

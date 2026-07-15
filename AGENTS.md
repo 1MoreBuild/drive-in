@@ -125,13 +125,14 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - **Decoded video queue** — targets about 200 ms and is capped at 6–16 canvases based on frame duration. The 100 ms startup gate must never exceed the memory-capped queue; encoded segment buffering handles network jitter.
 - **HLS cache cleanup** — old session dirs are removed on startup and when playback stops.
 - **Diagnostics and logs** — diagnostic uploads retain the latest 20 reports; daily server and error logs retain the latest 30 files per stream.
+- **Player memory telemetry** — 30-second health heartbeats record JS heap and HLS cache usage. While playing, a full `measureUserAgentSpecificMemory()` sample runs at most every 5 minutes and logs page memory alongside cache peaks, cap hits, ABR state, and stalls.
 - **Proxy map TTL** — registered proxy URLs expire after 1 hour.
 - **Segment cache** — split-stream byte ranges are cached under `.segment-cache/`; the default limit is 20 GiB.
 - **Queue storage** — queues and playlists use SQLite at `.drive-in.sqlite` by default.
 - **Play history** — last 30 items persisted to `.play-history.json`, used for resume on replay.
 - **Subtitles** — yt-dlp extracts subtitle URLs, and the server downloads and caches VTT/SRT files. Plex ASS/SSA, SRT, and WebVTT tracks are converted and cached as WebVTT for browser rendering. Image subtitles use Plex burn-in; failed text conversion falls back to burn-in.
 - **fMP4 HLS generation** — for split video+audio streams, the server probes MP4 structure and builds local HLS playlists over original byte ranges.
-- **Plex adaptive HLS** — keeps a 30-second encoded buffer and changes among the configured bitrate rungs using buffer health and measured segment throughput. The player prefetches upcoming segments, while the proxy retries not-yet-ready startup segments.
+- **Plex adaptive HLS** — targets a 90-second encoded buffer with a 96 MiB retained-segment budget, and changes among the configured bitrate rungs using buffer health and measured segment throughput. Prefetch stays single-flight so per-segment throughput remains valid for ABR. The player prefetches upcoming segments, while the proxy retries not-yet-ready startup segments.
 
 ## Testing
 

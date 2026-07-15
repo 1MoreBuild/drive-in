@@ -13,6 +13,7 @@ function cachedEntry(body) {
   const bytes = new TextEncoder().encode(body).buffer;
   return {
     state: "ready",
+    byteLength: bytes.byteLength,
     promise: Promise.resolve({
       bytes,
       status: 200,
@@ -81,7 +82,86 @@ test("seek resets HLS position and pending prefetches", () => {
   assert.equal(prefetcher.prefetches.size, 0);
 });
 
-test("prefetch throughput uses one controlled download at a time", () => {
+test("prefetch defaults target a 90-second in-car buffer", () => {
   const prefetcher = new HlsSegmentPrefetcher();
+  assert.equal(prefetcher.targetAheadSeconds, 90);
+  assert.equal(prefetcher.ahead, 36);
+  assert.equal(prefetcher.maxBytes, 96 * 1024 * 1024);
   assert.equal(prefetcher.maxConcurrent, 1);
+});
+
+test("prefetch scheduling stops after reaching the time target", () => {
+  const prefetcher = new HlsSegmentPrefetcher({
+    ahead: 36,
+    targetAheadSeconds: 12,
+    maxConcurrent: 0,
+  });
+  prefetcher.segments = Array.from({ length: 10 }, (_, index) => segment(index, 4));
+
+  prefetcher.scheduleAhead(1);
+
+  assert.deepEqual(
+    [...prefetcher.prefetches.values()].map((entry) => entry.index),
+    [1, 2, 3],
+  );
+});
+
+test("prefetch does not start more downloads after reaching the byte budget", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxBytes: 4, maxConcurrent: 1 });
+  prefetcher.prefetches.set(segment(1).url, cachedEntry("full"));
+  prefetcher.prefetches.set(segment(2).url, {
+    url: segment(2).url,
+    index: 2,
+    state: "queued",
+    promise: null,
+    controller: null,
+  });
+
+  prefetcher.pumpPrefetches();
+
+  assert.equal(prefetcher.prefetches.get(segment(2).url).state, "queued");
+  const stats = prefetcher.getStats();
+  assert.equal(stats.cachedBytes, 4);
+  assert.equal(stats.cachedSegments, 1);
+  assert.equal(stats.maxBytes, 4);
+  assert.equal(stats.cacheUtilization, 1);
+  assert.equal(stats.byteCapHitCount, 1);
+});
+
+test("prefetch reserves estimated bytes before starting another download", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxBytes: 10, maxConcurrent: 1 });
+  prefetcher.segmentSizeSamples = [4];
+  prefetcher.prefetches.set(segment(1).url, { ...cachedEntry("12345678"), index: 1 });
+  prefetcher.prefetches.set(segment(2).url, {
+    url: segment(2).url,
+    index: 2,
+    state: "queued",
+    promise: null,
+    controller: null,
+  });
+
+  prefetcher.pumpPrefetches();
+
+  assert.equal(prefetcher.prefetches.get(segment(2).url).state, "queued");
+  assert.equal(prefetcher.byteCapHitCount, 1);
+  assert.equal(prefetcher.getStats().managedBytesEstimate, 8);
+  prefetcher.pumpPrefetches();
+  assert.equal(prefetcher.byteCapHitCount, 1);
+});
+
+test("ready cache trims the farthest segments to stay within its byte budget", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxBytes: 6, maxConcurrent: 1 });
+  const near = { ...cachedEntry("near"), index: 1 };
+  const far = { ...cachedEntry("far!"), index: 2 };
+  prefetcher.prefetches.set(segment(1).url, near);
+  prefetcher.prefetches.set(segment(2).url, far);
+
+  prefetcher.updateCachePeaks();
+  prefetcher.trimReadyCacheToBudget();
+
+  assert.equal(prefetcher.prefetches.has(segment(1).url), true);
+  assert.equal(prefetcher.prefetches.has(segment(2).url), false);
+  assert.equal(prefetcher.cachedBytes, 4);
+  assert.equal(prefetcher.peakCachedBytes, 8);
+  assert.equal(prefetcher.byteCapHitCount, 1);
 });

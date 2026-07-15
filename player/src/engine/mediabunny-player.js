@@ -25,8 +25,16 @@ const ABR_STARTUP_HOLD_MS = 12_000;
 const ABR_DOWNSHIFT_COOLDOWN_MS = 8_000;
 const ABR_UPSHIFT_COOLDOWN_MS = 30_000;
 const ABR_REBUFFER_UPSHIFT_HOLD_MS = 120_000;
-const ABR_UPSHIFT_BUFFER_SECONDS = 20;
-const ABR_DOWNSHIFT_BUFFER_SECONDS = 10;
+// In-car connections often disappear for tens of seconds at a time. Keep the
+// encoded HLS buffer large and make ABR protect it before quality.
+const HLS_BUFFER_TARGET_SECONDS = 90;
+const HLS_BUFFER_MAX_SEGMENTS = 36;
+const HLS_BUFFER_MAX_BYTES = 96 * 1024 * 1024;
+// ABR throughput is measured per segment request. Keep one download in flight
+// so the sample represents the link instead of one share of parallel traffic.
+const HLS_PREFETCH_CONCURRENCY = 1;
+const ABR_UPSHIFT_BUFFER_SECONDS = 60;
+const ABR_DOWNSHIFT_BUFFER_SECONDS = 25;
 const ABR_UPSHIFT_SAFETY_FACTOR = 1.35;
 const ABR_DOWNSHIFT_SAFETY_FACTOR = 1.15;
 // Large enough to keep a 1080p video queue fed across Cloudflare, while still
@@ -221,7 +229,14 @@ export class MediabunnyPlayer {
   }
 
   createInput(url, { boundedRanges = true, prefetchHls = false } = {}) {
-    if (prefetchHls) this.hlsSegmentPrefetcher = new HlsSegmentPrefetcher({ ahead: 6, maxConcurrent: 1 });
+    if (prefetchHls) {
+      this.hlsSegmentPrefetcher = new HlsSegmentPrefetcher({
+        ahead: HLS_BUFFER_MAX_SEGMENTS,
+        targetAheadSeconds: HLS_BUFFER_TARGET_SECONDS,
+        maxBytes: HLS_BUFFER_MAX_BYTES,
+        maxConcurrent: HLS_PREFETCH_CONCURRENCY,
+      });
+    }
     return new Input({
       source: new UrlSource(new URL(url, location.href).href, {
         ...(boundedRanges ? { fetchFn: boundedRangeFetch } : {}),
@@ -774,6 +789,17 @@ export class MediabunnyPlayer {
       audioBufferedMs: Math.round(this.audioSeconds * 1000),
       videoBufferedMs: Math.round(this.videoSecondsAhead() * 1000),
       hlsBufferedAheadSeconds: hlsNetwork?.bufferedAheadSeconds ?? null,
+      hlsBufferedBytes: hlsNetwork?.cachedBytes ?? null,
+      hlsCachedSegments: hlsNetwork?.cachedSegments ?? null,
+      hlsPendingSegments: hlsNetwork?.pendingSegments ?? null,
+      hlsBufferMaxBytes: hlsNetwork?.maxBytes ?? null,
+      hlsBufferTargetSeconds: hlsNetwork?.targetAheadSeconds ?? null,
+      hlsBufferCacheUtilization: hlsNetwork?.cacheUtilization ?? null,
+      hlsPeakBufferedBytes: hlsNetwork?.peakCachedBytes ?? null,
+      hlsPeakBufferedAheadSeconds: hlsNetwork?.peakBufferedAheadSeconds ?? null,
+      hlsManagedBytesEstimate: hlsNetwork?.managedBytesEstimate ?? null,
+      hlsPeakManagedBytesEstimate: hlsNetwork?.peakManagedBytesEstimate ?? null,
+      hlsBufferByteCapHitCount: hlsNetwork?.byteCapHitCount ?? null,
       abrCurrentBitrate: this.abr?.currentBitrate || null,
       abrAdvertisedBitrate: this.abr?.advertisedBitrate || null,
       abrLastDecision: this.abr?.lastDecision || null,

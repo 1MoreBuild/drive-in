@@ -7,6 +7,7 @@ import {
 import { renderSubtitle, loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { navigate } from "./router.js";
 import { MediabunnyPlayer } from "./engine/mediabunny-player.js";
+import { PageMemoryMonitor } from "./telemetry/page-memory-monitor.js";
 
 // --- Callbacks (set by main.js to avoid circular deps) ---------------
 
@@ -47,6 +48,7 @@ const PLAYBACK_RATE_DROP_COOLDOWN_MS = 5_000;
 const AUDIO_UNDERRUN_COOLDOWN_MS = 2_000;
 const MEMORY_PRESSURE_GROWTH_BYTES = 8 * 1024 * 1024;
 const MEMORY_PRESSURE_GROWTH_RATIO = 0.15;
+const PAGE_MEMORY_SAMPLE_INTERVAL_MS = 5 * 60_000;
 const playerMetricsState = createPlayerMetricsState();
 const stutterEventBuffer = Array.from({ length: STUTTER_EVENT_CAPACITY }, () => ({
   seq: 0,
@@ -82,6 +84,12 @@ const playbackRecoveryState = {
   request: null,
 };
 const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+const pageMemoryMonitor = new PageMemoryMonitor({ intervalMs: PAGE_MEMORY_SAMPLE_INTERVAL_MS });
+let pageMemoryCapabilityLogged = false;
+let lastPageMemoryError = null;
+let lastPageMemorySessionId = null;
+let lastPageMemoryCorrelationValid = false;
+let playbackSessionSequence = 0;
 
 function getMediabunnyFaultInjection() {
   const params = new URLSearchParams(location.search);
@@ -255,6 +263,7 @@ function createDecodeHealthState() {
 
 function createPlayerRuntimeLogState() {
   return {
+    playbackSessionId: 0,
     frameCount: 0,
     jankCount: 0,
     lastHeartbeatFrameCount: 0,
@@ -600,24 +609,95 @@ function readAudioBufferStats(player) {
 
 function memorySnapshotForLog(force = true) {
   const snapshot = sampleMemoryUsage(performance.now(), force);
-  return snapshot
-    ? {
-        timestamp: snapshot.timestamp,
-        usedJSHeapSize: snapshot.usedJSHeapSize,
-        totalJSHeapSize: snapshot.totalJSHeapSize,
-        jsHeapSizeLimit: snapshot.jsHeapSizeLimit,
-        heapGrowthBytes: snapshot.heapGrowthBytes,
-      }
-    : null;
+  const pageMemory = pageMemoryMonitor.lastSample;
+  if (!snapshot && !pageMemory && !pageMemoryMonitor.supported) {
+    return {
+      pageMemorySupported: false,
+      pageMemoryUnavailableReason: pageMemoryMonitor.unavailableReason,
+    };
+  }
+  return {
+    timestamp: snapshot?.timestamp ?? null,
+    usedJSHeapSize: snapshot?.usedJSHeapSize ?? null,
+    totalJSHeapSize: snapshot?.totalJSHeapSize ?? null,
+    jsHeapSizeLimit: snapshot?.jsHeapSizeLimit ?? null,
+    heapGrowthBytes: snapshot?.heapGrowthBytes ?? null,
+    pageMemorySupported: pageMemoryMonitor.supported,
+    pageMemoryBytes: pageMemory?.bytes ?? null,
+    pageMemoryMeasuredAt: pageMemory?.timestamp ?? null,
+    pageMemorySampleAgeMs: pageMemory ? Math.max(0, Date.now() - pageMemory.timestamp) : null,
+    pageMemoryMeasurementDurationMs: pageMemory?.durationMs ?? null,
+    pageMemoryPlaybackSessionId: lastPageMemorySessionId,
+    pageMemoryCorrelationValid: pageMemory
+      ? lastPageMemoryCorrelationValid
+        && lastPageMemorySessionId === playerRuntimeLogState.playbackSessionId
+      : null,
+  };
 }
 
 function collectBufferState(player = state.player) {
   const { bufferedAudioMs, underrunCount } = readAudioBufferStats(player);
+  const stats = readPlayerStats(player);
   return {
     bufferHealthSeconds: readBufferHealthSeconds(player),
     bufferedAudioMs,
     audioUnderrunCount: underrunCount,
+    hlsBufferedAheadSeconds: normalizeMetricNumber(stats?.hlsBufferedAheadSeconds),
+    hlsBufferedBytes: normalizeMetricNumber(stats?.hlsBufferedBytes),
+    hlsCachedSegments: normalizeMetricNumber(stats?.hlsCachedSegments),
+    hlsPendingSegments: normalizeMetricNumber(stats?.hlsPendingSegments),
+    hlsBufferMaxBytes: normalizeMetricNumber(stats?.hlsBufferMaxBytes),
+    hlsBufferTargetSeconds: normalizeMetricNumber(stats?.hlsBufferTargetSeconds),
+    hlsBufferCacheUtilization: safeRound(normalizeMetricNumber(stats?.hlsBufferCacheUtilization)),
+    hlsPeakBufferedBytes: normalizeMetricNumber(stats?.hlsPeakBufferedBytes),
+    hlsPeakBufferedAheadSeconds: normalizeMetricNumber(stats?.hlsPeakBufferedAheadSeconds),
+    hlsManagedBytesEstimate: normalizeMetricNumber(stats?.hlsManagedBytesEstimate),
+    hlsPeakManagedBytesEstimate: normalizeMetricNumber(stats?.hlsPeakManagedBytesEstimate),
+    hlsBufferByteCapHitCount: normalizeMetricNumber(stats?.hlsBufferByteCapHitCount),
   };
+}
+
+async function maybeMeasurePageMemory() {
+  if (!pageMemoryMonitor.supported) {
+    if (!pageMemoryCapabilityLogged) {
+      pageMemoryCapabilityLogged = true;
+      postPlayerRuntimeLog("page_memory_measurement_unavailable", {
+        reason: pageMemoryMonitor.unavailableReason,
+        crossOriginIsolated: globalThis.crossOriginIsolated === true,
+      });
+    }
+    return;
+  }
+
+  const measurementSessionId = playerRuntimeLogState.playbackSessionId;
+  const measurementPlayer = state.player;
+  try {
+    const sample = await pageMemoryMonitor.measure();
+    if (!sample) return;
+    const correlationValid = measurementSessionId === playerRuntimeLogState.playbackSessionId
+      && measurementPlayer === state.player;
+    lastPageMemorySessionId = measurementSessionId;
+    lastPageMemoryCorrelationValid = correlationValid;
+    if (!correlationValid) pageMemoryMonitor.allowNextMeasurement();
+    lastPageMemoryError = null;
+    postPlayerRuntimeLog("page_memory_measurement", {
+      measurementPlaybackSessionId: measurementSessionId,
+      correlationValid,
+      memory: sample,
+      buffer: correlationValid ? collectBufferState(measurementPlayer) : null,
+      playerStats: correlationValid ? summarizePlayerStats(measurementPlayer) : null,
+      totalStallCount: correlationValid ? playerMetricsState.stallCount : null,
+      totalStallDurationMs: correlationValid ? Math.round(playerMetricsState.totalStallDurationMs) : null,
+    });
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (message === lastPageMemoryError) return;
+    lastPageMemoryError = message;
+    postPlayerRuntimeLog("page_memory_measurement_failed", {
+      error: message,
+      measurementPlaybackSessionId: measurementSessionId,
+    });
+  }
 }
 
 function postPlayerRuntimeLog(type, fields = {}) {
@@ -630,6 +710,7 @@ function postPlayerRuntimeLog(type, fields = {}) {
     duration: state.duration || 0,
     isPlaying: !!state.isPlaying,
     isBuffering: !!state.isBuffering,
+    playbackSessionId: playerRuntimeLogState.playbackSessionId,
     ...fields,
   };
   originalFetch(PLAYER_LOG_ENDPOINT, {
@@ -780,6 +861,17 @@ function summarizePlayerStats(player) {
     width: normalizeMetricNumber(stats.width),
     height: normalizeMetricNumber(stats.height),
     hlsBufferedAheadSeconds: normalizeMetricNumber(stats.hlsBufferedAheadSeconds),
+    hlsBufferedBytes: normalizeMetricNumber(stats.hlsBufferedBytes),
+    hlsCachedSegments: normalizeMetricNumber(stats.hlsCachedSegments),
+    hlsPendingSegments: normalizeMetricNumber(stats.hlsPendingSegments),
+    hlsBufferMaxBytes: normalizeMetricNumber(stats.hlsBufferMaxBytes),
+    hlsBufferTargetSeconds: normalizeMetricNumber(stats.hlsBufferTargetSeconds),
+    hlsBufferCacheUtilization: safeRound(normalizeMetricNumber(stats.hlsBufferCacheUtilization)),
+    hlsPeakBufferedBytes: normalizeMetricNumber(stats.hlsPeakBufferedBytes),
+    hlsPeakBufferedAheadSeconds: normalizeMetricNumber(stats.hlsPeakBufferedAheadSeconds),
+    hlsManagedBytesEstimate: normalizeMetricNumber(stats.hlsManagedBytesEstimate),
+    hlsPeakManagedBytesEstimate: normalizeMetricNumber(stats.hlsPeakManagedBytesEstimate),
+    hlsBufferByteCapHitCount: normalizeMetricNumber(stats.hlsBufferByteCapHitCount),
     abrCurrentBitrate: normalizeMetricNumber(stats.abrCurrentBitrate),
     abrAdvertisedBitrate: normalizeMetricNumber(stats.abrAdvertisedBitrate),
     abrLastDecision: stats.abrLastDecision && typeof stats.abrLastDecision === "object"
@@ -933,7 +1025,7 @@ function collectStutterEventsSinceLastReport() {
 }
 
 function buildStutterReportPayload(reason) {
-  const memorySnapshot = sampleMemoryUsage(performance.now(), true);
+  const memorySnapshot = memorySnapshotForLog(true);
   const { events, maxSeq } = collectStutterEventsSinceLastReport();
   const activeStallDurationMs = playerMetricsState.stallStartedAt
     ? performance.now() - playerMetricsState.stallStartedAt
@@ -946,15 +1038,8 @@ function buildStutterReportPayload(reason) {
       events,
       currentTime: state.currentTime,
       duration: state.duration,
-      memory: memorySnapshot
-        ? {
-            timestamp: memorySnapshot.timestamp,
-            usedJSHeapSize: memorySnapshot.usedJSHeapSize,
-            totalJSHeapSize: memorySnapshot.totalJSHeapSize,
-            jsHeapSizeLimit: memorySnapshot.jsHeapSizeLimit,
-            heapGrowthBytes: memorySnapshot.heapGrowthBytes,
-          }
-        : null,
+      memory: memorySnapshot,
+      buffer: collectBufferState(),
       totalStallCount: playerMetricsState.stallCount,
       totalStallDurationMs: Math.round(playerMetricsState.totalStallDurationMs + activeStallDurationMs),
       timeSincePlaybackStartedMs: Math.round(Math.max(0, performance.now() - stutterTelemetryState.playbackStartedAt)),
@@ -1067,6 +1152,7 @@ function sendPlayerHealthHeartbeat() {
   const jankCountSinceLastHeartbeat = playerRuntimeLogState.jankCount - playerRuntimeLogState.lastHeartbeatJankCount;
   playerRuntimeLogState.lastHeartbeatFrameCount = playerRuntimeLogState.frameCount;
   playerRuntimeLogState.lastHeartbeatJankCount = playerRuntimeLogState.jankCount;
+  void maybeMeasurePageMemory();
 
   postPlayerRuntimeLog("health_heartbeat", {
     currentTime: state.currentTime,
@@ -1192,6 +1278,8 @@ function reportPlayerMetrics() {
       isPlaying: state.isPlaying,
       isMuted: state.isMuted,
       bufferHealthSeconds,
+      buffer: collectBufferState(state.player),
+      memory: memorySnapshotForLog(false),
       stallCount: playerMetricsState.stallCount,
       totalStallDurationMs: Math.round(playerMetricsState.totalStallDurationMs + activeStallDurationMs),
       decodePath: playerMetricsState.decodePath,
@@ -1578,6 +1666,7 @@ export function showStatus(text) {
 export async function play(url, title, meta = {}) {
   if (state.playLock) return;
   state.playLock = true;
+  const playbackSessionId = ++playbackSessionSequence;
   const isRecovery = meta.__recovery === true;
   if (!isRecovery) {
     resetPlaybackRecovery();
@@ -1592,6 +1681,7 @@ export async function play(url, title, meta = {}) {
     resetStutterTelemetry();
     resetDecodeHealthState();
     resetPlayerRuntimeLogState();
+    playerRuntimeLogState.playbackSessionId = playbackSessionId;
 
     if (state.player) {
       await disposePlayer(state.player);
