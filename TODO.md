@@ -32,13 +32,13 @@ Set `DASH_TRANSCODE=1` only when the ffmpeg fallback is needed. The default path
 
 ### Plex
 
-Plex performs HLS transcoding, codec conversion, audio selection, and subtitle burn-in. Drive-In rewrites and proxies Plex playlists and segments so the browser sees one origin.
+Plex performs HLS transcoding, codec conversion, audio selection, and image-subtitle burn-in. Drive-In rewrites and proxies Plex playlists and segments so the browser sees one origin. Text subtitles are converted and cached as WebVTT, then rendered by the browser. Conversion failures fall back to Plex burn-in.
 
 ### Persistent state
 
 - `.play-history.json` stores the latest 30 playback entries.
 - `.drive-in.sqlite` stores Up Next and saved playlists.
-- `.media-cache/` stores subtitles and thumbnails.
+- `.media-cache/` stores source subtitles, converted Plex subtitles, and thumbnails.
 - `.segment-cache/` stores split-stream byte ranges with a size-bounded LRU policy.
 - `.hls-cache/` stores temporary ffmpeg fallback sessions and is cleared on startup.
 

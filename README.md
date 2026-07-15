@@ -13,7 +13,7 @@ In-car media player for Tesla vehicles. Mediabunny decodes with WebCodecs and Dr
 ## Features
 
 - **YouTube / Bilibili / HLS / MP4** — play almost any video URL via yt-dlp
-- **Plex integration** — browse and play your Plex library with subtitle and audio track selection
+- **Plex integration** — browse and play your Plex library with adaptive quality, subtitle, and audio track selection
 - **Playback queue** — build an Up Next list from the browser or CLI and auto-play the next item
 - **Saved playlists** — import remote playlists, save reusable lists, and enqueue them on demand
 - **Canvas rendering** — WebCodecs frames rendered to `<canvas>` via [Mediabunny](https://github.com/Vanilagy/mediabunny)
@@ -175,6 +175,8 @@ npx drivein --no-color status   # disable colored output
 npx drivein plex movies         # list movies
 npx drivein plex play 12345     # play by rating key
 ```
+
+Text-based Plex subtitles (ASS/SSA, SRT, and WebVTT) are converted once, cached as WebVTT, and rendered by the browser. Image subtitles such as PGS are burned in by Plex. If text conversion fails, playback falls back to Plex burn-in.
 
 ## Tesla Browser Notes
 

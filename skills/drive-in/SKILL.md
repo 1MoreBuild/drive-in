@@ -95,7 +95,7 @@ drivein plex play <ratingKey> --audio <audioId>   # play with a specific audio t
 drivein plex play <ratingKey> --sub <id> --audio <id>  # both
 ```
 
-Plex handles transcoding and subtitle burn-in when the selected source needs it.
+Plex handles transcoding. Drive-In converts and caches text subtitles for browser rendering; image subtitles and conversion failures use Plex burn-in.
 Playback resumes from where the user left off (Plex tracks progress).
 
 ## Queue and playlists
@@ -212,6 +212,7 @@ Fallback when the CLI doesn't cover a use case. Base URL from `$DRIVEIN_SERVER`.
 | GET | `/api/plex/show/:id/episodes` | — | List episodes of a show |
 | GET | `/api/plex/search` | `?q=<query>` | Search Plex library |
 | GET | `/api/plex/subtitles/:id` | — | List Plex subtitle tracks |
+| GET | `/api/plex/subtitle/:ratingKey/:streamId` | — | Fetch a converted Plex text subtitle as WebVTT |
 | GET | `/api/plex/audio/:id` | — | List Plex audio tracks |
 | POST | `/api/plex/play` | `{"ratingKey":"...", "subtitleStreamID":"...", "audioStreamID":"..."}` | Play Plex item |
 | POST | `/api/plex/progress` | `{"ratingKey":"...", "timeMs":<ms>}` | Report progress to Plex |

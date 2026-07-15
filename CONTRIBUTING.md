@@ -69,13 +69,20 @@ Use clear, descriptive commit messages:
 - `Add resolution selection for YouTube playback`
 - `Refactor proxy URL handling for DASH streams`
 
-### Manual Testing
+### Testing
 
-There are no automated tests yet. Before submitting a PR, please verify:
+Run the automated tests and production build before submitting a PR:
+
+```bash
+npm test
+npm run build
+```
+
+For playback changes, also verify:
 
 - [ ] Server starts without errors (`npm run start -w server`)
 - [ ] Player loads in browser at `http://localhost:5173` in dev mode
-- [ ] Your change works for the relevant stream type(s):
+- [ ] The relevant stream type works end to end:
 
 ```bash
 # HLS stream

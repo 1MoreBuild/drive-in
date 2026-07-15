@@ -19,14 +19,26 @@ if (isDev) {
 // Always: daily rotating log file
 targets.push({
   target: "pino-roll",
-  options: { file: resolve(logDir, "server"), frequency: "daily", dateFormat: "yyyy-MM-dd", mkdir: true },
+  options: {
+    file: resolve(logDir, "server"),
+    frequency: "daily",
+    dateFormat: "yyyy-MM-dd",
+    mkdir: true,
+    limit: { count: 30, removeOtherLogFiles: true },
+  },
   level: "info",
 });
 
 // Always: separate error file
 targets.push({
   target: "pino-roll",
-  options: { file: resolve(logDir, "error"), frequency: "daily", dateFormat: "yyyy-MM-dd", mkdir: true },
+  options: {
+    file: resolve(logDir, "error"),
+    frequency: "daily",
+    dateFormat: "yyyy-MM-dd",
+    mkdir: true,
+    limit: { count: 30, removeOtherLogFiles: true },
+  },
   level: "error",
 });
 

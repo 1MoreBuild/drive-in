@@ -4213,6 +4213,7 @@ app.get(/^\/(play|show\/\d+)/, (_req, res) => {
 // --- Diagnostics upload ----------------------------------------------
 
 const DIAG_DIR = resolve(__dirname, "../.diag-reports");
+const MAX_DIAG_REPORTS = 20;
 mkdirSync(DIAG_DIR, { recursive: true });
 
 app.post("/api/diag", (req, res) => {
@@ -4220,6 +4221,11 @@ app.post("/api/diag", (req, res) => {
   if (!data) return res.status(400).json({ error: "empty" });
   const filename = `diag-${Date.now()}.json`;
   writeFileSync(resolve(DIAG_DIR, filename), JSON.stringify(data, null, 2));
+  const expiredReports = readdirSync(DIAG_DIR)
+    .filter((name) => /^diag-\d+\.json$/.test(name))
+    .sort()
+    .slice(0, -MAX_DIAG_REPORTS);
+  for (const expired of expiredReports) safeUnlink(resolve(DIAG_DIR, expired));
   log.info({ filename }, "Diagnostic report saved");
   res.json({ ok: true, filename });
 });
