@@ -26,7 +26,7 @@
     "node": ">=20.19"
   },
   "scripts": {
-    "test": "npm test -w player",
+    "test": "npm test -w player && npm test -w server",
     "dev": "concurrently -k -n server,vite -c blue,green \"npm:dev:server\" \"npm:dev:vite\"",
     "dev:server": "npm run dev -w server",
     "dev:vite": "npm run dev -w player",

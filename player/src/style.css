@@ -71,6 +71,12 @@ html, body {
 
 /* --- Subtitle overlay ------------------------------------------------ */
 
+@font-face {
+  font-family: "Drive-In CJK";
+  src: url("/api/fonts/cjk") format("collection");
+  font-display: swap;
+}
+
 #subtitle-overlay {
   position: absolute;
   top: calc(100% - 80px - 6rem);
@@ -89,6 +95,7 @@ html, body {
   display: inline;
   background: rgba(0, 0, 0, 0.7);
   color: #fff;
+  font-family: "Drive-In CJK", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-size: 1.6rem;
   font-weight: 500;
   line-height: 2;

@@ -24,6 +24,7 @@ const ABR_EVALUATION_INTERVAL_MS = 1_000;
 const ABR_STARTUP_HOLD_MS = 12_000;
 const ABR_DOWNSHIFT_COOLDOWN_MS = 8_000;
 const ABR_UPSHIFT_COOLDOWN_MS = 30_000;
+const ABR_REBUFFER_UPSHIFT_HOLD_MS = 120_000;
 const ABR_UPSHIFT_BUFFER_SECONDS = 20;
 const ABR_DOWNSHIFT_BUFFER_SECONDS = 10;
 const ABR_UPSHIFT_SAFETY_FACTOR = 1.35;
@@ -564,7 +565,10 @@ export class MediabunnyPlayer {
     };
     this.abrStartedAt = now;
     this.lastAbrSwitchAt = now;
+    this.lastAbrAttemptAt = now;
     this.lastAbrRiskAt = now;
+    this.lastAbrRebufferAt = 0;
+    this.pendingAbrRebufferRisk = false;
     this.lastAbrVideoStutterCount = this.videoStutterCount;
   }
 
@@ -580,15 +584,29 @@ export class MediabunnyPlayer {
 
     const network = this.hlsSegmentPrefetcher.getStats();
     this.persistAbrEstimate(network, now);
-    if (network.sampleCount < 3 || now - this.abrStartedAt < ABR_STARTUP_HOLD_MS) return;
-
     const currentIndex = this.abr.bitrates.indexOf(this.abr.currentBitrate);
     if (currentIndex === -1) return;
     const sawNewStutter = this.videoStutterCount > this.lastAbrVideoStutterCount;
     if (sawNewStutter) {
       this.lastAbrVideoStutterCount = this.videoStutterCount;
       this.lastAbrRiskAt = now;
+      this.lastAbrRebufferAt = now;
+      this.pendingAbrRebufferRisk = true;
     }
+
+    // A rebuffer is stronger evidence than a throughput average. React even
+    // when a rendition switch reset the segment sampler and fewer than three
+    // downloads have completed at the new bitrate.
+    const canDownshift = currentIndex > 0
+      && now - Math.max(this.lastAbrSwitchAt, this.lastAbrAttemptAt) >= ABR_DOWNSHIFT_COOLDOWN_MS;
+    if (currentIndex === 0) this.pendingAbrRebufferRisk = false;
+    if (canDownshift && this.pendingAbrRebufferRisk) {
+      const switched = await this.switchAbrBitrate(this.abr.bitrates[currentIndex - 1], "rebuffer-risk");
+      if (switched) this.pendingAbrRebufferRisk = false;
+      return;
+    }
+
+    if (network.sampleCount < 3 || now - this.abrStartedAt < ABR_STARTUP_HOLD_MS) return;
 
     const latestThroughputKbps = Number(network.lastDownload?.bitsPerSecond) / 1000;
     const responsiveThroughputKbps = Number.isFinite(latestThroughputKbps) && latestThroughputKbps > 0
@@ -597,19 +615,19 @@ export class MediabunnyPlayer {
     const lowBuffer = network.bufferedAheadSeconds <= ABR_DOWNSHIFT_BUFFER_SECONDS;
     const insufficientThroughput = responsiveThroughputKbps
       < this.abr.currentBitrate * ABR_DOWNSHIFT_SAFETY_FACTOR;
-    const canDownshift = currentIndex > 0 && now - this.lastAbrSwitchAt >= ABR_DOWNSHIFT_COOLDOWN_MS;
-    if (canDownshift && (sawNewStutter || (lowBuffer && insufficientThroughput))) {
+    if (canDownshift && lowBuffer && insufficientThroughput) {
       const safeBudget = responsiveThroughputKbps / ABR_DOWNSHIFT_SAFETY_FACTOR;
       const safeTarget = [...this.abr.bitrates]
         .reverse()
         .find((bitrate) => bitrate < this.abr.currentBitrate && bitrate <= safeBudget);
       const target = safeTarget || this.abr.bitrates[0];
-      await this.switchAbrBitrate(target, sawNewStutter ? "rebuffer-risk" : "low-buffer");
+      await this.switchAbrBitrate(target, "low-buffer");
       return;
     }
 
     const nextBitrate = this.abr.bitrates[currentIndex + 1];
-    const stableLongEnough = now - Math.max(this.lastAbrSwitchAt, this.lastAbrRiskAt) >= ABR_UPSHIFT_COOLDOWN_MS;
+    const stableLongEnough = now - Math.max(this.lastAbrSwitchAt, this.lastAbrRiskAt) >= ABR_UPSHIFT_COOLDOWN_MS
+      && (!this.lastAbrRebufferAt || now - this.lastAbrRebufferAt >= ABR_REBUFFER_UPSHIFT_HOLD_MS);
     const hasUpshiftBuffer = network.bufferedAheadSeconds >= ABR_UPSHIFT_BUFFER_SECONDS;
     const hasUpshiftThroughput = nextBitrate
       && network.throughputKbps >= nextBitrate * ABR_UPSHIFT_SAFETY_FACTOR;
@@ -619,10 +637,11 @@ export class MediabunnyPlayer {
   }
 
   async switchAbrBitrate(targetBitrate, reason) {
-    if (!this.abr || this.abrSwitching || targetBitrate === this.abr.currentBitrate) return;
+    if (!this.abr || this.abrSwitching || targetBitrate === this.abr.currentBitrate) return false;
     const fromBitrate = this.abr.currentBitrate;
     const network = this.hlsSegmentPrefetcher?.getStats() || {};
     this.abrSwitching = true;
+    this.lastAbrAttemptAt = performance.now();
     try {
       const result = await this.onAbrSwitch({
         session: this.abr.session,
@@ -648,9 +667,11 @@ export class MediabunnyPlayer {
       this.lastAbrRiskAt = this.lastAbrSwitchAt;
       this.hlsSegmentPrefetcher?.handleBitrateSwitch();
       console.info("[plex-abr] bitrate switched", this.abr.lastDecision);
+      return true;
     } catch (error) {
       this.lastAbrRiskAt = performance.now();
       console.warn("[plex-abr] bitrate switch failed", error);
+      return false;
     } finally {
       this.abrSwitching = false;
     }

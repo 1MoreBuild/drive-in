@@ -11,6 +11,14 @@ import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
 import log from "./logger.js";
 import {
+  describePlexSubtitle,
+  isPlexTextSubtitle,
+  PlexSubtitleCache,
+  plexSubtitleVersionInfo,
+  readPlexSubtitleFile,
+  resolvePlexSubtitleDelivery,
+} from "./plex-subtitles.js";
+import {
   addPlaylistItem,
   createPlaylist,
   addQueueItem,
@@ -42,6 +50,7 @@ const PLEX_ABR_BITRATES = (() => {
   return unique.length ? unique : [3000, 5000, 8000];
 })();
 const PLEX_INITIAL_VIDEO_BITRATE = PLEX_ABR_BITRATES[0];
+const MAX_PLEX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
@@ -65,6 +74,13 @@ const PLEX_TOKEN = process.env.PLEX_TOKEN || (() => {
   try { return execSync("defaults read com.plexapp.plexmediaserver PlexOnlineToken 2>/dev/null").toString().trim(); }
   catch { return ""; }
 })();
+const CJK_FONT_PATH = [
+  process.env.CJK_FONT_PATH,
+  "/Applications/Plex Media Server.app/Contents/Resources/Fonts/NotoSansCJK-Medium.ttc",
+  "/System/Library/Fonts/Hiragino Sans GB.ttc",
+  "/System/Library/Fonts/PingFang.ttc",
+  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+].find((path) => path && existsSync(path));
 
 // --- Play history (persisted to disk) --------------------------------
 
@@ -107,6 +123,13 @@ app.use((req, res, next) => {
   res.set("Cross-Origin-Opener-Policy", "same-origin");
   res.set("Cross-Origin-Embedder-Policy", "credentialless");
   next();
+});
+
+app.get("/api/fonts/cjk", (_req, res) => {
+  if (!CJK_FONT_PATH) return res.status(404).json({ error: "CJK font not installed on server" });
+  res.set("Content-Type", "font/collection");
+  res.set("Cache-Control", "public, max-age=31536000, immutable");
+  return res.sendFile(CJK_FONT_PATH);
 });
 
 // Structured request logging
@@ -2563,6 +2586,80 @@ async function plexApi(path) {
   return res.json();
 }
 
+const plexSubtitleCache = new PlexSubtitleCache(resolve(CACHE_DIR, "plex-subtitles"));
+const plexSubtitleDescriptorCache = new Map();
+
+function rememberPlexSubtitleDescriptor(key, descriptor) {
+  plexSubtitleDescriptorCache.delete(key);
+  plexSubtitleDescriptorCache.set(key, descriptor);
+  while (plexSubtitleDescriptorCache.size > 128) {
+    plexSubtitleDescriptorCache.delete(plexSubtitleDescriptorCache.keys().next().value);
+  }
+}
+
+async function listPlexSubtitles(ratingKey, streams) {
+  return Promise.all(streams
+    .filter((stream) => stream.streamType === 3)
+    .map(async (stream) => {
+      const versionInfo = await plexSubtitleVersionInfo(stream);
+      const descriptorKey = `${ratingKey}:${stream.id}:${versionInfo.token}`;
+      const cachedDescriptor = plexSubtitleDescriptorCache.get(descriptorKey);
+      if (cachedDescriptor) {
+        rememberPlexSubtitleDescriptor(descriptorKey, cachedDescriptor);
+        return cachedDescriptor;
+      }
+      let inferredLanguage = null;
+      const title = stream.displayTitle || stream.extendedDisplayTitle || stream.title;
+      if (isPlexTextSubtitle(stream) && (!title || /^unknown$/i.test(title))) {
+        try {
+          const cached = await plexSubtitleCache.get(
+            ratingKey,
+            stream,
+            loadPlexSubtitleBuffer,
+            versionInfo,
+          );
+          inferredLanguage = cached.inferredLanguage;
+        } catch (error) {
+          log.warn({ error: error.message, streamId: stream.id }, "[plex] could not inspect text subtitle");
+        }
+      }
+      const descriptor = describePlexSubtitle(ratingKey, stream, null, {
+        versionToken: versionInfo.token,
+        inferredLanguage,
+      });
+      rememberPlexSubtitleDescriptor(descriptorKey, descriptor);
+      return descriptor;
+    }));
+}
+
+async function loadPlexSubtitleBuffer(stream) {
+  const localBuffer = await readPlexSubtitleFile(stream);
+  if (localBuffer) return localBuffer;
+  if (!stream.key) throw new Error("Plex subtitle stream has no downloadable source");
+
+  const sourceUrl = new URL(stream.key, `${PLEX_URL}/`);
+  sourceUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
+  const response = await fetch(sourceUrl);
+  if (!response.ok) throw new Error(`Plex subtitle fetch failed with ${response.status}`);
+  const declaredBytes = Number(response.headers.get("content-length"));
+  if (declaredBytes > MAX_PLEX_SUBTITLE_BYTES) throw new Error("Plex subtitle is larger than 20 MiB");
+  if (!response.body) throw new Error("Plex subtitle response has no body");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_PLEX_SUBTITLE_BYTES) {
+      await reader.cancel();
+      throw new Error("Plex subtitle is larger than 20 MiB");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, totalBytes);
+}
+
 function normalizePlexAbrBitrate(value, fallback = PLEX_INITIAL_VIDEO_BITRATE) {
   const requested = Number(value);
   if (PLEX_ABR_BITRATES.includes(requested)) return requested;
@@ -2995,14 +3092,39 @@ app.get("/api/plex/subtitles/:id", async (req, res) => {
   try {
     const data = await plexApi(`/library/metadata/${req.params.id}`);
     const part = data.MediaContainer.Metadata[0].Media[0].Part[0];
-    const subs = (part.Stream || [])
-      .filter((s) => s.streamType === 3)
-      .map((s) => ({
-        id: s.id, codec: s.codec, language: s.language,
-        title: s.title || s.displayTitle, displayTitle: s.displayTitle,
-      }));
-    res.json(subs);
+    res.json(await listPlexSubtitles(req.params.id, part.Stream || []));
   } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get("/api/plex/subtitle/:ratingKey/:streamId", async (req, res) => {
+  if (!PLEX_TOKEN) return res.status(503).json({ error: "Plex token not configured" });
+  try {
+    const data = await plexApi(`/library/metadata/${req.params.ratingKey}`);
+    const part = data.MediaContainer.Metadata[0].Media[0].Part[0];
+    const stream = (part.Stream || []).find((candidate) => (
+      candidate.streamType === 3 && String(candidate.id) === String(req.params.streamId)
+    ));
+    if (!stream) return res.status(404).json({ error: "Subtitle stream not found" });
+    if (!isPlexTextSubtitle(stream)) {
+      return res.status(415).json({ error: "Image subtitles must be rendered by Plex" });
+    }
+
+    const cached = await plexSubtitleCache.get(
+      req.params.ratingKey,
+      stream,
+      loadPlexSubtitleBuffer,
+    );
+    res.set("ETag", cached.etag);
+    res.set("Cache-Control", cached.immutable
+      ? "private, max-age=31536000, immutable"
+      : "private, max-age=3600, must-revalidate");
+    res.set("X-Drive-In-Subtitle-Cache", cached.source);
+    if (req.fresh) return res.status(304).end();
+    res.set("Content-Type", "text/vtt; charset=utf-8");
+    return res.send(cached.vtt);
+  } catch (e) {
+    return res.status(502).json({ error: e.message });
+  }
 });
 
 app.get("/api/plex/audio/:id", async (req, res) => {
@@ -3053,12 +3175,42 @@ async function playPlexNow({
   const media = meta.Media[0];
   const part = media.Part[0];
   const partStreams = part.Stream || [];
+  const subtitles = await listPlexSubtitles(ratingKey, partStreams);
   const subtitleLanguages = Array.isArray(preferredSubtitleLanguages)
     ? preferredSubtitleLanguages.map(String)
     : [];
-  const selectedSubtitleStreamID = subtitleStreamID || subtitleLanguages
-    .map((language) => partStreams.find((stream) => stream.streamType === 3 && stream.language === language)?.id)
+  const selectedSubtitleStreamID = (subtitleStreamID && String(subtitleStreamID) !== "0" ? subtitleStreamID : null)
+    || subtitleLanguages
+    .map((language) => subtitles.find((subtitle) => (
+      [subtitle.language, subtitle.languageCode, subtitle.title, subtitle.displayTitle]
+        .filter(Boolean)
+        .some((value) => String(value) === language)
+    ))?.id)
     .find(Boolean);
+  const selectedSubtitleIndex = subtitles.findIndex((subtitle) => (
+    String(subtitle.id) === String(selectedSubtitleStreamID)
+  ));
+  let selectedSubtitle = selectedSubtitleIndex >= 0 ? subtitles[selectedSubtitleIndex] : null;
+  let burnSubtitleStreamID = selectedSubtitle?.delivery === "burn" ? selectedSubtitle.id : null;
+  if (selectedSubtitle?.delivery === "external") {
+    const selectedStream = partStreams.find((stream) => (
+      stream.streamType === 3 && String(stream.id) === String(selectedSubtitle.id)
+    ));
+    const versionInfo = await plexSubtitleVersionInfo(selectedStream);
+    const resolvedDelivery = await resolvePlexSubtitleDelivery(selectedSubtitle, () => (
+      plexSubtitleCache.get(ratingKey, selectedStream, loadPlexSubtitleBuffer, versionInfo)
+    ));
+    selectedSubtitle = resolvedDelivery.subtitle;
+    burnSubtitleStreamID = resolvedDelivery.burnSubtitleStreamID;
+    subtitles[selectedSubtitleIndex] = selectedSubtitle;
+    if (resolvedDelivery.fallback) {
+      log.warn({
+        ratingKey,
+        streamId: selectedSubtitle.id,
+        error: resolvedDelivery.error.message,
+      }, "[plex] text subtitle conversion failed; falling back to burn-in");
+    }
+  }
   const selectedAudioStreamID = audioStreamID || (preferredAudioLanguage
     ? partStreams.find((stream) => (
       stream.streamType === 2
@@ -3072,8 +3224,8 @@ async function playPlexNow({
 
   // Set subtitle and audio selection on the Plex part before transcoding
   const partParams = new URLSearchParams({ "X-Plex-Token": PLEX_TOKEN, allParts: "1" });
-  if (selectedSubtitleStreamID) {
-    partParams.set("subtitleStreamID", selectedSubtitleStreamID);
+  if (burnSubtitleStreamID) {
+    partParams.set("subtitleStreamID", burnSubtitleStreamID);
   } else {
     partParams.set("subtitleStreamID", "0");
   }
@@ -3084,7 +3236,8 @@ async function playPlexNow({
   log.info({
     status: putRes.status,
     partId: part.id,
-    subtitleStreamID: selectedSubtitleStreamID || 0,
+    selectedSubtitleStreamID: selectedSubtitleStreamID || 0,
+    burnSubtitleStreamID: burnSubtitleStreamID || 0,
     audioStreamID: selectedAudioStreamID || null,
   }, "[plex] PUT subtitle/audio on part");
 
@@ -3100,7 +3253,7 @@ async function playPlexNow({
     ? PLEX_ABR_BITRATES.filter((bitrate) => bitrate <= safeInitialBudget).pop() || PLEX_INITIAL_VIDEO_BITRATE
     : PLEX_INITIAL_VIDEO_BITRATE;
   const playerUrl = await plexTranscodeUrl(ratingKey, {
-    subtitleStreamID: selectedSubtitleStreamID,
+    subtitleStreamID: burnSubtitleStreamID,
     audioStreamID: selectedAudioStreamID,
     offsetSec: resumeSec,
     videoBitrate: selectedVideoBitrate,
@@ -3109,9 +3262,6 @@ async function playPlexNow({
   updateState({ status: "playing", title, resolvedUrl: `plex://${ratingKey}`, isLive: false });
 
   // Collect subtitle and audio tracks for player UI
-  const subtitles = partStreams
-    .filter((s) => s.streamType === 3)
-    .map((s) => ({ id: s.id, codec: s.codec, language: s.language, title: s.title || s.displayTitle, displayTitle: s.displayTitle }));
   const audioTracks = partStreams
     .filter((s) => s.streamType === 2)
     .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));

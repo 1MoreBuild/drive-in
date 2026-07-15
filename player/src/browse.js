@@ -51,6 +51,7 @@ function formatSubtitleLabel(sub) {
     let label = "中文";
     if (hasChs && hasEng) label = "简英双语";
     else if (hasCht && hasEng) label = "繁英双语";
+    else if (hasEng) label = "中英双语";
     else if (hasChs) label = "简体中文";
     else if (hasCht) label = "繁体中文";
 
@@ -126,10 +127,38 @@ function selectSubtitle(id) {
   if (state.plexInfo?.subtitles?.length) {
     const sub = state.plexInfo.subtitles.find((s) => String(s.id) === String(id));
     if (sub) {
-      localStorage.setItem("preferred-sub-langs", JSON.stringify([sub.language]));
+      const preference = sub.language || sub.languageCode || sub.displayTitle;
+      localStorage.setItem("preferred-sub-langs", JSON.stringify([preference]));
     } else {
       localStorage.removeItem("preferred-sub-langs");
     }
+
+    const activeSub = state.plexInfo.subtitles.find((candidate) => (
+      String(candidate.id) === String(state.plexInfo.activeSubtitleID)
+    ));
+    const canSwitchWithoutTranscode = (!activeSub || activeSub.delivery === "external")
+      && (!sub || sub.delivery === "external");
+    if (canSwitchWithoutTranscode) {
+      disableExternalSubtitle();
+      state.plexInfo.activeSubtitleID = sub?.id || null;
+      updateSubsUI();
+      if (sub?.url) {
+        loadSubtitleTrack(`plex:${sub.id}`, sub.url).then((loaded) => {
+          if (loaded) return;
+          showStatus("Text subtitle failed. Falling back to Plex burn-in...");
+          requestPlexPlayback({
+            ratingKey: state.plexInfo.ratingKey,
+            subtitleStreamID: sub.id,
+            offset: Math.floor(state.currentTime * 1000),
+          }).catch((err) => {
+            console.error("[subs] Fallback error:", err);
+            showStatus(`Subtitle error: ${err.message}`);
+          });
+        });
+      }
+      return;
+    }
+
     const offsetMs = Math.floor(state.currentTime * 1000);
     requestPlexPlayback({
       ratingKey: state.plexInfo.ratingKey,

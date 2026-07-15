@@ -4,7 +4,7 @@ import {
   updateVolumeButton, showBuffering, hideBuffering, isDraggingProgress,
   mediaTitle,
 } from "./controls.js";
-import { renderSubtitle, disableExternalSubtitle } from "./subtitles.js";
+import { renderSubtitle, loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { navigate } from "./router.js";
 import { MediabunnyPlayer } from "./engine/mediabunny-player.js";
 
@@ -1651,6 +1651,14 @@ export async function play(url, title, meta = {}) {
       if (duration > 0n) state.duration = Number(duration) / 1000;
     }
     updateTimeDisplay();
+
+    const activePlexSubtitle = state.plexInfo?.subtitles?.find((subtitle) => (
+      subtitle.delivery === "external"
+      && String(subtitle.id) === String(state.plexInfo.activeSubtitleID)
+    ));
+    if (activePlexSubtitle?.url) {
+      await loadSubtitleTrack(`plex:${activePlexSubtitle.id}`, activePlexSubtitle.url);
+    }
 
     if (!state.audioUnlocked) {
       state.player.setVolume(0);

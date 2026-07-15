@@ -14,6 +14,7 @@
   },
   "main": "index.js",
   "scripts": {
+    "test": "node --test",
     "start": "node index.js",
     "dev": "SERVE_SOURCE=1 node --watch index.js"
   },
