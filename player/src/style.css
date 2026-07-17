@@ -52,6 +52,32 @@ html, body {
   cursor: default;
 }
 
+#connection-status {
+  position: fixed;
+  top: 18px;
+  right: 22px;
+  z-index: 100;
+  min-height: 44px;
+  padding: 0 18px;
+  border: 1px solid oklch(100% 0 0 / 0.12);
+  border-radius: 999px;
+  background: oklch(14% 0.01 250 / 0.96);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.875rem;
+  letter-spacing: 0.02em;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.28);
+}
+
+.connection-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: oklch(72% 0.15 65);
+}
+
 /* --- Canvas --------------------------------------------------------- */
 
 #player-container {
@@ -794,8 +820,8 @@ html, body {
   border-radius: 50%;
   display: flex;
   align-items: center;
-  min-width: 36px;
-  min-height: 36px;
+  min-width: 48px;
+  min-height: 48px;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -1127,6 +1153,18 @@ html, body {
   .browse-card-queue {
     opacity: 1;
   }
+
+  .browse-card-queue {
+    right: 8px;
+    bottom: 8px;
+    width: 48px;
+    height: 48px;
+  }
+
+  .browse-card-queue svg {
+    width: 20px;
+    height: 20px;
+  }
 }
 
 /* --- Watched badge --------------------------------------------------- */
@@ -1222,7 +1260,18 @@ html, body {
   display: block;
 }
 
+.episode-thumb-empty {
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text-tertiary);
+  background: var(--surface-raised);
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+}
 
+.episode-thumb-empty svg {
+  opacity: 0.28;
+}
 
 .episode-card-title {
   font-size: 0.875rem;
@@ -1238,6 +1287,21 @@ html, body {
   font-size: 0.75rem;
   color: var(--text-tertiary);
   margin-top: 3px;
+}
+
+@media (hover: none) and (min-width: 761px) {
+  .season-grid {
+    gap: 24px 18px;
+  }
+
+  .episode-card-title {
+    font-size: 1rem;
+  }
+
+  .episode-card-meta,
+  #episodes-section .season-header {
+    font-size: 0.875rem;
+  }
 }
 
 /* --- Reduced motion -------------------------------------------------- */

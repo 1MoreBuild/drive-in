@@ -2,13 +2,19 @@ import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
 import { initControls, updateAudioGainUI, updatePlayButton, updateVolumeButton } from "./controls.js";
 import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setAudioGain, setPlayerCallbacks } from "./player.js";
-import { loadBrowseScreen, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
+import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
 
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
+const connectionStatus = document.getElementById("connection-status");
+const connectionStatusText = document.getElementById("connection-status-text");
 let reconnectTimer = null;
+let lastWsActivityAt = 0;
+const WS_RECONNECT_DELAY_MS = 3_000;
+const WS_STALE_AFTER_MS = 70_000;
+const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
 
 // --- Player callbacks (break circular dep player↔browse) -------------
 
@@ -73,59 +79,114 @@ initMediaSession();
 
 // --- WebSocket -------------------------------------------------------
 
+function showConnectionStatus(text = "Reconnecting…") {
+  connectionStatusText.textContent = text;
+  connectionStatus.classList.remove("hidden");
+}
+
+function hideConnectionStatus() {
+  connectionStatus.classList.add("hidden");
+}
+
+function scheduleReconnect(delay = WS_RECONNECT_DELAY_MS) {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
+}
+
+function syncPlayerConnection(ws) {
+  const rawStatus = state.player?.getStatus?.();
+  const status = state.player
+    ? (["stopped", "ended", "error"].includes(rawStatus) ? "idle" : rawStatus || (state.isPlaying ? "playing" : "paused"))
+    : "idle";
+  ws.send(JSON.stringify({ type: "status", status }));
+  if (state.player) reportProgress();
+}
+
+async function restoreConnectedRoute() {
+  const route = parseRoute();
+  if (state.player || state.isPlaying) return;
+
+  // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
+  if (route.view === "player" && (route.url || route.plex)) {
+    showStatus("Resuming playback...");
+    const endpoint = route.plex ? "/api/plex/play" : "/api/play";
+    const body = route.plex ? plexPlaybackRequest(route.plex) : { url: route.url };
+    const playbackRequest = route.plex
+      ? requestPlexPlayback(body)
+      : fetch(`${location.origin}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(async (response) => {
+        if (response.ok) return response;
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || `Playback failed with ${response.status}`);
+      });
+    playbackRequest.catch((error) => {
+      console.error("[playback] Resume failed:", error);
+      showStatus(`Playback error: ${error.message}`);
+      navigate("/", true);
+      loadBrowseScreen();
+    });
+    return;
+  }
+
+  const browseData = await loadBrowseScreen();
+  if (route.view === "show") {
+    const show = browseData.shows.find((item) => String(item.ratingKey) === String(route.ratingKey));
+    if (show) await openEpisodes(show);
+    else {
+      navigate("/", true);
+      showStatus("Show not found");
+    }
+    return;
+  }
+
+  if (route.view === "player") navigate("/", true);
+}
+
 function connect() {
+  if (
+    state.ws
+    && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)
+  ) return;
+
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${proto}//${location.host}/ws?role=player`;
+  const ws = new WebSocket(wsUrl);
 
-  state.ws = new WebSocket(wsUrl);
+  state.ws = ws;
+  lastWsActivityAt = Date.now();
 
-  state.ws.onopen = () => {
+  ws.onopen = () => {
+    if (state.ws !== ws) return;
     console.log("[ws] Connected");
+    lastWsActivityAt = Date.now();
+    hideConnectionStatus();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    // On reconnect during active playback, stay on the current view.
-    if (state.player || state.isPlaying) return;
-
-    const route = parseRoute();
-    // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
-    if (route.view === "player" && (route.url || route.plex)) {
-      showStatus("Resuming playback...");
-      const endpoint = route.plex ? "/api/plex/play" : "/api/play";
-      const body = route.plex ? plexPlaybackRequest(route.plex) : { url: route.url };
-      const playbackRequest = route.plex
-        ? requestPlexPlayback(body)
-        : fetch(`${location.origin}${endpoint}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }).then(async (response) => {
-          if (response.ok) return response;
-          const result = await response.json().catch(() => ({}));
-          throw new Error(result.error || `Playback failed with ${response.status}`);
-        });
-      playbackRequest.catch((error) => {
-        console.error("[playback] Resume failed:", error);
-        showStatus(`Playback error: ${error.message}`);
-        navigate("/", true);
-        loadBrowseScreen();
-      });
-      return;
-    }
-    // No playback context — go to browse
-    if (route.view === "player") navigate("/", true);
-    loadBrowseScreen();
+    syncPlayerConnection(ws);
+    restoreConnectedRoute().catch((error) => {
+      console.error("[ws] Failed to restore route:", error);
+      showStatus(`Connection restored, but the page failed to load: ${error.message}`);
+    });
   };
 
-  state.ws.onmessage = (e) => {
+  ws.onmessage = (e) => {
+    if (state.ws !== ws) return;
+    lastWsActivityAt = Date.now();
     try {
       if (typeof e.data !== "string") return;
       const msg = JSON.parse(e.data);
 
       if (msg.type === "ping") {
-        if (state.ws?.readyState === WebSocket.OPEN) {
-          state.ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong", ts: msg.ts }));
         }
         return;
       }
@@ -145,6 +206,7 @@ function connect() {
             startTime: msg.startTime || 0,
             sourceUrl: msg.sourceUrl || null,
             mediaSource: msg.mediaSource || null,
+            autoplay: msg.autoplay !== false,
           });
           break;
         case "pause":
@@ -205,21 +267,43 @@ function connect() {
     }
   };
 
-  state.ws.onclose = () => {
+  ws.onclose = () => {
+    if (state.ws !== ws) return;
+    state.ws = null;
     console.log("[ws] Disconnected, reconnecting in 3s...");
-    showStatus("Disconnected. Reconnecting...");
-    // Keep only one reconnect timer alive so repeated close/error events do not stack work.
-    if (!reconnectTimer) {
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect();
-      }, 3000);
-    }
+    showConnectionStatus("Reconnecting…");
+    if (!state.player && !state.isPlaying) showStatus("Reconnecting…");
+    scheduleReconnect();
   };
 
-  state.ws.onerror = () => {
-    state.ws.close();
+  ws.onerror = () => {
+    ws.close();
   };
 }
 
 connect();
+
+function verifyConnection() {
+  if (document.visibilityState === "hidden") return;
+  const ws = state.ws;
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    showConnectionStatus("Reconnecting…");
+    scheduleReconnect(0);
+    return;
+  }
+  if (
+    ws.readyState === WebSocket.OPEN
+    && Date.now() - lastWsActivityAt > WS_STALE_AFTER_MS
+  ) {
+    console.warn("[ws] Connection heartbeat is stale; reconnecting");
+    showConnectionStatus("Restoring connection…");
+    ws.close();
+  }
+}
+
+setInterval(verifyConnection, WS_HEALTH_CHECK_INTERVAL_MS);
+window.addEventListener("pageshow", verifyConnection);
+window.addEventListener("online", verifyConnection);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") verifyConnection();
+});

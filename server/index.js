@@ -36,9 +36,20 @@ import {
   shiftQueueItem,
   updatePlaylist,
 } from "./queue-store.js";
+import {
+  buildFormatSelector,
+  normalizeTargetHeight,
+  targetHeightForViewport,
+} from "./stream-quality.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
+const STREAM_MAX_VIDEO_BITRATE_KBPS = (() => {
+  const parsed = Number(process.env.STREAM_MAX_VIDEO_BITRATE_KBPS || 4800);
+  return Number.isFinite(parsed) && parsed >= 500 && parsed <= 20_000
+    ? Math.floor(parsed)
+    : 4800;
+})();
 const PLEX_URL = process.env.PLEX_URL || "http://localhost:32400";
 const PLEX_ABR_BITRATES = (() => {
   const parsed = String(process.env.PLEX_ABR_BITRATES || "3000,5000,8000")
@@ -63,7 +74,9 @@ const SEGMENT_CACHE_MAX_BYTES = (() => {
 const SEGMENT_CACHE_MIN_BYTES = 10 * 1024;
 const SEGMENT_CACHE_TARGET_BYTES = Math.floor(SEGMENT_CACHE_MAX_BYTES * 0.9);
 const SEGMENT_CACHE_EVICT_DEBOUNCE_MS = 60_000;
-const SEGMENT_CACHE_MAX_PREFETCHES = 3;
+// Weak source links get slower when several Bilibili/YouTube ranges compete.
+// Keep background warming single-flight and let foreground misses go first.
+const SEGMENT_CACHE_MAX_PREFETCHES = 1;
 // Keep roughly 30 seconds of split-stream media warm. The canvas player only
 // holds a small decoded-frame queue, so network jitter must be absorbed here.
 const SEGMENT_PREFETCH_AHEAD = 6;
@@ -185,6 +198,7 @@ const state = {
   url: null,
   title: null,
   resolvedUrl: null,
+  streamProfile: null,
   isLive: false,
 };
 // Live player state reported via WebSocket
@@ -375,6 +389,9 @@ function getMetricsSnapshot() {
         hashKeyHits: segmentCacheState.hashKeyHits,
         prefetchCount: segmentCacheState.prefetchCount,
         prefetchQueueDepth: segmentCachePrefetchQueue.length + segmentCachePrefetchActive,
+        prefetchActive: segmentCachePrefetchActive,
+        prefetchConcurrency: SEGMENT_CACHE_MAX_PREFETCHES,
+        foregroundFetches: segmentCacheForegroundActive,
         coalescedRequests: segmentCacheState.coalescedRequests,
         integrityFailures: segmentCacheState.integrityFailures,
         retryCount: segmentCacheState.retryCount,
@@ -409,14 +426,10 @@ function updateState(patch) {
 
 // --- yt-dlp resolver -------------------------------------------------
 
-// Cap total bitrate at 4800k — this still allows typical 1080p30 sources while
-// keeping segment size and Canvas 2D presentation load inside the tested range.
-const FORMAT_SELECTOR = "bv[vcodec^=avc1][tbr<=4800]+ba[acodec^=mp4a]/bv[vcodec^=avc1][tbr<=4800]+ba*/bv[tbr<=4800]+ba*/b*";
-
 // Common yt-dlp flags — use browser cookies to avoid 429 rate limiting
 const YTDLP_COMMON = ["--cookies-from-browser", "chrome"];
 
-function ytdlpJson(url) {
+function ytdlpJson(url, { targetHeight = 720 } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       "yt-dlp",
@@ -424,7 +437,10 @@ function ytdlpJson(url) {
         ...YTDLP_COMMON,
         "--no-warnings", "-j", "--no-playlist",
         "--write-sub", "--sub-lang", "all",
-        "-f", FORMAT_SELECTOR,
+        "-f", buildFormatSelector({
+          targetHeight,
+          maxVideoKbps: STREAM_MAX_VIDEO_BITRATE_KBPS,
+        }),
         url,
       ],
       { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
@@ -506,9 +522,26 @@ function extractSubtitles(info) {
   return subs;
 }
 
-function ytdlp(url) {
-  return ytdlpJson(url).then((info) => {
+function ytdlp(url, { targetHeight = 720 } = {}) {
+  const selectedTargetHeight = normalizeTargetHeight(targetHeight);
+  return ytdlpJson(url, { targetHeight: selectedTargetHeight }).then((info) => {
     const isLive = !!info.is_live;
+    const selectedFormats = info.requested_formats?.length ? info.requested_formats : [info];
+    const selectedVideo = selectedFormats.find((format) => format.vcodec && format.vcodec !== "none");
+    const selectedAudio = selectedFormats.find((format) => format.acodec && format.acodec !== "none");
+    const streamProfile = selectedVideo ? {
+      videoFormatId: selectedVideo.format_id || null,
+      audioFormatId: selectedAudio?.format_id || null,
+      width: selectedVideo.width || null,
+      height: selectedVideo.height || null,
+      fps: selectedVideo.fps || null,
+      videoKbps: selectedVideo.tbr || selectedVideo.vbr || null,
+      audioKbps: selectedAudio?.abr || selectedAudio?.tbr || null,
+      maxVideoKbps: STREAM_MAX_VIDEO_BITRATE_KBPS,
+      targetHeight: selectedTargetHeight,
+      preferredFps: 60,
+      split: selectedFormats.length > 1,
+    } : null;
     const meta = {
       title: info.title || info.fulltitle || url,
       isLive,
@@ -516,6 +549,7 @@ function ytdlp(url) {
       duration: info.duration || null,
       uploader: info.uploader || null,
       subtitles: extractSubtitles(info),
+      streamProfile,
     };
 
     // 1. HLS manifest available — best case
@@ -779,7 +813,8 @@ function startTranscodePipeline(videoUrl, audioUrl, { videoHeaders = null, audio
     "-map", "0:v:0", "-map", "1:a:0",
     "-c:v", "libx264", "-preset", "veryfast",
     "-profile:v", "main", "-level", "4.0", "-crf", "23",
-    "-maxrate", "4800k", "-bufsize", "9600k",
+    "-maxrate", `${STREAM_MAX_VIDEO_BITRATE_KBPS}k`,
+    "-bufsize", `${STREAM_MAX_VIDEO_BITRATE_KBPS * 2}k`,
     "-c:a", "aac", "-b:a", "192k",
     "-f", "hls",
     "-hls_time", "6",
@@ -1347,7 +1382,14 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
       upstreamUrl: entry.url,
       rangeHeader: rangeStr,
     });
-    const result = await getOrFetchDashSegment(map.proxyId, rangeStr, { label: "dash-seg" });
+    let result;
+    segmentCacheForegroundActive += 1;
+    try {
+      result = await getOrFetchDashSegment(map.proxyId, rangeStr, { label: "dash-seg" });
+    } finally {
+      segmentCacheForegroundActive = Math.max(0, segmentCacheForegroundActive - 1);
+      runSegmentPrefetchQueue();
+    }
     if (req.destroyed || res.destroyed) return;
     if (result.cacheEntry) {
       await serveSegmentCacheToResponse(
@@ -1542,6 +1584,7 @@ const segmentCacheState = {
 const segmentCachePrefetchQueue = [];
 const dashSegmentFetches = new Map();
 let segmentCachePrefetchActive = 0;
+let segmentCacheForegroundActive = 0;
 const segmentCachePrefetchSet = new Set();
 let segmentCacheEvictionTimer = null;
 let lastSegmentCacheEvictionMs = 0;
@@ -1821,6 +1864,9 @@ setInterval(() => {
     missesSinceLastHealthLog: missesSinceLast,
     cachedSegments: getCachedSegmentCount(),
     prefetchQueueDepth: segmentCachePrefetchQueue.length + segmentCachePrefetchActive,
+    prefetchActive: segmentCachePrefetchActive,
+    prefetchConcurrency: SEGMENT_CACHE_MAX_PREFETCHES,
+    foregroundFetches: segmentCacheForegroundActive,
   }, "Segment cache health");
 }, 120_000).unref();
 
@@ -2225,7 +2271,11 @@ function enqueueSegmentPrefetch(proxyId, range, segmentIndex = null) {
 }
 
 function runSegmentPrefetchQueue() {
-  while (segmentCachePrefetchActive < SEGMENT_CACHE_MAX_PREFETCHES && segmentCachePrefetchQueue.length) {
+  while (
+    segmentCacheForegroundActive === 0
+    && segmentCachePrefetchActive < SEGMENT_CACHE_MAX_PREFETCHES
+    && segmentCachePrefetchQueue.length
+  ) {
     const item = segmentCachePrefetchQueue.shift();
     if (item.generation !== dashPlaybackGeneration) {
       segmentCachePrefetchSet.delete(item.key);
@@ -2494,8 +2544,8 @@ app.get("/api/proxy/range", async (req, res) => {
   }
 });
 
-// Max bitrate for HLS variant filtering (matches FORMAT_SELECTOR cap)
-const HLS_MAX_BANDWIDTH = 4800_000;
+// HLS BANDWIDTH includes audio, so retain a small allowance above the video cap.
+const HLS_MAX_BANDWIDTH = (STREAM_MAX_VIDEO_BITRATE_KBPS + 256) * 1000;
 
 function proxyHlsResourceUrl(resourceUrl, baseUrl, headers = null) {
   const absoluteUrl = /^https?:\/\//i.test(resourceUrl)
@@ -3259,7 +3309,13 @@ async function playPlexNow({
     videoBitrate: selectedVideoBitrate,
   });
 
-  updateState({ status: "playing", title, resolvedUrl: `plex://${ratingKey}`, isLive: false });
+  updateState({
+    status: "playing",
+    title,
+    resolvedUrl: `plex://${ratingKey}`,
+    streamProfile: null,
+    isLive: false,
+  });
 
   // Collect subtitle and audio tracks for player UI
   const audioTracks = partStreams
@@ -3757,7 +3813,6 @@ app.post("/api/resolve", async (req, res) => {
 
 async function buildDashSplitSource({ resolved, sourceUrl }) {
   resolved.isLive = false;
-  resetDashSegmentSession();
   const pairId = `pair-${Date.now()}`;
   const videoProxyId = proxyRegister(resolved.videoUrl, resolved.videoHeaders, {
     originalUrl: sourceUrl, pairId, role: "video",
@@ -3771,6 +3826,9 @@ async function buildDashSplitSource({ resolved, sourceUrl }) {
     video: { init: videoInfo.initEnd, segs: videoInfo.segments.length, mb: Math.round(videoInfo.totalSize / 1048576) },
     audio: { init: audioInfo.initEnd, segs: audioInfo.segments.length, mb: Math.round(audioInfo.totalSize / 1048576) },
   }, "DASH probe complete");
+  // Keep the current DASH session playable while the replacement is probed.
+  // Swap sessions only after both new tracks are ready.
+  resetDashSegmentSession();
   const dashHls = generateDashHls(
     pairId,
     resolved.videoFormat, resolved.audioFormat,
@@ -3810,13 +3868,23 @@ async function buildDashSplitTranscodeAndPlayerUrl({ resolved }) {
   throw new Error("DASH transcode did not produce init.mp4 and media segments within the startup window");
 }
 
-async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
+async function playUrlNow({
+  url,
+  transcode: transcodeEnabled,
+  targetHeight,
+  startTime: requestedStartTime,
+  reason = "play",
+  autoplay = true,
+} = {}) {
   if (!url) {
     const err = new Error("url required");
     err.status = 400;
     throw err;
   }
   const shouldTranscode = transcodeEnabled !== false && String(transcodeEnabled).toLowerCase() !== "false" && DASH_TRANSCODE;
+  const selectedTargetHeight = normalizeTargetHeight(
+    targetHeight ?? targetHeightForViewport(playerState.viewport),
+  );
 
   if (!playerWs || playerWs.readyState !== 1) {
     const err = new Error("No player connected. Open the player in Tesla browser first.");
@@ -3824,7 +3892,11 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
     throw err;
   }
 
-  updateState({ status: "resolving", url });
+  updateState({
+    status: "resolving",
+    url,
+    streamProfile: reason === "viewport-change" ? state.streamProfile : null,
+  });
 
   // Check if it's already a direct stream URL
   const directPattern = /\.(m3u8|mp4|flv|ts|webm)(\?|$)/i;
@@ -3833,8 +3905,15 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
   if (directPattern.test(url)) {
     resolved = { url, title: url, isLive: false, type: /\.m3u8/i.test(url) ? "hls" : "direct", subtitles: [] };
   } else {
-    resolved = await ytdlp(url);
+    resolved = await ytdlp(url, { targetHeight: selectedTargetHeight });
   }
+
+  log.info({
+    sourceUrl: url,
+    streamType: resolved.type,
+    reason,
+    streamProfile: resolved.streamProfile || null,
+  }, "Stream format selected");
 
   await stopActivePlexTranscode();
 
@@ -3915,8 +3994,9 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
   }
 
   updateState({
-    status: "playing",
+    status: autoplay ? "playing" : "paused",
     resolvedUrl: resolved.url || resolved.videoUrl,
+    streamProfile: resolved.streamProfile || null,
     title: resolved.title,
     isLive: resolved.isLive,
   });
@@ -3926,7 +4006,10 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
   // Look up saved progress from history
   const history = loadHistory();
   const savedEntry = history.find((h) => h.url === url);
-  const startTime = savedEntry?.progress || 0;
+  const numericStartTime = Number(requestedStartTime);
+  const startTime = Number.isFinite(numericStartTime) && numericStartTime >= 0
+    ? numericStartTime
+    : savedEntry?.progress || 0;
 
   broadcast({
     type: "play",
@@ -3938,6 +4021,8 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
     thumbnail: thumbUrl,
     duration: resolved.duration,
     startTime,
+    autoplay,
+    streamProfile: resolved.streamProfile || null,
   });
 
   addToHistory({
@@ -3948,7 +4033,92 @@ async function playUrlNow({ url, transcode: transcodeEnabled } = {}) {
     progress: startTime, // preserve saved progress until player reports new position
   });
 
-  return { ok: true, title: resolved.title, isLive: resolved.isLive };
+  return {
+    ok: true,
+    title: resolved.title,
+    isLive: resolved.isLive,
+    streamProfile: resolved.streamProfile || null,
+  };
+}
+
+const VIEWPORT_QUALITY_SWITCH_DEBOUNCE_MS = 2_000;
+let viewportQualitySwitchTimer = null;
+let viewportQualitySwitching = false;
+let pendingViewport = null;
+
+function scheduleViewportQualitySwitch(viewport) {
+  pendingViewport = viewport;
+  if (viewportQualitySwitchTimer) {
+    clearTimeout(viewportQualitySwitchTimer);
+    viewportQualitySwitchTimer = null;
+  }
+
+  const targetHeight = targetHeightForViewport(viewport);
+  if (
+    viewportQualitySwitching
+    || !state.url
+    || !state.streamProfile
+    || state.streamProfile.targetHeight === targetHeight
+    || state.resolvedUrl?.startsWith("plex://")
+  ) return;
+
+  viewportQualitySwitchTimer = setTimeout(() => {
+    viewportQualitySwitchTimer = null;
+    void applyViewportQualitySwitch();
+  }, VIEWPORT_QUALITY_SWITCH_DEBOUNCE_MS);
+}
+
+async function applyViewportQualitySwitch() {
+  if (viewportQualitySwitching) return;
+  const viewport = pendingViewport;
+  const targetHeight = targetHeightForViewport(viewport);
+  const fromHeight = state.streamProfile?.targetHeight;
+  const sourceUrl = state.url;
+  if (!sourceUrl || !fromHeight || fromHeight === targetHeight) return;
+
+  const startTime = Math.max(0, Number(playerState.currentTime) || 0);
+  const autoplay = playerState.isPlaying !== false;
+  viewportQualitySwitching = true;
+  log.info({
+    sourceUrl,
+    fromHeight,
+    targetHeight,
+    startTime,
+    autoplay,
+    viewport,
+  }, "Viewport quality switch starting");
+
+  try {
+    const result = await playUrlNow({
+      url: sourceUrl,
+      targetHeight,
+      startTime,
+      autoplay,
+      reason: "viewport-change",
+    });
+    log.info({
+      sourceUrl,
+      fromHeight,
+      targetHeight,
+      selected: result.streamProfile,
+    }, "Viewport quality switch complete");
+  } catch (err) {
+    log.error({
+      err: err?.message || String(err),
+      sourceUrl,
+      fromHeight,
+      targetHeight,
+    }, "Viewport quality switch failed");
+    updateState({ status: autoplay ? "playing" : "paused" });
+  } finally {
+    viewportQualitySwitching = false;
+    // Only schedule another pass when the viewport changed while this switch
+    // was in flight. A resolver failure should wait for the next real resize
+    // instead of retrying forever.
+    if (targetHeight !== targetHeightForViewport(pendingViewport)) {
+      scheduleViewportQualitySwitch(pendingViewport);
+    }
+  }
 }
 
 // Play a URL (resolve + push to player)
@@ -3973,7 +4143,7 @@ app.post("/api/control", async (req, res) => {
     await stopActivePlexTranscode();
     resetDashSegmentSession();
     currentSubtitles = [];
-    updateState({ status: "idle", url: null, resolvedUrl: null, title: null });
+    updateState({ status: "idle", url: null, resolvedUrl: null, streamProfile: null, title: null });
   }
 
   if (!playerWs || playerWs.readyState !== 1) {
@@ -4118,8 +4288,6 @@ wss.on("connection", (ws, req) => {
     playerWs = ws;
     log.info("Player WebSocket connected");
 
-    // Reset state when player reconnects — old playback context is lost
-    updateState({ status: "idle", url: null, resolvedUrl: null, title: null, isLive: false });
     ws.send(JSON.stringify({ type: "queueUpdated", queue: listQueue() }));
     ws.send(JSON.stringify({ type: "playlistsUpdated", playlists: listPlaylists() }));
 
@@ -4134,9 +4302,19 @@ wss.on("connection", (ws, req) => {
       const msg = JSON.parse(raw);
       // Player reports status changes
       if (msg.type === "status" && msg.status) {
-        updateState({ status: msg.status });
+        updateState(msg.status === "idle"
+          ? { status: "idle", url: null, resolvedUrl: null, streamProfile: null, title: null, isLive: false }
+          : { status: msg.status });
       } else if (msg.type === "playerState") {
-        playerState = { currentTime: msg.currentTime, duration: msg.duration, isPlaying: msg.isPlaying, isMuted: msg.isMuted, updatedAt: Date.now() };
+        playerState = {
+          currentTime: msg.currentTime,
+          duration: msg.duration,
+          isPlaying: msg.isPlaying,
+          isMuted: msg.isMuted,
+          viewport: msg.viewport || null,
+          updatedAt: Date.now(),
+        };
+        scheduleViewportQualitySwitch(playerState.viewport);
         // Save progress for non-Plex content to history
         if (!msg.plexRatingKey && state.url) {
           const history = loadHistory();

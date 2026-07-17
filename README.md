@@ -220,6 +220,7 @@ drive-in/              (npm workspaces monorepo)
 | `LOG_LEVEL` | `info` in production | Pino log level |
 | `DRIVEIN_DB` | `.drive-in.sqlite` | Queue and playlist database path |
 | `SEGMENT_CACHE_MAX_BYTES` | `21474836480` | Maximum split-stream segment cache size |
+| `STREAM_MAX_VIDEO_BITRATE_KBPS` | `4800` | Maximum selected video bitrate for YouTube and Bilibili. Selection prefers 50/60 fps, defaults to 720p in the normal Tesla window, and switches to 1080p when the effective fullscreen viewport is wide enough. |
 | `DASH_TRANSCODE` | disabled | Set to `1` to prefer the ffmpeg split-stream fallback |
 | `DRIVEIN_SERVER` | `http://localhost:9090` | CLI remote server URL |
 | `SERVE_SOURCE` | — | Set to `1` for dev mode (serve player source) |

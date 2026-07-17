@@ -856,6 +856,9 @@ function summarizePlayerStats(player) {
     videoCurrentTimeMs: normalizeMetricNumber(stats.videoCurrentTime),
     audioNextTimeMs: normalizeMetricNumber(stats.audioNextTime),
     videoNextTimeMs: normalizeMetricNumber(stats.videoNextTime),
+    audioSourceEnded: typeof stats.audioSourceEnded === "boolean" ? stats.audioSourceEnded : null,
+    videoSourceEnded: typeof stats.videoSourceEnded === "boolean" ? stats.videoSourceEnded : null,
+    durationDistanceMs: normalizeMetricNumber(stats.durationDistanceMs),
     audioCodec: typeof stats.audiocodec === "string" ? stats.audiocodec : null,
     videoCodec: typeof stats.videocodec === "string" ? stats.videocodec : null,
     width: normalizeMetricNumber(stats.width),
@@ -890,6 +893,33 @@ function describePlayerCanvas() {
     height: canvas.height,
     clientWidth: canvas.clientWidth,
     clientHeight: canvas.clientHeight,
+  };
+}
+
+function describeViewport() {
+  const dpr = Number(globalThis.devicePixelRatio) || 1;
+  const innerWidth = Number(globalThis.innerWidth) || 0;
+  const innerHeight = Number(globalThis.innerHeight) || 0;
+  const visualViewport = globalThis.visualViewport;
+  return {
+    innerWidth,
+    innerHeight,
+    devicePixelRatio: dpr,
+    devicePixelWidth: Math.round(innerWidth * dpr),
+    devicePixelHeight: Math.round(innerHeight * dpr),
+    visualViewport: visualViewport ? {
+      width: Math.round(visualViewport.width * 100) / 100,
+      height: Math.round(visualViewport.height * 100) / 100,
+      scale: visualViewport.scale,
+      offsetLeft: visualViewport.offsetLeft,
+      offsetTop: visualViewport.offsetTop,
+    } : null,
+    screen: globalThis.screen ? {
+      width: globalThis.screen.width,
+      height: globalThis.screen.height,
+      availWidth: globalThis.screen.availWidth,
+      availHeight: globalThis.screen.availHeight,
+    } : null,
   };
 }
 
@@ -1156,6 +1186,7 @@ function sendPlayerHealthHeartbeat() {
 
   postPlayerRuntimeLog("health_heartbeat", {
     currentTime: state.currentTime,
+    viewport: describeViewport(),
     buffer: collectBufferState(),
     frameCountSinceLastHeartbeat,
     jankCountSinceLastHeartbeat,
@@ -1286,6 +1317,7 @@ function reportPlayerMetrics() {
       droppedFrames,
       playerStats,
       playbackState: getPlaybackState(),
+      viewport: describeViewport(),
       capabilityProfile: {
         hasWebCodecs: CAPABILITY_PROFILE.hasWebCodecs,
         hasVideoDecoder: CAPABILITY_PROFILE.hasVideoDecoder,
@@ -1355,6 +1387,7 @@ async function logDecodePath(player, phase, extra = {}) {
     droppedFrames: readDroppedFrames(player),
     audio: readAudioBufferStats(player),
     canvas: describePlayerCanvas(),
+    viewport: describeViewport(),
     ...extra,
   };
   console.log("[player] Decode health:", decodeInfo);
@@ -1436,6 +1469,7 @@ export function reportProgress() {
     isPlaying: state.isPlaying,
     isMuted: state.isMuted,
     plexRatingKey: state.plexInfo?.ratingKey || null,
+    viewport: describeViewport(),
   };
   if (state.ws?.readyState === 1) {
     state.ws.send(JSON.stringify({ type: "playerState", ...ps }));
@@ -1651,9 +1685,11 @@ function handleResize() {
         state.player.resize(container.clientWidth, container.clientHeight);
       } catch {}
     }
+    reportProgress();
   }, 150);
 }
 window.addEventListener("resize", handleResize, { passive: true });
+globalThis.visualViewport?.addEventListener("resize", handleResize, { passive: true });
 document.addEventListener("fullscreenchange", handleResize);
 document.addEventListener("webkitfullscreenchange", handleResize);
 const btnAudio = document.getElementById("btn-audio");
@@ -1756,8 +1792,13 @@ export async function play(url, title, meta = {}) {
       updateVolumeButton();
     }
 
-    await state.player.play();
-    state.isPlaying = true;
+    if (meta.autoplay !== false) {
+      await state.player.play();
+      state.isPlaying = true;
+    } else {
+      state.isPlaying = false;
+      hideBuffering();
+    }
     onUpdateAudioUI();
     updatePlayButton();
     showControls();

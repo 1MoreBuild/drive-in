@@ -34,3 +34,36 @@ test("rebuffer during ABR cooldown remains pending until a downshift can run", a
   assert.deepEqual(switches, [{ bitrate: 3000, reason: "rebuffer-risk" }]);
   assert.equal(player.pendingAbrRebufferRisk, false);
 });
+
+test("HLS playback waits for a 15-second encoded startup buffer", () => {
+  const player = Object.create(MediabunnyPlayer.prototype);
+  player.duration = 120;
+  player.hasDecodedStartupBuffer = () => true;
+  let bufferedAheadSeconds = 10;
+  player.hlsSegmentPrefetcher = {
+    getStats: () => ({
+      activePlaylistCount: 2,
+      bufferedAheadSeconds,
+      pendingSegments: 20,
+    }),
+  };
+
+  assert.equal(player.hasStartupBuffer(30), false);
+  bufferedAheadSeconds = 15;
+  assert.equal(player.hasStartupBuffer(30), true);
+});
+
+test("HLS startup buffer shrinks at the end of a video", () => {
+  const player = Object.create(MediabunnyPlayer.prototype);
+  player.duration = 120;
+  player.hasDecodedStartupBuffer = () => true;
+  player.hlsSegmentPrefetcher = {
+    getStats: () => ({
+      activePlaylistCount: 2,
+      bufferedAheadSeconds: 4,
+      pendingSegments: 2,
+    }),
+  };
+
+  assert.equal(player.hasStartupBuffer(116), true);
+});

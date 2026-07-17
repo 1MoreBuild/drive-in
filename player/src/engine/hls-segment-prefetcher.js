@@ -26,12 +26,10 @@ export class HlsSegmentPrefetcher {
     this.targetAheadSeconds = targetAheadSeconds;
     this.maxBytes = maxBytes;
     this.maxConcurrent = maxConcurrent;
-    this.segments = [];
+    this.playlists = new Map();
     this.segmentIndexes = new Map();
     this.prefetches = new Map();
     this.controllers = new Set();
-    this.currentIndex = -1;
-    this.currentUrl = null;
     this.awaitingPlaylistUpdate = false;
     this.throughputSamples = [];
     this.ewmaThroughputBps = 0;
@@ -60,21 +58,24 @@ export class HlsSegmentPrefetcher {
     }
 
     const prefetched = this.prefetches.get(url);
-    const segmentIndex = this.segmentIndexes.get(url);
-    if (segmentIndex === undefined && !prefetched) return globalThis.fetch(input, init);
-    if (segmentIndex !== undefined) {
-      this.currentIndex = segmentIndex;
-      this.currentUrl = url;
-    }
+    const segmentRef = this.segmentIndexes.get(url);
+    const playlist = segmentRef ? this.playlists.get(segmentRef.playlistUrl) : null;
+    if (!segmentRef && !prefetched) return globalThis.fetch(input, init);
+    const advanced = segmentRef && playlist
+      ? this.advancePlaylist(playlist, segmentRef.index, url)
+      : false;
 
     if (prefetched) {
       if (prefetched.state === "queued") this.startPrefetchEntry(prefetched);
-      if (segmentIndex !== undefined && !this.awaitingPlaylistUpdate) this.scheduleAhead(segmentIndex + 1);
+      if (advanced && !this.awaitingPlaylistUpdate) {
+        this.scheduleAhead(segmentRef.playlistUrl, segmentRef.index + 1);
+      }
       const entry = await prefetched.promise;
       this.prefetches.delete(url);
       this.pumpPrefetches();
       if (entry) return responseFromCache(entry);
       for (const [pendingUrl, pendingEntry] of this.prefetches) {
+        if (pendingEntry.playlistUrl !== prefetched.playlistUrl) continue;
         if (pendingEntry.state === "ready") continue;
         pendingEntry.controller?.abort();
         this.prefetches.delete(pendingUrl);
@@ -82,11 +83,30 @@ export class HlsSegmentPrefetcher {
     }
 
     const response = await globalThis.fetch(input, init);
-    if (!this.awaitingPlaylistUpdate) {
-      if (response.ok) void this.scheduleAfterForegroundDownload(response.clone(), segmentIndex + 1);
-      else this.scheduleAhead(segmentIndex + 1);
+    if (!this.awaitingPlaylistUpdate && segmentRef && advanced) {
+      if (response.ok) {
+        void this.scheduleAfterForegroundDownload(
+          response.clone(),
+          segmentRef.playlistUrl,
+          segmentRef.index + 1,
+        );
+      } else {
+        this.scheduleAhead(segmentRef.playlistUrl, segmentRef.index + 1);
+      }
     }
     return response;
+  }
+
+  advancePlaylist(playlist, index, url) {
+    if (index < playlist.currentIndex) return false;
+    playlist.currentIndex = index;
+    playlist.currentUrl = url;
+    for (const [pendingUrl, entry] of this.prefetches) {
+      if (entry.playlistUrl !== playlist.url || entry.index >= index) continue;
+      entry.controller?.abort();
+      this.prefetches.delete(pendingUrl);
+    }
+    return true;
   }
 
   updatePlaylist(body, playlistUrl) {
@@ -107,10 +127,11 @@ export class HlsSegmentPrefetcher {
     }
     if (!segments.length) return;
 
-    const unchanged = segments.length === this.segments.length
+    const previous = this.playlists.get(playlistUrl);
+    const unchanged = segments.length === previous?.segments.length
       && segments.every((segment, index) => (
-        segment.url === this.segments[index]?.url
-        && segment.duration === this.segments[index]?.duration
+        segment.url === previous.segments[index]?.url
+        && segment.duration === previous.segments[index]?.duration
       ));
     if (unchanged) {
       this.awaitingPlaylistUpdate = false;
@@ -119,6 +140,7 @@ export class HlsSegmentPrefetcher {
 
     const nextIndexes = new Map(segments.map((segment, index) => [segment.url, index]));
     for (const [url, entry] of this.prefetches) {
+      if (entry.playlistUrl !== playlistUrl) continue;
       const nextIndex = nextIndexes.get(url);
       if (nextIndex !== undefined) {
         entry.index = nextIndex;
@@ -138,28 +160,41 @@ export class HlsSegmentPrefetcher {
       .sort((a, b) => b[1].orphanedAt - a[1].orphanedAt);
     for (const [url] of orphanedReady.slice(this.ahead)) this.prefetches.delete(url);
 
-    this.segments = segments;
-    this.segmentIndexes = nextIndexes;
-    this.currentIndex = this.currentUrl ? nextIndexes.get(this.currentUrl) ?? -1 : -1;
+    if (previous) {
+      for (const segment of previous.segments) this.segmentIndexes.delete(segment.url);
+    }
+    const playlist = {
+      url: playlistUrl,
+      segments,
+      currentUrl: previous?.currentUrl || null,
+      currentIndex: previous?.currentUrl ? nextIndexes.get(previous.currentUrl) ?? -1 : -1,
+    };
+    this.playlists.set(playlistUrl, playlist);
+    for (const [url, index] of nextIndexes) {
+      this.segmentIndexes.set(url, { playlistUrl, index });
+    }
     this.awaitingPlaylistUpdate = false;
     this.pumpPrefetches();
   }
 
-  scheduleAhead(startIndex) {
+  scheduleAhead(playlistUrl, startIndex) {
+    const playlist = this.playlists.get(playlistUrl);
+    if (!playlist) return;
     let scheduledSeconds = 0;
-    const endIndex = Math.min(this.segments.length, startIndex + this.ahead);
+    const endIndex = Math.min(playlist.segments.length, startIndex + this.ahead);
     for (let index = startIndex; index < endIndex; index += 1) {
-      const url = this.segments[index].url;
+      const url = playlist.segments[index].url;
       if (!this.prefetches.has(url)) {
         this.prefetches.set(url, {
           url,
+          playlistUrl,
           index,
           state: "queued",
           promise: null,
           controller: null,
         });
       }
-      scheduledSeconds += this.segments[index].duration;
+      scheduledSeconds += playlist.segments[index].duration;
       if (scheduledSeconds >= this.targetAheadSeconds) break;
     }
     this.pumpPrefetches();
@@ -175,7 +210,13 @@ export class HlsSegmentPrefetcher {
     if (active >= this.maxConcurrent) return;
     const queued = [...this.prefetches.values()]
       .filter((entry) => entry.state === "queued")
-      .sort((a, b) => a.index - b.index);
+      .sort((a, b) => {
+        const aCurrent = this.playlists.get(a.playlistUrl)?.currentIndex ?? -1;
+        const bCurrent = this.playlists.get(b.playlistUrl)?.currentIndex ?? -1;
+        const aDistance = a.index - aCurrent;
+        const bDistance = b.index - bCurrent;
+        return aDistance - bDistance || a.index - b.index;
+      });
     for (const entry of queued) {
       if (active >= this.maxConcurrent) break;
       const estimate = this.averageSegmentBytes;
@@ -211,7 +252,7 @@ export class HlsSegmentPrefetcher {
   }
 
   async prefetch(entry, generation) {
-    const { url, index: segmentIndex } = entry;
+    const { url, playlistUrl, index: segmentIndex } = entry;
     const controller = new AbortController();
     entry.controller = controller;
     this.controllers.add(controller);
@@ -224,7 +265,7 @@ export class HlsSegmentPrefetcher {
       });
       if (!response.ok || generation !== this.generation || this.destroyed) return null;
       const bytes = await response.arrayBuffer();
-      this.recordDownload(bytes.byteLength, performance.now() - startedAt, segmentIndex);
+      this.recordDownload(bytes.byteLength, performance.now() - startedAt, segmentIndex, playlistUrl);
       return {
         bytes,
         status: response.status,
@@ -240,14 +281,22 @@ export class HlsSegmentPrefetcher {
     }
   }
 
-  async scheduleAfterForegroundDownload(response, nextIndex) {
+  async scheduleAfterForegroundDownload(response, playlistUrl, nextIndex) {
     try {
       await response.arrayBuffer();
     } catch {}
-    if (!this.destroyed && !this.awaitingPlaylistUpdate) this.scheduleAhead(nextIndex);
+    const playlist = this.playlists.get(playlistUrl);
+    if (
+      !this.destroyed
+      && !this.awaitingPlaylistUpdate
+      && playlist
+      && nextIndex > playlist.currentIndex
+    ) {
+      this.scheduleAhead(playlistUrl, nextIndex);
+    }
   }
 
-  recordDownload(byteLength, durationMs, segmentIndex) {
+  recordDownload(byteLength, durationMs, segmentIndex, playlistUrl = null) {
     if (!Number.isFinite(byteLength) || byteLength <= 0 || !Number.isFinite(durationMs) || durationMs <= 0) return;
     const bitsPerSecond = Math.min(100_000_000, (byteLength * 8 * 1000) / Math.max(20, durationMs));
     this.ewmaThroughputBps = this.ewmaThroughputBps
@@ -260,6 +309,7 @@ export class HlsSegmentPrefetcher {
     this.completedDownloads += 1;
     this.lastDownload = {
       segmentIndex,
+      playlistUrl,
       byteLength,
       durationMs,
       bitsPerSecond,
@@ -274,21 +324,38 @@ export class HlsSegmentPrefetcher {
     const throughputBps = conservativeSample && this.ewmaThroughputBps
       ? Math.min(conservativeSample, this.ewmaThroughputBps)
       : conservativeSample || this.ewmaThroughputBps;
-    let bufferedAheadSeconds = 0;
+    const activePlaylists = [...this.playlists.values()]
+      .filter((playlist) => playlist.currentIndex >= 0);
+    const playlistStats = activePlaylists.map((playlist) => {
+      let bufferedAheadSeconds = 0;
+      let readySegments = 0;
+      let pendingSegments = 0;
+      for (let index = playlist.currentIndex + 1; index < playlist.segments.length; index += 1) {
+        const entry = this.prefetches.get(playlist.segments[index].url);
+        if (!entry || entry.state !== "ready") break;
+        bufferedAheadSeconds += playlist.segments[index].duration;
+        readySegments += 1;
+      }
+      for (let index = playlist.currentIndex + 1; index < playlist.segments.length; index += 1) {
+        const entry = this.prefetches.get(playlist.segments[index].url);
+        if (entry?.state === "pending" || entry?.state === "queued") pendingSegments += 1;
+      }
+      return {
+        playlistUrl: playlist.url,
+        currentIndex: playlist.currentIndex,
+        bufferedAheadSeconds,
+        readySegments,
+        pendingSegments,
+      };
+    });
+    const bufferedAheadSeconds = playlistStats.length
+      ? Math.min(...playlistStats.map((stats) => stats.bufferedAheadSeconds))
+      : 0;
     let readySegments = 0;
     let pendingSegments = 0;
-    for (let index = this.currentIndex + 1; index < this.segments.length; index += 1) {
-      const entry = this.prefetches.get(this.segments[index].url);
-      if (!entry || entry.state !== "ready") break;
-      bufferedAheadSeconds += this.segments[index].duration;
-      readySegments += 1;
-    }
-    for (let index = this.currentIndex + 1; index < this.segments.length; index += 1) {
-      const entry = this.prefetches.get(this.segments[index].url);
-      if (!entry) continue;
-      if (entry.state === "pending" || entry.state === "queued") {
-        pendingSegments += 1;
-      }
+    for (const stats of playlistStats) {
+      readySegments += stats.readySegments;
+      pendingSegments += stats.pendingSegments;
     }
     const cachedBytes = this.cachedBytes;
     const cachedSegments = [...this.prefetches.values()]
@@ -312,7 +379,8 @@ export class HlsSegmentPrefetcher {
       managedBytesEstimate,
       peakManagedBytesEstimate: this.peakManagedBytesEstimate,
       byteCapHitCount: this.byteCapHitCount,
-      currentIndex: this.currentIndex,
+      activePlaylistCount: activePlaylists.length,
+      playlistStats,
       completedDownloads: this.completedDownloads,
       lastDownload: this.lastDownload || null,
     };
@@ -340,13 +408,18 @@ export class HlsSegmentPrefetcher {
   }
 
   contiguousBufferedAheadSeconds() {
-    let seconds = 0;
-    for (let index = this.currentIndex + 1; index < this.segments.length; index += 1) {
-      const entry = this.prefetches.get(this.segments[index].url);
-      if (!entry || entry.state !== "ready") break;
-      seconds += this.segments[index].duration;
-    }
-    return seconds;
+    const activePlaylists = [...this.playlists.values()]
+      .filter((playlist) => playlist.currentIndex >= 0);
+    if (!activePlaylists.length) return 0;
+    return Math.min(...activePlaylists.map((playlist) => {
+      let seconds = 0;
+      for (let index = playlist.currentIndex + 1; index < playlist.segments.length; index += 1) {
+        const entry = this.prefetches.get(playlist.segments[index].url);
+        if (!entry || entry.state !== "ready") break;
+        seconds += playlist.segments[index].duration;
+      }
+      return seconds;
+    }));
   }
 
   updateCachePeaks(bufferedAheadSeconds = this.contiguousBufferedAheadSeconds()) {
@@ -391,12 +464,16 @@ export class HlsSegmentPrefetcher {
       entry.controller?.abort();
       this.prefetches.delete(url);
     }
+    this.playlists.clear();
+    this.segmentIndexes.clear();
   }
 
   handleSeek() {
     this.cancelPrefetches();
-    this.currentIndex = -1;
-    this.currentUrl = null;
+    for (const playlist of this.playlists.values()) {
+      playlist.currentIndex = -1;
+      playlist.currentUrl = null;
+    }
     this.awaitingPlaylistUpdate = false;
   }
 
@@ -411,8 +488,7 @@ export class HlsSegmentPrefetcher {
     if (this.destroyed) return;
     this.destroyed = true;
     this.cancelPrefetches();
-    this.segments = [];
+    this.playlists.clear();
     this.segmentIndexes.clear();
-    this.currentUrl = null;
   }
 }

@@ -106,6 +106,7 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - `PLEX_URL` — Plex server URL (default: `http://localhost:32400`)
 - `PLEX_TOKEN` — Plex auth token (auto-detected from macOS defaults if not set)
 - `PLEX_ABR_BITRATES` — Plex adaptive bitrate ladder in Kbps (default: `3000,5000,8000`); rung changes adjust bitrate while retaining the 1080p resolution ceiling
+- `STREAM_MAX_VIDEO_BITRATE_KBPS` — YouTube/Bilibili video bitrate ceiling in Kbps (default: `4800`). Selection prefers 50/60 fps, targets 720p in the normal Tesla window, and switches to 1080p when the effective fullscreen viewport is wide enough.
 
 ## Code style
 
@@ -132,6 +133,7 @@ Set `DRIVEIN_SERVER` env var to point CLI at a remote server.
 - **Play history** — last 30 items persisted to `.play-history.json`, used for resume on replay.
 - **Subtitles** — yt-dlp extracts subtitle URLs, and the server downloads and caches VTT/SRT files. Plex ASS/SSA, SRT, and WebVTT tracks are converted and cached as WebVTT for browser rendering. Image subtitles use Plex burn-in; failed text conversion falls back to burn-in.
 - **fMP4 HLS generation** — for split video+audio streams, the server probes MP4 structure and builds local HLS playlists over original byte ranges.
+- **Viewport-aware stream quality** — the player reports its CSS/visual viewport on resize and fullscreen changes. YouTube/Bilibili target 720p below a 1600 CSS-pixel effective video width and 1080p above it, with a 2-second debounce and position-preserving stream replacement.
 - **Plex adaptive HLS** — targets a 90-second encoded buffer with a 96 MiB retained-segment budget, and changes among the configured bitrate rungs using buffer health and measured segment throughput. Prefetch stays single-flight so per-segment throughput remains valid for ABR. The player prefetches upcoming segments, while the proxy retries not-yet-ready startup segments.
 
 ## Testing

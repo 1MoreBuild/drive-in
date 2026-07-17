@@ -25,11 +25,16 @@ function cachedEntry(body) {
   };
 }
 
+function playlistBody(segments) {
+  return `#EXTM3U\n${segments.map((item) => `#EXTINF:${item.duration},\n${item.url}`).join("\n")}\n`;
+}
+
 test("buffer health stops at the first missing segment", () => {
   const prefetcher = new HlsSegmentPrefetcher();
-  prefetcher.segments = [segment(0), segment(1), segment(2), segment(3)];
-  prefetcher.segmentIndexes = new Map(prefetcher.segments.map((item, index) => [item.url, index]));
-  prefetcher.currentIndex = 0;
+  const segments = [segment(0), segment(1), segment(2), segment(3)];
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  prefetcher.updatePlaylist(playlistBody(segments), playlistUrl);
+  prefetcher.playlists.get(playlistUrl).currentIndex = 0;
   prefetcher.prefetches.set(segment(1).url, { state: "pending" });
   prefetcher.prefetches.set(segment(2).url, cachedEntry("two"));
   prefetcher.prefetches.set(segment(3).url, cachedEntry("three"));
@@ -71,14 +76,16 @@ test("bitrate switch cancels unfinished old-rendition work", () => {
 
 test("seek resets HLS position and pending prefetches", () => {
   const prefetcher = new HlsSegmentPrefetcher();
-  prefetcher.currentIndex = 20;
-  prefetcher.currentUrl = segment(20).url;
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  prefetcher.updatePlaylist(playlistBody([segment(20), segment(21)]), playlistUrl);
+  prefetcher.playlists.get(playlistUrl).currentIndex = 0;
+  prefetcher.playlists.get(playlistUrl).currentUrl = segment(20).url;
   prefetcher.prefetches.set(segment(21).url, { state: "queued", controller: null });
 
   prefetcher.handleSeek();
 
-  assert.equal(prefetcher.currentIndex, -1);
-  assert.equal(prefetcher.currentUrl, null);
+  assert.equal(prefetcher.playlists.get(playlistUrl).currentIndex, -1);
+  assert.equal(prefetcher.playlists.get(playlistUrl).currentUrl, null);
   assert.equal(prefetcher.prefetches.size, 0);
 });
 
@@ -96,14 +103,86 @@ test("prefetch scheduling stops after reaching the time target", () => {
     targetAheadSeconds: 12,
     maxConcurrent: 0,
   });
-  prefetcher.segments = Array.from({ length: 10 }, (_, index) => segment(index, 4));
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  prefetcher.updatePlaylist(
+    playlistBody(Array.from({ length: 10 }, (_, index) => segment(index, 4))),
+    playlistUrl,
+  );
 
-  prefetcher.scheduleAhead(1);
+  prefetcher.scheduleAhead(playlistUrl, 1);
 
   assert.deepEqual(
     [...prefetcher.prefetches.values()].map((entry) => entry.index),
     [1, 2, 3],
   );
+});
+
+test("keeps separate audio and video playlists buffered", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxConcurrent: 0 });
+  const videoUrl = "https://drivein.test/video.m3u8";
+  const audioUrl = "https://drivein.test/audio.m3u8";
+  const videoSegments = Array.from({ length: 4 }, (_, index) => ({
+    url: `https://drivein.test/video-${index}.m4s`,
+    duration: 5,
+  }));
+  const audioSegments = Array.from({ length: 4 }, (_, index) => ({
+    url: `https://drivein.test/audio-${index}.m4s`,
+    duration: 5,
+  }));
+
+  prefetcher.updatePlaylist(playlistBody(videoSegments), videoUrl);
+  prefetcher.updatePlaylist(playlistBody(audioSegments), audioUrl);
+  prefetcher.playlists.get(videoUrl).currentIndex = 0;
+  prefetcher.playlists.get(audioUrl).currentIndex = 0;
+  prefetcher.scheduleAhead(videoUrl, 1);
+  prefetcher.scheduleAhead(audioUrl, 1);
+
+  assert.deepEqual(prefetcher.segmentIndexes.get(videoSegments[1].url), {
+    playlistUrl: videoUrl,
+    index: 1,
+  });
+  assert.deepEqual(prefetcher.segmentIndexes.get(audioSegments[1].url), {
+    playlistUrl: audioUrl,
+    index: 1,
+  });
+  assert.equal(prefetcher.prefetches.size, 6);
+
+  for (const item of videoSegments.slice(1, 3)) {
+    prefetcher.prefetches.set(item.url, { ...cachedEntry(item.url), playlistUrl: videoUrl });
+  }
+  prefetcher.prefetches.set(audioSegments[1].url, {
+    ...cachedEntry(audioSegments[1].url),
+    playlistUrl: audioUrl,
+  });
+
+  const stats = prefetcher.getStats();
+  assert.equal(stats.activePlaylistCount, 2);
+  assert.equal(stats.bufferedAheadSeconds, 5);
+  assert.equal(stats.readySegments, 3);
+  assert.deepEqual(
+    stats.playlistStats.map((item) => item.bufferedAheadSeconds),
+    [10, 5],
+  );
+});
+
+test("jumping to a resume position drops stale startup prefetches", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxConcurrent: 0 });
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  const segments = Array.from({ length: 10 }, (_, index) => segment(index));
+  prefetcher.updatePlaylist(playlistBody(segments), playlistUrl);
+  const playlist = prefetcher.playlists.get(playlistUrl);
+  prefetcher.advancePlaylist(playlist, 0, segments[0].url);
+  prefetcher.scheduleAhead(playlistUrl, 1);
+
+  prefetcher.advancePlaylist(playlist, 7, segments[7].url);
+
+  assert.equal(playlist.currentIndex, 7);
+  assert.deepEqual(
+    [...prefetcher.prefetches.values()].map((entry) => entry.index),
+    [7, 8, 9],
+  );
+  assert.equal(prefetcher.advancePlaylist(playlist, 1, segments[1].url), false);
+  assert.equal(playlist.currentIndex, 7);
 });
 
 test("prefetch does not start more downloads after reaching the byte budget", () => {

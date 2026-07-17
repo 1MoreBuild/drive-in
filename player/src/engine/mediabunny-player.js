@@ -7,6 +7,7 @@ import {
 } from "mediabunny";
 import { AudioRingBuffer } from "./audio-ring-buffer.js";
 import { HlsSegmentPrefetcher } from "./hls-segment-prefetcher.js";
+import { getPlaybackEndReason } from "./playback-end.js";
 import { PresentationClock } from "./presentation-clock.js";
 
 const AUDIO_CAPACITY_SECONDS = 3;
@@ -28,6 +29,7 @@ const ABR_REBUFFER_UPSHIFT_HOLD_MS = 120_000;
 // In-car connections often disappear for tens of seconds at a time. Keep the
 // encoded HLS buffer large and make ABR protect it before quality.
 const HLS_BUFFER_TARGET_SECONDS = 90;
+const HLS_START_SECONDS = 15;
 const HLS_BUFFER_MAX_SEGMENTS = 36;
 const HLS_BUFFER_MAX_BYTES = 96 * 1024 * 1024;
 // ABR throughput is measured per segment request. Keep one download in flight
@@ -160,7 +162,7 @@ export class MediabunnyPlayer {
       const isHls = source?.type === "hls" || /\.m3u8(?:[?#]|$)/i.test(url);
       const useAdaptiveHls = isHls && Boolean(source?.abr);
       if (useAdaptiveHls) this.configureAbr(source.abr);
-      this.input = this.createInput(url, { boundedRanges: !isHls, prefetchHls: useAdaptiveHls });
+      this.input = this.createInput(url, { boundedRanges: !isHls, prefetchHls: isHls });
       this.inputs.push(this.input);
       if (!await this.input.canRead()) {
         throw new Error("Mediabunny could not recognize this MP4/HLS source");
@@ -278,7 +280,7 @@ export class MediabunnyPlayer {
       processorOptions: this.audioRing.processorOptions,
     });
     this.audioNode.port.onmessage = (event) => {
-      if (event.data?.type === "underrun" && this.wantsPlayback) {
+      if (event.data?.type === "underrun" && this.wantsPlayback && !this.audioEnded) {
         this.enterBuffering("audio-underrun");
       }
     };
@@ -452,8 +454,23 @@ export class MediabunnyPlayer {
 
     const mediaTime = this.clock.currentTime;
     this.maybeTriggerScheduledFault(mediaTime);
-    this.updatePlaybackBarrier();
     this.renderVideo(mediaTime);
+    const endReason = this.wantsPlayback ? getPlaybackEndReason({
+      duration: this.duration,
+      mediaTime,
+      hasAudio: Boolean(this.audioTrack),
+      hasVideo: Boolean(this.videoTrack),
+      audioEnded: this.audioEnded,
+      videoEnded: this.videoEnded,
+      audioBufferedSeconds: this.audioSeconds,
+      videoBufferedSeconds: this.videoSecondsAhead(mediaTime),
+    }) : null;
+    if (endReason && this.state !== "ended") {
+      this.finishPlayback(endReason);
+      return;
+    }
+
+    this.updatePlaybackBarrier();
     void this.evaluateAbr(now);
 
     if (now - this.lastTimeEventAt >= TIME_EVENT_INTERVAL_MS) {
@@ -461,17 +478,14 @@ export class MediabunnyPlayer {
       this.onTime(mediaTime);
     }
 
-    if (
-      this.duration > 0
-      && mediaTime >= this.duration - 0.02
-      && this.state !== "ended"
-    ) {
-      this.wantsPlayback = false;
-      this.audioRing?.setRunning(false);
-      this.clock.stop();
-      this.setState("ended");
-      this.onEnded();
-    }
+  }
+
+  finishPlayback(reason) {
+    this.wantsPlayback = false;
+    this.audioRing?.setRunning(false);
+    this.clock.stop();
+    this.setState("ended", { reason });
+    this.onEnded();
   }
 
   renderVideo(mediaTime) {
@@ -506,11 +520,17 @@ export class MediabunnyPlayer {
       return;
     }
 
-    if (this.hasStartupBuffer(mediaTime)) this.enterPlaying();
-    else this.enterBuffering("waiting-for-both-tracks");
+    if (this.hasStartupBuffer(mediaTime)) {
+      this.enterPlaying();
+    } else {
+      const reason = this.hasDecodedStartupBuffer(mediaTime)
+        ? "building-network-buffer"
+        : "waiting-for-both-tracks";
+      this.enterBuffering(reason);
+    }
   }
 
-  hasStartupBuffer(mediaTime) {
+  hasDecodedStartupBuffer(mediaTime) {
     const audioReady = !this.audioTrack
       || this.audioSeconds >= AUDIO_START_SECONDS
       || (this.audioEnded && this.audioRing.availableFrames > 0);
@@ -523,6 +543,19 @@ export class MediabunnyPlayer {
     return audioReady && videoReady;
   }
 
+  hasStartupBuffer(mediaTime) {
+    if (!this.hasDecodedStartupBuffer(mediaTime)) return false;
+    if (!this.hlsSegmentPrefetcher) return true;
+    const network = this.hlsSegmentPrefetcher.getStats();
+    if (!network.activePlaylistCount) return false;
+    const remainingSeconds = Number.isFinite(this.duration)
+      ? Math.max(0, this.duration - mediaTime)
+      : HLS_START_SECONDS;
+    const requiredSeconds = Math.min(HLS_START_SECONDS, remainingSeconds);
+    return network.bufferedAheadSeconds >= requiredSeconds
+      || (network.pendingSegments === 0 && network.bufferedAheadSeconds > 0);
+  }
+
   hasPlaybackSafetyMargin(mediaTime) {
     const audioSafe = !this.audioTrack
       || this.audioSeconds >= AUDIO_REBUFFER_SECONDS
@@ -530,7 +563,8 @@ export class MediabunnyPlayer {
     const videoSafe = !this.videoTrack
       || this.videoSecondsAhead(mediaTime) >= VIDEO_REBUFFER_SECONDS
       || this.videoEnded;
-    return audioSafe && videoSafe && !this.audioRing?.needsBuffering;
+    const unexpectedAudioUnderrun = this.audioRing?.needsBuffering && !this.audioEnded;
+    return audioSafe && videoSafe && !unexpectedAudioUnderrun;
   }
 
   enterPlaying() {
@@ -788,6 +822,11 @@ export class MediabunnyPlayer {
       bandwidth: hlsNetwork?.throughputKbps ? hlsNetwork.throughputKbps * 1000 : null,
       audioBufferedMs: Math.round(this.audioSeconds * 1000),
       videoBufferedMs: Math.round(this.videoSecondsAhead() * 1000),
+      audioSourceEnded: this.audioEnded,
+      videoSourceEnded: this.videoEnded,
+      durationDistanceMs: this.duration > 0
+        ? Math.round((this.duration - this.clock.currentTime) * 1000)
+        : null,
       hlsBufferedAheadSeconds: hlsNetwork?.bufferedAheadSeconds ?? null,
       hlsBufferedBytes: hlsNetwork?.cachedBytes ?? null,
       hlsCachedSegments: hlsNetwork?.cachedSegments ?? null,

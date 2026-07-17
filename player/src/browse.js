@@ -311,8 +311,9 @@ export async function loadBrowseScreen() {
     moviesSection.classList.add("hidden");
   }
 
-  if (showsRes.status === "fulfilled" && showsRes.value?.items?.length) {
-    renderCardRow(showsList, showsRes.value.items, { type: "plex-show" });
+  const shows = showsRes.status === "fulfilled" ? showsRes.value?.items || [] : [];
+  if (shows.length) {
+    renderCardRow(showsList, shows, { type: "plex-show" });
     showsSection.classList.remove("hidden");
     hasContent = true;
   } else {
@@ -330,6 +331,7 @@ export async function loadBrowseScreen() {
 
   // Reset episodes view
   episodesSection.classList.add("hidden");
+  return { shows };
 }
 
 // --- Playlist rendering ----------------------------------------------
@@ -702,14 +704,17 @@ export async function openEpisodes(show) {
       const grid = document.createElement("div");
       grid.className = "season-grid";
 
-      for (const ep of seasonEps) {
+      for (const [episodeIndex, ep] of seasonEps.entries()) {
         const el = document.createElement("div");
         el.className = "episode-card";
 
         const thumbUrl = ep.thumb ? `/api/plex/thumb?path=${encodeURIComponent(ep.thumb)}` : "";
         const thumbHtml = thumbUrl
-          ? `<img src="${thumbUrl}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'24\\' height=\\'24\\'><path d=\\'M8 5v14l11-7z\\'/></svg>'}))">`
-          : `<div class="browse-card-thumb-empty"><svg viewBox="0 0 24 24" fill="white" width="24" height="24"><path d="M8 5v14l11-7z"/></svg></div>`;
+          // Tesla Chromium can leave dynamically inserted lazy images dormant
+          // when the episodes section was hidden during layout. Episode lists
+          // are small and disk-cached, so eager loading is the reliable choice.
+          ? `<img src="${thumbUrl}" alt="" loading="eager" decoding="async" fetchpriority="${episodeIndex < 4 ? "high" : "low"}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty episode-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'currentColor\\' width=\\'28\\' height=\\'28\\'><path d=\\'M8 5v14l11-7z\\'/></svg><span>Preview unavailable</span>'}))">`
+          : `<div class="browse-card-thumb-empty episode-thumb-empty"><svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28"><path d="M8 5v14l11-7z"/></svg><span>Preview unavailable</span></div>`;
         const epWatched = ep.viewCount > 0;
         const epBadge = epWatched
           ? `<div class="watched-badge"><svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></div>`
