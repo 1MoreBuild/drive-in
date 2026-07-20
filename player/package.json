@@ -22,6 +22,6 @@
     "vite": "8.0.16"
   },
   "dependencies": {
-    "mediabunny": "1.50.8"
+    "mediabunny": "1.50.9"
   }
 }
