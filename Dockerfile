@@ -12,7 +12,7 @@ COPY player/ player/
 RUN npm run build -w player
 
 # Use an immutable Deno release image as the runtime source.
-FROM denoland/deno:alpine-2.8.1@sha256:a40c899f6aca244a3f0a116c05f6dec0a29f9898d2f004d60ec57c1514f87349 AS deno-runtime
+FROM denoland/deno:alpine-2.9.3@sha256:9d590d72116913ec9d73acb25112040fbffa657e33565075e7e71904b09e110e AS deno-runtime
 
 # Compile production-only native dependencies against the final glibc runtime.
 FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS production-deps
