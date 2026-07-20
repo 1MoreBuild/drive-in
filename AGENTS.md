@@ -21,7 +21,7 @@ npm run start                  # build and serve production app on :9090
 SERVE_SOURCE=1 npm run dev:server
 ```
 
-Node.js 20.19 or newer is required. Playback also needs `yt-dlp`, `ffmpeg`, and Deno. Cloudflared is optional.
+Node.js 22.12 or newer is required. Playback also needs `yt-dlp`, `ffmpeg`, and Deno. Cloudflared is optional.
 
 ## Code map
 

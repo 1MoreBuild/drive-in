@@ -23,7 +23,7 @@
     "yt-dlp"
   ],
   "engines": {
-    "node": ">=20.19"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "test": "npm test -w player && npm test -w server",
