@@ -1,11 +1,32 @@
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "fs/promises";
 import { createHash } from "crypto";
+import { execFile } from "child_process";
 import { Worker } from "worker_threads";
 import { extname, resolve } from "path";
 
 const TEXT_SUBTITLE_CODECS = new Set(["ass", "ssa", "srt", "subrip", "vtt", "webvtt"]);
 const MAX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 const SUBTITLE_CONVERSION_VERSION = 4;
+
+export function isEmbeddedPlexTextSubtitle(stream) {
+  return isPlexTextSubtitle(stream)
+    && !stream?.file
+    && !stream?.key
+    && typeof stream?.sourceFile === "string"
+    && Number.isInteger(Number(stream?.sourceStreamIndex))
+    && Number(stream.sourceStreamIndex) >= 0;
+}
+
+export function plexSubtitleStreamsForPart(part) {
+  return (part?.Stream || []).map((stream) => {
+    if (stream.streamType !== 3 || stream.file || stream.key || !part?.file) return stream;
+    return {
+      ...stream,
+      sourceFile: part.file,
+      sourceStreamIndex: Number(stream.index),
+    };
+  });
+}
 
 async function localSubtitleStats(stream) {
   const path = stream?.file;
@@ -30,6 +51,10 @@ export async function plexSubtitleVersionInfo(stream, { now = Date.now() } = {})
   const stats = await localSubtitleStats(stream);
   if (stats) {
     parts.push(stream.file, stats.size, stats.mtimeNs);
+  } else if (isEmbeddedPlexTextSubtitle(stream)) {
+    const sourceStats = await stat(stream.sourceFile, { bigint: true });
+    if (!sourceStats.isFile()) throw new Error("Embedded subtitle source is not a file");
+    parts.push("embedded", stream.sourceFile, stream.sourceStreamIndex, sourceStats.size, sourceStats.mtimeNs);
   } else {
     // Plex does not reliably expose validators for every remote/embedded text
     // stream. Revalidate these hourly instead of making them immutable forever.
@@ -37,7 +62,7 @@ export async function plexSubtitleVersionInfo(stream, { now = Date.now() } = {})
   }
   return {
     token: createHash("sha256").update(parts.map(String).join("\0")).digest("hex").slice(0, 16),
-    immutable: !!stats,
+    immutable: !!stats || isEmbeddedPlexTextSubtitle(stream),
   };
 }
 
@@ -57,6 +82,100 @@ export async function readPlexSubtitleFile(stream) {
     throw new Error(`Subtitle file is too large (${stats.size} bytes)`);
   }
   return readFile(path);
+}
+
+export function embeddedSubtitleFfmpegArgs(stream) {
+  if (!isEmbeddedPlexTextSubtitle(stream)) {
+    throw new Error("Subtitle is not an extractable embedded text stream");
+  }
+  const codec = String(stream.codec || stream.format || "").toLowerCase();
+  const output = codec === "ass" || codec === "ssa"
+    ? { codec: "ass", format: "ass" }
+    : codec === "srt" || codec === "subrip"
+      ? { codec: "srt", format: "srt" }
+      : codec === "vtt" || codec === "webvtt"
+        ? { codec: "webvtt", format: "webvtt" }
+        : null;
+  if (!output) throw new Error(`Unsupported embedded subtitle codec: ${codec || "unknown"}`);
+  return [
+    "-nostdin",
+    "-v", "error",
+    "-i", stream.sourceFile,
+    "-map", `0:${Number(stream.sourceStreamIndex)}`,
+    "-c:s", output.codec,
+    "-f", output.format,
+    "pipe:1",
+  ];
+}
+
+export function extractEmbeddedPlexSubtitle(stream, {
+  execFileImpl = execFile,
+  timeoutMs = 20 * 60_000,
+} = {}) {
+  const args = embeddedSubtitleFfmpegArgs(stream);
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFileImpl("ffmpeg", args, {
+      encoding: "buffer",
+      maxBuffer: MAX_SUBTITLE_BYTES,
+      timeout: timeoutMs,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = Buffer.from(stderr || "").toString("utf8").trim().slice(-500);
+        rejectPromise(new Error(detail || `Embedded subtitle extraction failed: ${error.message}`));
+        return;
+      }
+      const buffer = Buffer.from(stdout || "");
+      if (!buffer.length) {
+        rejectPromise(new Error("Embedded subtitle extraction returned no data"));
+        return;
+      }
+      resolvePromise(buffer);
+    });
+  });
+}
+
+export class SubtitleExtractionQueue {
+  constructor({ maxConcurrent = 1 } = {}) {
+    this.maxConcurrent = Math.max(1, Number(maxConcurrent) || 1);
+    this.active = 0;
+    this.pending = [];
+    this.tasks = new Map();
+  }
+
+  has(key) {
+    return this.tasks.has(key);
+  }
+
+  enqueue(key, task) {
+    const existing = this.tasks.get(key);
+    if (existing) return existing;
+
+    let resolveTask;
+    let rejectTask;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolveTask = resolvePromise;
+      rejectTask = rejectPromise;
+    });
+    this.tasks.set(key, promise);
+    this.pending.push({ key, task, resolveTask, rejectTask });
+    this.pump();
+    return promise;
+  }
+
+  pump() {
+    while (this.active < this.maxConcurrent && this.pending.length) {
+      const item = this.pending.shift();
+      this.active += 1;
+      Promise.resolve()
+        .then(item.task)
+        .then(item.resolveTask, item.rejectTask)
+        .finally(() => {
+          this.active -= 1;
+          this.tasks.delete(item.key);
+          this.pump();
+        });
+    }
+  }
 }
 
 export function decodeSubtitleBuffer(buffer) {
@@ -200,7 +319,7 @@ export function analyzeSubtitle(stream, buffer) {
   };
 }
 
-export function convertSubtitleInWorker(stream, buffer) {
+function convertSubtitleInWorker(stream, buffer) {
   return new Promise((resolvePromise, rejectPromise) => {
     const bytes = Uint8Array.from(buffer);
     const worker = new Worker(new URL("./plex-subtitle-worker.js", import.meta.url), {
@@ -348,7 +467,7 @@ export class PlexSubtitleCache {
     }
   }
 
-  async get(ratingKey, stream, loadBuffer, providedVersionInfo = null) {
+  async getCached(ratingKey, stream, providedVersionInfo = null) {
     await this.ready;
     const versionInfo = providedVersionInfo || await plexSubtitleVersionInfo(stream);
     const version = versionInfo.token;
@@ -361,11 +480,19 @@ export class PlexSubtitleCache {
     }
 
     const diskHit = await this.readDiskValue(key);
-    if (diskHit) {
-      const value = diskHit;
-      this.remember(key, value);
-      return { ...value, version, etag, immutable: versionInfo.immutable, source: "disk" };
-    }
+    if (!diskHit) return null;
+    this.remember(key, diskHit);
+    return { ...diskHit, version, etag, immutable: versionInfo.immutable, source: "disk" };
+  }
+
+  async get(ratingKey, stream, loadBuffer, providedVersionInfo = null) {
+    await this.ready;
+    const versionInfo = providedVersionInfo || await plexSubtitleVersionInfo(stream);
+    const version = versionInfo.token;
+    const key = this.cacheKey(ratingKey, stream, version);
+    const etag = `"drivein-subtitle-${version}"`;
+    const cached = await this.getCached(ratingKey, stream, versionInfo);
+    if (cached) return cached;
 
     if (this.inFlight.has(key)) {
       const value = await this.inFlight.get(key);

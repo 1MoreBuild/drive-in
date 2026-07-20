@@ -1,103 +1,95 @@
 # Drive-In
 
-In-car media player for Tesla vehicles. Mediabunny decodes with WebCodecs and Drive-In renders frames on `<canvas>` instead of `<video>`.
+Drive-In is a self-hosted media player for Tesla browsers. Mediabunny decodes media with WebCodecs and renders frames to `<canvas>` instead of a native `<video>` element.
 
-> **Disclaimer**
->
-> This project is an **educational and exploratory experiment** in human-vehicle interaction and in-car media experiences. It is not intended for production use or to encourage unsafe behavior.
->
-> - **Drive safely.** Only use this software while the vehicle is parked or by passengers. Never operate a vehicle while distracted. Always obey local traffic laws.
-> - **Respect copyright.** This project does not host, distribute, or encourage access to pirated or unauthorized content. Users are solely responsible for ensuring they have the legal right to access and play any media.
-> - **No affiliation.** This project is not affiliated with, endorsed by, or associated with Tesla, Inc. or Plex, Inc.
+> Use Drive-In only while parked or as a passenger. Obey local laws and only play media you are authorized to access. This project is not affiliated with Tesla or Plex.
 
 ## Features
 
-- **YouTube / Bilibili / HLS / MP4** — play almost any video URL via yt-dlp
-- **Plex integration** — browse and play your Plex library with adaptive quality, subtitle, and audio track selection
-- **Playback queue** — build an Up Next list from the browser or CLI and auto-play the next item
-- **Saved playlists** — import remote playlists, save reusable lists, and enqueue them on demand
-- **Canvas rendering** — WebCodecs frames rendered to `<canvas>` via [Mediabunny](https://github.com/Vanilagy/mediabunny)
-- **Dual subtitles** — display two subtitle languages simultaneously
-- **CLI control** — play, pause, stop, browse Plex, manage subtitles from the terminal
-- **Remote access** — Cloudflare Tunnel support for controlling from outside the local network
+- YouTube, Bilibili, HLS, and direct MP4 playback through yt-dlp
+- Plex browsing and fixed 720p playback with track selection
+- Canvas rendering with synchronized AudioWorklet playback
+- Dual browser-rendered subtitles
+- Queue, saved playlists, resume history, and CLI control
+- Optional Cloudflare Tunnel access
 
-## Architecture
+## How it works
 
+The browser sends playback requests to an Express server. The server resolves source URLs, proxies media through the same origin, and pushes player commands over WebSocket.
+
+| Source | Delivery path |
+|--------|---------------|
+| HLS | Rewritten same-origin manifest and segment proxy |
+| MP4 | Range-capable stream proxy |
+| Split video/audio | Generated fMP4 HLS over source byte ranges |
+| Plex | Proxied fixed 720p HLS transcode |
+
+The player decodes these streams with Mediabunny and WebCodecs, uses consumed AudioWorklet samples as its clock, and presents video frames on a canvas.
+
+## Requirements
+
+- Node.js 20.19 or newer
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [FFmpeg](https://ffmpeg.org/)
+- [Deno](https://deno.com/) for current YouTube extraction
+- Cloudflared only if using a tunnel
+
+On macOS:
+
+```bash
+brew install yt-dlp ffmpeg deno
 ```
-CLI / Browser UI
-        |
-        v  POST /api/play
-   Express server (port 9090)
-        |
-        +-- yt-dlp: resolve video URL, detect stream type
-        |    +-- HLS -> proxy with m3u8 URL rewriting
-        |    +-- Direct (mp4) -> raw stream proxy
-        |    +-- DASH split (Bilibili/YouTube) -> generate fMP4 HLS + proxy segments
-        |
-        +-- Plex integration (buffer-based adaptive HLS + segment retry/prefetch)
-        |
-        +-- WebSocket -> push play/pause/stop to player
-        |
-        +-- Static file server
-             +-- /lib/mediabunny/* -> Mediabunny ESM bundle
-             +-- /* -> player UI
 
-Tesla browser opens http://<server>/
-        |
-        +-- Mediabunny decodes with WebCodecs and renders on <canvas>
-```
-
-### Stream Types
-
-| Type | Example | How it works |
-|------|---------|-------------|
-| `hls` | `.m3u8` URLs, live streams | Proxy m3u8 + rewrite segment URLs for CORS |
-| `direct` | `.mp4` with audio+video | Raw stream proxy |
-| `dash_split` | Bilibili, YouTube | Probe MP4 `sidx`, generate fMP4 HLS, proxy segments |
-| `plex` | Plex library items | Adaptive HLS transcode via Plex server, proxied |
-
-## Prerequisites
-
-- **Node.js** >= 20.19
-- **yt-dlp** — `brew install yt-dlp`
-- **ffmpeg** — `brew install ffmpeg`
-- **Deno** — `brew install deno` (required by yt-dlp for YouTube)
-- **cloudflared** — `brew install cloudflared` (optional, for remote access from Tesla)
-
-## Quick Start
+## Run locally
 
 ```bash
 git clone https://github.com/1MoreBuild/drive-in.git
 cd drive-in
-cp .env.example .env          # configure environment variables (optional)
-npm install                    # install all workspaces
-npm run dev                    # start server + Vite at http://localhost:5173
+cp .env.example .env
+npm install
+npm run dev
 ```
 
-Open `http://localhost:5173` during development.
-
-### Other Modes
+Open `http://localhost:5173`. For the production build:
 
 ```bash
-npm run build                  # build player only (Vite production build)
-npm run start                  # build player + start production server on :9090
-npm run start -w server        # start server only (no tunnel, no build)
-npm run dev:remote             # dev server + Vite + temporary Cloudflare Tunnel
-npm run start:tunnel           # production server + configured named tunnel
-SERVE_SOURCE=1 npm run dev:server # serve source directly on :9090
+npm run start
 ```
 
-### Playback Engine
+Then open `http://localhost:9090`.
 
-Mediabunny is the only playback engine. It decodes audio and video with WebCodecs, presents frames on `<canvas>`, and uses consumed AudioWorklet samples as the master clock.
+Other useful commands:
 
-Mediabunny supports direct MP4, HLS, and separate video/audio MP4 sources. To test the A/V buffering barrier, open with:
-
-```text
-?videoStallAt=10&videoStallMs=15000
+```bash
+npm run dev:remote             # development with a temporary tunnel
+npm run start:tunnel           # production with a configured tunnel
+npm run check                  # tests and production build
 ```
 
-This pauses only video reads at media time 10s. Audio, video, and the presentation clock should stop together and resume from the same timestamp.
+## CLI
+
+The published CLI controls a running Drive-In server:
+
+```bash
+npx @drive-in/cli config set server http://your-server:9090
+npx @drive-in/cli play "https://www.youtube.com/watch?v=..."
+npx @drive-in/cli pause
+npx @drive-in/cli status
+```
+
+It also supports Plex, subtitles, audio tracks, queues, and playlists. Run `npx @drive-in/cli --help` for the current command list.
+
+## Plex
+
+Set `PLEX_URL` and `PLEX_TOKEN` in `.env`. On macOS, Drive-In can auto-detect a local Plex token when `PLEX_TOKEN` is unset.
+
+Plex transcodes video once at 720p and does not change bitrate during playback. This keeps the 90-second prefetch buffer intact. Plex also handles image-subtitle burn-in; Drive-In converts supported text subtitles to WebVTT and renders them in the browser.
+
+## Tesla and remote access
+
+The server sets the cross-origin isolation headers required by its SharedArrayBuffer audio path. The first tap unlocks audio because browsers block autoplay with sound.
+
+Drive-In does not authenticate HTTP, WebSocket, or proxy requests. Never expose it directly to the public internet. Put tunnels behind Cloudflare Access, a VPN, or another trusted access layer.
 
 ## Docker
 
@@ -106,141 +98,29 @@ docker build -t drive-in .
 docker run -p 9090:9090 --env-file .env drive-in
 ```
 
-Or with Docker Compose:
+Or:
 
 ```bash
+cp .env.example .env
 docker compose up
 ```
 
-The image includes Node.js, yt-dlp, ffmpeg, and Deno. See [`docker-compose.yml`](docker-compose.yml) for optional Cloudflare Tunnel configuration.
+## Configuration
 
-## CLI
+Copy [`.env.example`](.env.example) and edit the values you need. It documents Plex, bitrate, cache, port, logging, database, font, and fallback-transcode settings.
 
-The CLI is published as [`@drive-in/cli`](https://www.npmjs.com/package/@drive-in/cli) on npm. Use it to control a running Drive-In server from anywhere.
-
-```bash
-# Install globally, or use npx
-npx @drive-in/cli status
-
-# Or if you cloned the repo, just use:
-npx drivein status
-```
-
-### Configure server URL (once)
-
-```bash
-npx drivein config set server http://your-server:9090
-```
-
-Precedence: `--server` flag > `DRIVEIN_SERVER` env > config file > default (`localhost:9090`)
-
-### Commands
-
-```bash
-npx drivein play <url>          # play a video (YouTube, Bilibili, HLS, mp4)
-npx drivein queue add <url>     # add a URL to Up Next
-npx drivein queue list          # show queued items
-npx drivein queue next          # play the next queued item now
-npx drivein playlist import <url> # import a YouTube/Bilibili playlist
-npx drivein playlist enqueue <id> # add a saved playlist to Up Next
-npx drivein pause               # pause playback
-npx drivein resume              # resume playback
-npx drivein stop                # stop playback
-npx drivein status              # show current status
-
-# Subtitles
-npx drivein subs                # list available subtitles
-npx drivein sub en zh           # enable English + Chinese subs
-
-# Plex
-npx drivein plex movies         # list Plex movies
-npx drivein plex shows          # list Plex TV shows
-npx drivein plex search <query> # search Plex library
-npx drivein plex play <id>      # play a Plex item by rating key
-npx drivein queue plex <id>     # add a Plex item to Up Next
-
-# Output modes
-npx drivein --json status       # JSON output for scripting
-npx drivein --quiet play <url>  # suppress output (errors only)
-npx drivein --no-color status   # disable colored output
-```
-
-## Plex Setup
-
-1. Set `PLEX_URL` (default: `http://localhost:32400`) and `PLEX_TOKEN` in your `.env` file
-2. On macOS, the Plex token is auto-detected from system defaults if not set
-3. Browse and play:
-
-```bash
-npx drivein plex movies         # list movies
-npx drivein plex play 12345     # play by rating key
-```
-
-Text-based Plex subtitles (ASS/SSA, SRT, and WebVTT) are converted once, cached as WebVTT, and rendered by the browser. Image subtitles such as PGS are burned in by Plex. If text conversion fails, playback falls back to Plex burn-in.
-
-## Tesla Browser Notes
-
-- **SharedArrayBuffer** is required — the server sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: credentialless` headers automatically
-- **Audio autoplay** — the player starts muted due to browser restrictions; tap anywhere to unmute
-- **Cloudflare Tunnel** is useful for Tesla access, but Drive-In has no built-in authentication. Protect public deployments with Cloudflare Access or an equivalent policy.
+CLI server selection follows this order: `--server`, `DRIVEIN_SERVER`, the CLI config file, then `http://localhost:9090`.
 
 ## Diagnostics
 
-- `/diag.html` checks the browser features required by the Mediabunny player.
-- `/metrics.html` shows current proxy, buffering, and player metrics.
+- `/diag.html` checks required browser capabilities.
+- `/metrics.html` shows current delivery and player health metrics.
+- `/api/health` reports process and connection health.
 
-## Project Structure
+## Development
 
-```
-drive-in/              (npm workspaces monorepo)
-+-- server/            Express + WebSocket + yt-dlp + Plex + proxy
-|   +-- index.js       Main server, all route/proxy/pipeline logic
-|   +-- logger.js      Pino logger setup
-|   +-- queue-store.js SQLite queue and playlist storage
-+-- player/            Browser frontend (Vite build for prod, source for dev)
-|   +-- index.html     Import map for Mediabunny source-mode development
-|   +-- vite.config.js Vite config for production build
-|   +-- src/
-|       +-- engine/    Mediabunny decoder, audio ring buffer, presentation clock
-|       +-- main.js    WebSocket, routing, audio unlock, controls
-|       +-- style.css  Canvas player and browse UI
-+-- cli/               CLI tool
-|   +-- bin/drivein.js Commander-based CLI
-+-- skills/            Claude Code skill definitions
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PLEX_URL` | `http://localhost:32400` | Plex server URL |
-| `PLEX_TOKEN` | (auto-detected on macOS) | Plex authentication token |
-| `PLEX_ABR_BITRATES` | `3000,5000,8000` | Plex adaptive bitrate ladder in Kbps; rung changes adjust bitrate while retaining the 1080p resolution ceiling |
-| `PORT` | `9090` | HTTP and WebSocket port |
-| `LOG_LEVEL` | `info` in production | Pino log level |
-| `DRIVEIN_DB` | `.drive-in.sqlite` | Queue and playlist database path |
-| `SEGMENT_CACHE_MAX_BYTES` | `21474836480` | Maximum split-stream segment cache size |
-| `STREAM_MAX_VIDEO_BITRATE_KBPS` | `4800` | Maximum selected video bitrate for YouTube and Bilibili. Selection prefers 50/60 fps, defaults to 720p in the normal Tesla window, and switches to 1080p when the effective fullscreen viewport is wide enough. |
-| `DASH_TRANSCODE` | disabled | Set to `1` to prefer the ffmpeg split-stream fallback |
-| `DRIVEIN_SERVER` | `http://localhost:9090` | CLI remote server URL |
-| `SERVE_SOURCE` | — | Set to `1` for dev mode (serve player source) |
-
-See [`.env.example`](.env.example) for a template.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and PR guidelines.
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+Run `npm run check` before submitting changes. See [CONTRIBUTING.md](CONTRIBUTING.md) for the short contribution guide and [RELEASING.md](RELEASING.md) for CLI releases.
 
 ## License
 
-[MIT License](LICENSE)
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party dependency licenses.
-
----
-
-*Not affiliated with Tesla, Inc. or Plex, Inc.*
+[MIT](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

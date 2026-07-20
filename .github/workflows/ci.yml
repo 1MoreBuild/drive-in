@@ -29,11 +29,8 @@ jobs:
 
       - run: npm ci
 
-      - name: Test player
-        run: npm test
-
-      - name: Build player
-        run: npm run build -w player
+      - name: Test and build
+        run: npm run check
 
       - name: Verify production pages
         run: test -f player/dist/index.html && test -f player/dist/diag.html && test -f player/dist/metrics.html

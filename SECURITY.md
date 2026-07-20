@@ -27,9 +27,12 @@ The following are in scope for security reports:
 
 ## Security Design
 
-- WebSocket `updateState` only accepts the `status` field from player clients (sanitized)
+- WebSocket connections require the same origin and the `player` role; player status and progress messages are schema-validated
+- Subtitle files are served only from a canonical cache root with allowlisted path components
+- External thumbnail fetches block private and special-use networks on every redirect and enforce time, type, and size limits
+- Plex credentials stay server-side; clients receive token-free proxy URLs
 - HTTP APIs, WebSocket control, and proxy endpoints do not currently have application-level authentication
 - Public deployments must add an access layer such as Cloudflare Access, a VPN, or a trusted-network firewall
-- yt-dlp commands have a 30-second timeout to prevent hanging
+- yt-dlp commands have a 30-second timeout and superseded playback resolutions are aborted
 - Environment variables are used for all secrets (Plex tokens, API keys)
 - No secrets are stored in the codebase

@@ -1,5 +1,5 @@
 const SEGMENT_PATTERN = /\.(?:m4s|mp4|ts)(?:[?#]|$)/i;
-const PLAYLIST_PATTERN = /\.m3u8(?:[?#]|$)/i;
+const PLAYLIST_PATTERN = /(?:\.m3u8|\/api\/proxy\/hls)(?:[?#]|$)/i;
 
 function requestUrl(input) {
   if (typeof input === "string") return new URL(input, location.href).href;
@@ -111,18 +111,34 @@ export class HlsSegmentPrefetcher {
 
   updatePlaylist(body, playlistUrl) {
     const segments = [];
-    let pendingDuration = 0;
+    let pendingDuration = null;
+    let liveDvrStartTime = null;
+    let liveEdgeTime = null;
+    let livePlayStartTime = null;
     for (const rawLine of body.split(/\r?\n/)) {
       const line = rawLine.trim();
-      if (line.startsWith("#EXTINF:")) {
+      if (line.startsWith("#EXT-X-DRIVE-IN-DVR-START:")) {
+        const value = Number(line.slice("#EXT-X-DRIVE-IN-DVR-START:".length));
+        if (Number.isFinite(value)) liveDvrStartTime = value;
+      } else if (line.startsWith("#EXT-X-DRIVE-IN-LIVE-EDGE:")) {
+        const value = Number(line.slice("#EXT-X-DRIVE-IN-LIVE-EDGE:".length));
+        if (Number.isFinite(value)) liveEdgeTime = value;
+      } else if (line.startsWith("#EXT-X-DRIVE-IN-PLAY-START:")) {
+        const value = Number(line.slice("#EXT-X-DRIVE-IN-PLAY-START:".length));
+        if (Number.isFinite(value)) livePlayStartTime = value;
+      } else if (line.startsWith("#EXTINF:")) {
         const duration = Number(line.slice("#EXTINF:".length).split(",", 1)[0]);
-        pendingDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
-      } else if (line && !line.startsWith("#") && SEGMENT_PATTERN.test(line)) {
+        pendingDuration = Number.isFinite(duration) && duration >= 0 ? duration : null;
+      } else if (
+        line
+        && !line.startsWith("#")
+        && (pendingDuration !== null || SEGMENT_PATTERN.test(line))
+      ) {
         segments.push({
           url: new URL(line, playlistUrl).href,
-          duration: pendingDuration || 5,
+          duration: pendingDuration ?? 5,
         });
-        pendingDuration = 0;
+        pendingDuration = null;
       }
     }
     if (!segments.length) return;
@@ -168,6 +184,10 @@ export class HlsSegmentPrefetcher {
       segments,
       currentUrl: previous?.currentUrl || null,
       currentIndex: previous?.currentUrl ? nextIndexes.get(previous.currentUrl) ?? -1 : -1,
+      liveDvrStartTime,
+      liveEdgeTime,
+      livePlayStartTime,
+      liveEdgeObservedAt: performance.now(),
     };
     this.playlists.set(playlistUrl, playlist);
     for (const [url, index] of nextIndexes) {
@@ -259,7 +279,7 @@ export class HlsSegmentPrefetcher {
     const startedAt = performance.now();
     try {
       const response = await globalThis.fetch(url, {
-        headers: { Range: "bytes=0-" },
+        headers: { Range: "bytes=0-", "X-Drive-In-Prefetch": "1" },
         priority: "low",
         signal: controller.signal,
       });
@@ -362,6 +382,20 @@ export class HlsSegmentPrefetcher {
       .filter((entry) => entry.state === "ready").length;
     this.updateCachePeaks(bufferedAheadSeconds);
     const managedBytesEstimate = cachedBytes + this.pendingEstimatedBytes;
+    const livePlaylists = activePlaylists.filter((playlist) => (
+      Number.isFinite(playlist.liveDvrStartTime) && Number.isFinite(playlist.liveEdgeTime)
+    ));
+    const liveDvrStartTime = livePlaylists.length
+      ? Math.min(...livePlaylists.map((playlist) => playlist.liveDvrStartTime))
+      : null;
+    const liveEdgeTime = livePlaylists.length
+      ? Math.max(...livePlaylists.map((playlist) => (
+          playlist.liveEdgeTime + Math.max(0, performance.now() - playlist.liveEdgeObservedAt) / 1000
+        )))
+      : null;
+    const livePlayStartTime = livePlaylists.length
+      ? Math.max(...livePlaylists.map((playlist) => playlist.livePlayStartTime || playlist.liveDvrStartTime))
+      : null;
     return {
       throughputKbps: throughputBps ? Math.round(throughputBps / 1000) : 0,
       sampleCount: this.throughputSamples.length,
@@ -383,6 +417,9 @@ export class HlsSegmentPrefetcher {
       playlistStats,
       completedDownloads: this.completedDownloads,
       lastDownload: this.lastDownload || null,
+      liveDvrStartTime,
+      liveEdgeTime,
+      livePlayStartTime,
     };
   }
 

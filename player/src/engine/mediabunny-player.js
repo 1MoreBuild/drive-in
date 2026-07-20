@@ -8,7 +8,7 @@ import {
 import { AudioRingBuffer } from "./audio-ring-buffer.js";
 import { HlsSegmentPrefetcher } from "./hls-segment-prefetcher.js";
 import { getPlaybackEndReason } from "./playback-end.js";
-import { PresentationClock } from "./presentation-clock.js";
+import { estimateAudioOutputLatencySeconds, PresentationClock } from "./presentation-clock.js";
 
 const AUDIO_CAPACITY_SECONDS = 3;
 const AUDIO_START_SECONDS = 0.75;
@@ -72,6 +72,7 @@ export class MediabunnyPlayer {
     onError = () => {},
     onAbrSwitch = async () => null,
     faultInjection = null,
+    hlsStartSeconds = HLS_START_SECONDS,
   }) {
     this.container = container;
     this.onStateChange = onStateChange;
@@ -81,6 +82,7 @@ export class MediabunnyPlayer {
     this.onError = onError;
     this.onAbrSwitch = onAbrSwitch;
     this.faultInjection = faultInjection;
+    this.hlsStartSeconds = clamp(Number(hlsStartSeconds) || HLS_START_SECONDS, 1, HLS_START_SECONDS);
 
     this.input = null;
     this.inputs = [];
@@ -105,6 +107,7 @@ export class MediabunnyPlayer {
     this.state = "idle";
     this.wantsPlayback = false;
     this.duration = 0;
+    this.isLive = false;
     this.firstTimestamp = 0;
     this.videoQueue = [];
     this.videoQueueCapacity = VIDEO_QUEUE_MIN_CAPACITY;
@@ -147,6 +150,7 @@ export class MediabunnyPlayer {
       throw new Error("Mediabunny engine requires COOP/COEP and SharedArrayBuffer");
     }
     this.setState("loading");
+    this.isLive = Boolean(isLive);
     if (source?.type === "split-mp4") {
       const videoInput = this.createInput(source.videoUrl, { boundedRanges: true });
       const audioInput = this.createInput(source.audioUrl, { boundedRanges: true });
@@ -224,7 +228,9 @@ export class MediabunnyPlayer {
       this.audioSink = new AudioBufferSink(this.audioTrack);
     }
 
-    const initialTime = clamp(startTime || this.firstTimestamp, this.firstTimestamp, this.duration || Infinity);
+    const liveTimeline = this.getLiveTimeline();
+    const requestedInitialTime = startTime || liveTimeline?.playStartTime || this.firstTimestamp;
+    const initialTime = clamp(requestedInitialTime, this.firstTimestamp, this.duration || Infinity);
     await this.restartProducers(initialTime);
     this.setState("paused");
     return this;
@@ -401,7 +407,7 @@ export class MediabunnyPlayer {
     return this.play();
   }
 
-  async seek(milliseconds) {
+  async seek(milliseconds, { preserveHlsBuffer = false } = {}) {
     const seconds = typeof milliseconds === "bigint"
       ? Number(milliseconds) / 1000
       : Number(milliseconds) / 1000;
@@ -409,7 +415,7 @@ export class MediabunnyPlayer {
     this.audioRing?.setRunning(false);
     this.clock.stop();
     this.setState("seeking");
-    this.hlsSegmentPrefetcher?.handleSeek();
+    if (!preserveHlsBuffer) this.hlsSegmentPrefetcher?.handleSeek();
     await this.restartProducers(target);
     if (this.wantsPlayback) this.enterBuffering("seek");
     else this.setState("paused");
@@ -453,8 +459,9 @@ export class MediabunnyPlayer {
     this.animationFrame = requestAnimationFrame(this.renderFrame);
 
     const mediaTime = this.clock.currentTime;
+    const videoPresentationTime = this.getVideoPresentationTime(mediaTime);
     this.maybeTriggerScheduledFault(mediaTime);
-    this.renderVideo(mediaTime);
+    this.renderVideo(videoPresentationTime);
     const endReason = this.wantsPlayback ? getPlaybackEndReason({
       duration: this.duration,
       mediaTime,
@@ -463,7 +470,8 @@ export class MediabunnyPlayer {
       audioEnded: this.audioEnded,
       videoEnded: this.videoEnded,
       audioBufferedSeconds: this.audioSeconds,
-      videoBufferedSeconds: this.videoSecondsAhead(mediaTime),
+      videoBufferedSeconds: this.videoSecondsAhead(videoPresentationTime),
+      ignoreDurationBoundary: this.isLive,
     }) : null;
     if (endReason && this.state !== "ended") {
       this.finishPlayback(endReason);
@@ -531,11 +539,12 @@ export class MediabunnyPlayer {
   }
 
   hasDecodedStartupBuffer(mediaTime) {
+    const videoPresentationTime = this.getVideoPresentationTime(mediaTime);
     const audioReady = !this.audioTrack
       || this.audioSeconds >= AUDIO_START_SECONDS
       || (this.audioEnded && this.audioRing.availableFrames > 0);
     const videoReady = !this.videoTrack
-      || this.videoSecondsAhead(mediaTime) >= VIDEO_START_SECONDS
+      || this.videoSecondsAhead(videoPresentationTime) >= VIDEO_START_SECONDS
       // A high-frame-rate stream can hit the strict memory cap before reaching
       // the time target. A full queue is still enough decoded work to start.
       || this.videoQueue.length >= this.videoQueueCapacity
@@ -548,20 +557,22 @@ export class MediabunnyPlayer {
     if (!this.hlsSegmentPrefetcher) return true;
     const network = this.hlsSegmentPrefetcher.getStats();
     if (!network.activePlaylistCount) return false;
-    const remainingSeconds = Number.isFinite(this.duration)
+    const requiredStartSeconds = this.hlsStartSeconds || HLS_START_SECONDS;
+    const remainingSeconds = !this.isLive && Number.isFinite(this.duration)
       ? Math.max(0, this.duration - mediaTime)
-      : HLS_START_SECONDS;
-    const requiredSeconds = Math.min(HLS_START_SECONDS, remainingSeconds);
+      : requiredStartSeconds;
+    const requiredSeconds = Math.min(requiredStartSeconds, remainingSeconds);
     return network.bufferedAheadSeconds >= requiredSeconds
       || (network.pendingSegments === 0 && network.bufferedAheadSeconds > 0);
   }
 
   hasPlaybackSafetyMargin(mediaTime) {
+    const videoPresentationTime = this.getVideoPresentationTime(mediaTime);
     const audioSafe = !this.audioTrack
       || this.audioSeconds >= AUDIO_REBUFFER_SECONDS
       || this.audioEnded;
     const videoSafe = !this.videoTrack
-      || this.videoSecondsAhead(mediaTime) >= VIDEO_REBUFFER_SECONDS
+      || this.videoSecondsAhead(videoPresentationTime) >= VIDEO_REBUFFER_SECONDS
       || this.videoEnded;
     const unexpectedAudioUnderrun = this.audioRing?.needsBuffering && !this.audioEnded;
     return audioSafe && videoSafe && !unexpectedAudioUnderrun;
@@ -589,6 +600,17 @@ export class MediabunnyPlayer {
     const last = this.videoQueue[this.videoQueue.length - 1];
     if (!last) return 0;
     return Math.max(0, last.timestamp + last.duration - mediaTime);
+  }
+
+  getAudioOutputLatencySeconds() {
+    return estimateAudioOutputLatencySeconds(this.audioContext);
+  }
+
+  getVideoPresentationTime(mediaTime = this.clock.currentTime) {
+    return Math.max(
+      this.firstTimestamp,
+      mediaTime - this.getAudioOutputLatencySeconds(),
+    );
   }
 
   get audioSeconds() {
@@ -798,21 +820,38 @@ export class MediabunnyPlayer {
     return this.state;
   }
 
+  getLiveTimeline() {
+    if (!this.isLive) return null;
+    const stats = this.hlsSegmentPrefetcher?.getStats();
+    if (!Number.isFinite(stats?.liveDvrStartTime) || !Number.isFinite(stats?.liveEdgeTime)) return null;
+    return {
+      startTime: stats.liveDvrStartTime,
+      edgeTime: stats.liveEdgeTime,
+      playStartTime: stats.livePlayStartTime,
+    };
+  }
+
   getStats() {
     const currentTimeMs = Math.round(this.clock.currentTime * 1000);
+    const audioOutputLatencyMs = Math.round(this.getAudioOutputLatencySeconds() * 1000);
+    const videoPresentationTime = this.getVideoPresentationTime();
     const hlsNetwork = this.hlsSegmentPrefetcher?.getStats() || null;
     return {
       audioFrameRenderCount: this.audioRing
         ? Math.floor(this.audioRing.consumedFrames / 128)
         : 0,
       audioCurrentTime: currentTimeMs,
+      audibleAudioCurrentTime: currentTimeMs - audioOutputLatencyMs,
+      audioOutputLatencyMs,
       audioNextTime: currentTimeMs + Math.round(this.audioSeconds * 1000),
       audioStutter: this.audioRing?.underrunCount || 0,
       videoFrameDecodeCount: this.videoDecodeCount,
       videoFrameRenderCount: this.videoRenderCount,
       videoFrameDropCount: this.videoDropCount,
       videoCurrentTime: Math.round(this.lastRenderedTimestamp * 1000),
-      videoNextTime: currentTimeMs + Math.round(this.videoSecondsAhead() * 1000),
+      videoNextTime: Math.round(
+        (videoPresentationTime + this.videoSecondsAhead(videoPresentationTime)) * 1000,
+      ),
       videoStutter: this.videoStutterCount,
       audiocodec: this.audioCodec,
       videocodec: this.videoCodec,
@@ -821,7 +860,7 @@ export class MediabunnyPlayer {
       engine: "mediabunny",
       bandwidth: hlsNetwork?.throughputKbps ? hlsNetwork.throughputKbps * 1000 : null,
       audioBufferedMs: Math.round(this.audioSeconds * 1000),
-      videoBufferedMs: Math.round(this.videoSecondsAhead() * 1000),
+      videoBufferedMs: Math.round(this.videoSecondsAhead(videoPresentationTime) * 1000),
       audioSourceEnded: this.audioEnded,
       videoSourceEnded: this.videoEnded,
       durationDistanceMs: this.duration > 0
@@ -839,6 +878,12 @@ export class MediabunnyPlayer {
       hlsManagedBytesEstimate: hlsNetwork?.managedBytesEstimate ?? null,
       hlsPeakManagedBytesEstimate: hlsNetwork?.peakManagedBytesEstimate ?? null,
       hlsBufferByteCapHitCount: hlsNetwork?.byteCapHitCount ?? null,
+      liveDvrStartTime: hlsNetwork?.liveDvrStartTime ?? null,
+      liveEdgeTime: hlsNetwork?.liveEdgeTime ?? null,
+      livePlayStartTime: hlsNetwork?.livePlayStartTime ?? null,
+      liveLatencyMs: Number.isFinite(hlsNetwork?.liveEdgeTime)
+        ? Math.max(0, Math.round((hlsNetwork.liveEdgeTime - this.clock.currentTime) * 1000))
+        : null,
       abrCurrentBitrate: this.abr?.currentBitrate || null,
       abrAdvertisedBitrate: this.abr?.advertisedBitrate || null,
       abrLastDecision: this.abr?.lastDecision || null,

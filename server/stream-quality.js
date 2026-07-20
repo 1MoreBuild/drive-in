@@ -1,6 +1,6 @@
 export const WINDOWED_TARGET_HEIGHT = 720;
 export const FULLSCREEN_TARGET_HEIGHT = 1080;
-export const FULLSCREEN_VIDEO_WIDTH_THRESHOLD = 1600;
+const FULLSCREEN_VIDEO_WIDTH_THRESHOLD = 1600;
 
 export function normalizeTargetHeight(value) {
   return Number(value) >= FULLSCREEN_TARGET_HEIGHT

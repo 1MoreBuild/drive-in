@@ -7,7 +7,9 @@ const app = document.getElementById("app");
 const btnCenterPlay = document.getElementById("btn-center-play");
 const btnVolume = document.getElementById("btn-volume");
 const timeCurrent = document.getElementById("time-current");
+const timeSep = document.getElementById("time-sep");
 const timeDuration = document.getElementById("time-duration");
+const btnLiveEdge = document.getElementById("btn-live-edge");
 const progressWrap = document.getElementById("progress-wrap");
 const progressPlayed = document.getElementById("progress-played");
 const progressScrubber = document.getElementById("progress-scrubber");
@@ -17,8 +19,6 @@ const btnSubs = document.getElementById("btn-subs");
 const subsPanel = document.getElementById("subs-panel");
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
-const audioGainSlider = document.getElementById("audio-gain-slider");
-const audioGainValue = document.getElementById("audio-gain-value");
 export const mediaTitle = document.getElementById("media-title");
 
 // --- Controls visibility (auto-hide) ---------------------------------
@@ -43,19 +43,44 @@ function hideControls() {
 let lastCurrentTimeText = "";
 let lastDurationText = "";
 let lastProgressPct = "";
+// Compensate for WebCodecs seek warm-up by targeting a real segment from the
+// bounded future runway exposed by the HLS proxy.
+const LIVE_SEEK_LEAD_SECONDS = 11;
 
 export function updateTimeDisplay() {
-  const nextCurrentTimeText = fmt(state.currentTime);
-  const nextDurationText = fmt(state.duration);
+  const hasLiveTimeline = state.isLive
+    && state.liveDvrAvailable
+    && state.liveEdgeTime > state.liveStartTime;
+  const liveLatency = hasLiveTimeline ? state.liveEdgeTime - state.currentTime : Infinity;
+  const atLiveEdge = liveLatency <= 10;
+  const nextCurrentTimeText = state.isLive
+    ? hasLiveTimeline && !atLiveEdge
+      ? fmt(Math.max(0, state.currentTime - state.liveStartTime))
+      : ""
+    : fmt(state.currentTime);
+  const nextDurationText = state.isLive ? "" : fmt(state.duration);
 
-  if (nextCurrentTimeText !== lastCurrentTimeText) {
+  if (nextCurrentTimeText !== lastCurrentTimeText || timeCurrent.textContent !== nextCurrentTimeText) {
     lastCurrentTimeText = nextCurrentTimeText;
     timeCurrent.textContent = nextCurrentTimeText;
   }
-  if (nextDurationText !== lastDurationText) {
+  if (nextDurationText !== lastDurationText || timeDuration.textContent !== nextDurationText) {
     lastDurationText = nextDurationText;
     timeDuration.textContent = nextDurationText;
   }
+  timeSep.classList.toggle("hidden", state.isLive);
+  btnLiveEdge.classList.toggle("hidden", !state.isLive);
+  btnLiveEdge.disabled = atLiveEdge;
+  btnLiveEdge.classList.toggle("at-edge", atLiveEdge);
+
+  const seekStart = hasLiveTimeline ? state.liveStartTime : 0;
+  const seekEnd = hasLiveTimeline ? state.liveEdgeTime : state.duration;
+  progressWrap.setAttribute("aria-valuemin", "0");
+  progressWrap.setAttribute("aria-valuemax", String(Math.max(0, Math.round(seekEnd - seekStart))));
+  progressWrap.setAttribute("aria-valuenow", String(Math.max(0, Math.round(state.currentTime - seekStart))));
+  progressWrap.setAttribute("aria-valuetext", state.isLive
+    ? atLiveEdge ? "Live" : `${fmt(Math.max(0, state.currentTime - seekStart))} from start`
+    : `${fmt(state.currentTime)} of ${fmt(state.duration)}`);
 }
 
 export function updateProgress(fraction) {
@@ -77,13 +102,6 @@ export function updatePlayButton() {
 
 export function updateVolumeButton() {
   btnVolume.classList.toggle("muted", state.isMuted);
-}
-
-export function updateAudioGainUI() {
-  if (!audioGainSlider || !audioGainValue) return;
-  const gain = Number(state.audioGain || 2);
-  audioGainSlider.value = String(gain);
-  audioGainValue.textContent = `${gain.toFixed(1)}x`;
 }
 
 // --- Buffering state -------------------------------------------------
@@ -116,7 +134,7 @@ export function isDraggingProgress() {
   return isDragging;
 }
 
-export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVolume, onSetAudioGain }) {
+export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVolume }) {
   // Pointer movement shows controls
   app.addEventListener("pointermove", showControls);
   app.addEventListener("pointerdown", showControls);
@@ -141,17 +159,25 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     updateVolumeButton();
   });
 
-  if (audioGainSlider) {
-    for (const eventName of ["click", "pointerdown"]) {
-      audioGainSlider.addEventListener(eventName, (e) => e.stopPropagation());
-    }
-    audioGainSlider.addEventListener("input", (e) => {
-      const gain = Number(e.target.value);
-      onSetAudioGain(gain);
-      updateAudioGainUI();
-      showControls();
-    });
-  }
+  btnLiveEdge.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (!state.isLive || btnLiveEdge.disabled) return;
+    onSeekToTime(state.liveEdgeTime + LIVE_SEEK_LEAD_SECONDS);
+  });
+
+  progressWrap.addEventListener("keydown", (e) => {
+    if (state.isLive && !state.liveDvrAvailable) return;
+    let target = null;
+    if (e.key === "ArrowLeft") target = state.currentTime - 5;
+    if (e.key === "ArrowRight") target = state.currentTime + 5;
+    if (e.key === "Home") target = state.isLive ? state.liveStartTime : 0;
+    if (e.key === "End") target = state.isLive
+      ? state.liveEdgeTime + LIVE_SEEK_LEAD_SECONDS
+      : state.duration;
+    if (target == null) return;
+    e.preventDefault();
+    onSeekToTime(Math.max(state.isLive ? state.liveStartTime : 0, target));
+  });
 
   // Subtitle panel toggle
   btnSubs.addEventListener("click", (e) => {
@@ -218,12 +244,15 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
   progressWrap.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (state.isLive && !state.liveDvrAvailable) return;
     isDragging = true;
     progressWrap.classList.add("dragging");
     progressWrap.setPointerCapture(e.pointerId);
     const frac = getSeekFraction(e);
     updateProgress(frac);
-    state.currentTime = frac * state.duration;
+    state.currentTime = state.isLive
+      ? state.liveStartTime + frac * (state.liveEdgeTime - state.liveStartTime)
+      : frac * state.duration;
     updateTimeDisplay();
   });
 
@@ -231,7 +260,9 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     if (!isDragging) return;
     const frac = getSeekFraction(e);
     updateProgress(frac);
-    state.currentTime = frac * state.duration;
+    state.currentTime = state.isLive
+      ? state.liveStartTime + frac * (state.liveEdgeTime - state.liveStartTime)
+      : frac * state.duration;
     updateTimeDisplay();
     showControls();
   });
@@ -240,7 +271,10 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     if (!isDragging) return;
     isDragging = false;
     progressWrap.classList.remove("dragging");
-    onSeekToTime(getSeekFraction(e) * state.duration);
+    const fraction = getSeekFraction(e);
+    onSeekToTime(state.isLive
+      ? state.liveStartTime + fraction * (state.liveEdgeTime - state.liveStartTime)
+      : fraction * state.duration);
   });
 
   progressWrap.addEventListener("pointercancel", () => {
@@ -248,5 +282,4 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     progressWrap.classList.remove("dragging");
   });
 
-  updateAudioGainUI();
 }

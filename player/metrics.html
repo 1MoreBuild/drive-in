@@ -138,10 +138,10 @@
       <h2>Decode Info</h2>
       <div class="row"><span class="label">Decode Path</span><span class="value" id="decode-path">--</span></div>
       <div class="row"><span class="label">Dropped Frames</span><span class="value" id="dropped-frames">--</span></div>
-      <div class="row"><span class="label">WebCodecs</span><span class="value" id="has-webcodecs">--</span></div>
-      <div class="row"><span class="label">Hardware Decoder</span><span class="value" id="has-hw-decoder">--</span></div>
-      <div class="row"><span class="label">Worker Decode</span><span class="value" id="worker-decode">--</span></div>
-      <div class="row"><span class="label">Tesla-like Env</span><span class="value" id="tesla-env">--</span></div>
+      <div class="row"><span class="label">VideoDecoder API</span><span class="value" id="has-video-decoder">--</span></div>
+      <div class="row"><span class="label">AudioDecoder API</span><span class="value" id="has-audio-decoder">--</span></div>
+      <div class="row"><span class="label">AudioWorklet API</span><span class="value" id="has-audio-worklet">--</span></div>
+      <div class="row"><span class="label">Cross-origin Isolated</span><span class="value" id="cross-origin-isolated">--</span></div>
     </section>
   </div>
 
@@ -294,10 +294,10 @@ function renderMetrics(data) {
 
   setValue("decode-path", player.decodePath || "--", player.decodePath ? "info" : "muted");
   setValue("dropped-frames", player.droppedFrames == null ? "--" : String(player.droppedFrames), droppedFramesClass(player.droppedFrames));
-  setValue("has-webcodecs", capability.hasWebCodecs ? "Yes" : "No", capability.hasWebCodecs == null ? "muted" : booleanClass(capability.hasWebCodecs));
-  setValue("has-hw-decoder", capability.hasVideoDecoder ? "Yes" : "No", capability.hasVideoDecoder == null ? "muted" : booleanClass(capability.hasVideoDecoder));
-  setValue("worker-decode", capability.enableWorker ? "Yes" : "No", capability.enableWorker == null ? "muted" : booleanClass(capability.enableWorker));
-  setValue("tesla-env", capability.teslaLikeEnv ? "Yes" : "No", capability.teslaLikeEnv == null ? "muted" : capability.teslaLikeEnv ? "warn" : "ok");
+  setValue("has-video-decoder", capability.hasVideoDecoder ? "Yes" : "No", capability.hasVideoDecoder == null ? "muted" : booleanClass(capability.hasVideoDecoder));
+  setValue("has-audio-decoder", capability.hasAudioDecoder ? "Yes" : "No", capability.hasAudioDecoder == null ? "muted" : booleanClass(capability.hasAudioDecoder));
+  setValue("has-audio-worklet", capability.hasAudioWorklet ? "Yes" : "No", capability.hasAudioWorklet == null ? "muted" : booleanClass(capability.hasAudioWorklet));
+  setValue("cross-origin-isolated", capability.crossOriginIsolated ? "Yes" : "No", capability.crossOriginIsolated == null ? "muted" : booleanClass(capability.crossOriginIsolated));
 }
 
 async function refresh() {

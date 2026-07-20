@@ -16,6 +16,20 @@ test("finishes when the advertised duration boundary is reached", () => {
   }), "duration-boundary");
 });
 
+test("live playback ignores the temporary playlist duration boundary", () => {
+  assert.equal(getPlaybackEndReason({
+    duration: 1784504669.105,
+    mediaTime: 1784504669.105,
+    hasAudio: true,
+    hasVideo: true,
+    audioEnded: false,
+    videoEnded: false,
+    audioBufferedSeconds: 3,
+    videoBufferedSeconds: 0.2,
+    ignoreDurationBoundary: true,
+  }), null);
+});
+
 test("finishes a rounded duration once both decoded sources drain", () => {
   assert.equal(getPlaybackEndReason({
     duration: 433,

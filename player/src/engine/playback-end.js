@@ -1,4 +1,4 @@
-export const DURATION_END_TOLERANCE_SECONDS = 0.02;
+const DURATION_END_TOLERANCE_SECONDS = 0.02;
 export const DRAINED_TAIL_TOLERANCE_SECONDS = 0.05;
 
 function finiteNonNegative(value) {
@@ -15,12 +15,14 @@ export function getPlaybackEndReason({
   videoEnded,
   audioBufferedSeconds,
   videoBufferedSeconds,
+  ignoreDurationBoundary = false,
 }) {
   const safeDuration = finiteNonNegative(duration);
   const safeMediaTime = finiteNonNegative(mediaTime);
 
   if (
-    safeDuration > 0
+    !ignoreDurationBoundary
+    && safeDuration > 0
     && safeMediaTime >= safeDuration - DURATION_END_TOLERANCE_SECONDS
   ) {
     return "duration-boundary";

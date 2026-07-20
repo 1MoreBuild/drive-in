@@ -7,11 +7,14 @@ import {
   assToVtt,
   decodeSubtitleBuffer,
   describePlexSubtitle,
+  embeddedSubtitleFfmpegArgs,
   isPlexTextSubtitle,
   PlexSubtitleCache,
+  plexSubtitleStreamsForPart,
   plexSubtitleVersionInfo,
   plexSubtitleVersionToken,
   resolvePlexSubtitleDelivery,
+  SubtitleExtractionQueue,
   subtitleToVtt,
 } from "../plex-subtitles.js";
 
@@ -122,6 +125,84 @@ test("remote subtitle versions expire hourly instead of becoming immutable", asy
   const nextHour = await plexSubtitleVersionInfo(stream, { now: 3600_000 });
   assert.equal(first.immutable, false);
   assert.notEqual(first.token, nextHour.token);
+});
+
+test("embedded subtitle versions follow the parent media file instead of expiring hourly", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "drivein-embedded-subtitle-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceFile = join(root, "movie.mkv");
+  writeFileSync(sourceFile, "first media version");
+  const [stream] = plexSubtitleStreamsForPart({
+    file: sourceFile,
+    Stream: [{ id: 39934, index: 2, streamType: 3, codec: "ass" }],
+  });
+
+  const first = await plexSubtitleVersionInfo(stream, { now: 0 });
+  const later = await plexSubtitleVersionInfo(stream, { now: 7200_000 });
+  writeFileSync(sourceFile, "second media version with a different size");
+  const changed = await plexSubtitleVersionInfo(stream, { now: 7200_000 });
+
+  assert.equal(first.immutable, true);
+  assert.equal(later.token, first.token);
+  assert.notEqual(changed.token, first.token);
+  assert.deepEqual(embeddedSubtitleFfmpegArgs(stream).slice(-7), [
+    "-map", "0:2", "-c:s", "ass", "-f", "ass", "pipe:1",
+  ]);
+});
+
+test("cache-only lookup never starts an embedded subtitle extraction", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "drivein-subtitle-peek-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceFile = join(root, "movie.mkv");
+  writeFileSync(sourceFile, "media");
+  const stream = {
+    id: 39934,
+    index: 2,
+    streamType: 3,
+    codec: "ass",
+    sourceFile,
+    sourceStreamIndex: 2,
+  };
+  let loadCount = 0;
+  const cache = new PlexSubtitleCache(join(root, "cache"), {
+    convert: async () => ({
+      vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n",
+      inferredLanguage: null,
+    }),
+  });
+  const versionInfo = await plexSubtitleVersionInfo(stream);
+
+  assert.equal(await cache.getCached("4140", stream, versionInfo), null);
+  assert.equal(loadCount, 0);
+  await cache.get("4140", stream, () => {
+    loadCount += 1;
+    return Buffer.from(bilingualAss);
+  }, versionInfo);
+  assert.equal((await cache.getCached("4140", stream, versionInfo)).source, "memory");
+  assert.equal(loadCount, 1);
+});
+
+test("background subtitle queue deduplicates work and stays single-flight", async () => {
+  const queue = new SubtitleExtractionQueue({ maxConcurrent: 1 });
+  let active = 0;
+  let maxActive = 0;
+  let firstRuns = 0;
+  const task = (value) => async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    if (value === "first") firstRuns += 1;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    active -= 1;
+    return value;
+  };
+
+  const first = queue.enqueue("same", task("first"));
+  const duplicate = queue.enqueue("same", task("duplicate"));
+  const second = queue.enqueue("second", task("second"));
+  assert.equal(duplicate, first);
+  assert.deepEqual(await Promise.all([first, duplicate, second]), ["first", "first", "second"]);
+  assert.equal(firstRuns, 1);
+  assert.equal(maxActive, 1);
 });
 
 test("failed external conversion falls back to Plex burn-in", async () => {

@@ -5,7 +5,6 @@ dist/
 .segment-cache/
 .logs/
 .diag-reports/
-.subs-cache/
 .env
 .play-history.json
 .drive-in.sqlite*

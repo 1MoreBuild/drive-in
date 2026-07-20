@@ -8,7 +8,6 @@ node_modules/
 .hls-cache/
 .media-cache/
 .segment-cache/
-.subs-cache/
 .logs/
 .diag-reports/
 .play-history.json
@@ -18,6 +17,4 @@ node_modules/
 .claude/
 .github/
 skills/
-TODO.md
 AGENTS.md
-CLAUDE.md

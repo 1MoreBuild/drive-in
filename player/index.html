@@ -49,7 +49,7 @@
       </div>
 
       <div id="controls-bottom">
-        <div id="progress-wrap">
+        <div id="progress-wrap" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
           <div id="progress-bar">
             <div id="progress-played"></div>
           </div>
@@ -61,6 +61,7 @@
             <span id="time-current">0:00</span>
             <span id="time-sep"> / </span>
             <span id="time-duration">0:00</span>
+            <button id="btn-live-edge" type="button" class="hidden" aria-label="Jump to live">LIVE</button>
           </div>
 
           <div id="controls-spacer"></div>

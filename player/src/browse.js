@@ -647,7 +647,7 @@ function commitHistoryDeletes() {
 
 // --- Play items ------------------------------------------------------
 
-export function playItem(item) {
+function playItem(item) {
   if (item.plex?.ratingKey) playPlexItem(item.plex.ratingKey);
   else if (item.url) {
     fetch(`${location.origin}/api/play`, {

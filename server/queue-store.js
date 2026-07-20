@@ -307,11 +307,6 @@ export function addPlaylistItem(playlistId, input) {
   return listPlaylistItems(playlistId).find((row) => row.id === id);
 }
 
-export function addPlaylistItems(playlistId, inputs = []) {
-  for (const item of inputs) addPlaylistItem(playlistId, item);
-  return getPlaylist(playlistId);
-}
-
 export function removePlaylistItem(playlistId, itemId) {
   const item = sourceRowToItem(db.prepare("SELECT * FROM playlist_items WHERE playlist_id = ? AND id = ?").get(playlistId, itemId));
   if (!item) return null;

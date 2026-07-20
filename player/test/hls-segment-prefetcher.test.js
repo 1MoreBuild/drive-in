@@ -45,6 +45,63 @@ test("buffer health stops at the first missing segment", () => {
   assert.equal(stats.pendingSegments, 1);
 });
 
+test("recognizes extensionless proxied live segments after EXTINF", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxConcurrent: 0 });
+  const masterUrl = "https://drivein.test/api/proxy/hls?id=master";
+  prefetcher.updatePlaylist(
+    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\n/api/proxy/hls?id=variant\n",
+    masterUrl,
+  );
+  assert.equal(prefetcher.playlists.size, 0);
+
+  const mediaUrl = "https://drivein.test/api/proxy/hls?id=variant";
+  prefetcher.updatePlaylist(
+    "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\n/api/proxy?id=segment-100\n#EXTINF:5.0,\n/api/proxy?id=segment-101\n",
+    mediaUrl,
+  );
+
+  const playlist = prefetcher.playlists.get(mediaUrl);
+  assert.deepEqual(playlist.segments, [
+    { url: "https://drivein.test/api/proxy?id=segment-100", duration: 5 },
+    { url: "https://drivein.test/api/proxy?id=segment-101", duration: 5 },
+  ]);
+  assert.equal(prefetcher.segmentIndexes.size, 2);
+});
+
+test("reports an absolute DVR timeline without caching the full history", () => {
+  const prefetcher = new HlsSegmentPrefetcher({ maxConcurrent: 0 });
+  const playlistUrl = "https://drivein.test/api/proxy/hls?id=live";
+  prefetcher.updatePlaylist(
+    "#EXTM3U\n#EXT-X-DRIVE-IN-DVR-START:1000\n#EXT-X-DRIVE-IN-LIVE-EDGE:4600\n#EXTINF:2,\n/api/proxy/live-segment?id=live&sq=100\n",
+    playlistUrl,
+  );
+  const playlist = prefetcher.playlists.get(playlistUrl);
+  prefetcher.advancePlaylist(playlist, 0, playlist.segments[0].url);
+
+  const stats = prefetcher.getStats();
+  assert.equal(stats.liveDvrStartTime, 1000);
+  assert.ok(stats.liveEdgeTime >= 4600);
+  assert.equal(playlist.segments.length, 1);
+});
+
+test("parses a proxied live playlist URL without an m3u8 suffix", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(
+    "#EXTM3U\n#EXTINF:2.0,\n/api/proxy?id=segment-200\n",
+    { headers: { "content-type": "application/vnd.apple.mpegurl" } },
+  );
+  const prefetcher = new HlsSegmentPrefetcher({ maxConcurrent: 0 });
+
+  await prefetcher.fetch("https://drivein.test/api/proxy/hls?id=variant");
+
+  assert.equal(prefetcher.playlists.size, 1);
+  assert.deepEqual(
+    [...prefetcher.segmentIndexes.keys()],
+    ["https://drivein.test/api/proxy?id=segment-200"],
+  );
+});
+
 test("playlist replacement preserves completed old-rendition segments", async () => {
   const prefetcher = new HlsSegmentPrefetcher();
   const oldUrl = segment("old").url;

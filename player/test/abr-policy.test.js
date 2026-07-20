@@ -67,3 +67,41 @@ test("HLS startup buffer shrinks at the end of a video", () => {
 
   assert.equal(player.hasStartupBuffer(116), true);
 });
+
+test("low-latency live playback starts with two encoded seconds", () => {
+  const player = Object.create(MediabunnyPlayer.prototype);
+  player.duration = 0;
+  player.isLive = true;
+  player.hlsStartSeconds = 2;
+  player.hasDecodedStartupBuffer = () => true;
+  let bufferedAheadSeconds = 1;
+  player.hlsSegmentPrefetcher = {
+    getStats: () => ({
+      activePlaylistCount: 2,
+      bufferedAheadSeconds,
+      pendingSegments: 2,
+    }),
+  };
+
+  assert.equal(player.hasStartupBuffer(0), false);
+  bufferedAheadSeconds = 2;
+  assert.equal(player.hasStartupBuffer(0), true);
+});
+
+test("live-edge seek preserves the encoded HLS buffer", async () => {
+  const player = Object.create(MediabunnyPlayer.prototype);
+  player.firstTimestamp = 0;
+  player.duration = 120;
+  player.wantsPlayback = false;
+  player.audioRing = { setRunning: () => {} };
+  player.clock = { stop: () => {} };
+  player.setState = () => {};
+  player.restartProducers = async () => {};
+  let resetCount = 0;
+  player.hlsSegmentPrefetcher = { handleSeek: () => { resetCount += 1; } };
+
+  await player.seek(1_000, { preserveHlsBuffer: true });
+  assert.equal(resetCount, 0);
+  await player.seek(2_000);
+  assert.equal(resetCount, 1);
+});

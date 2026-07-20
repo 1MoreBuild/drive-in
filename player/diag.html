@@ -44,7 +44,7 @@
 <div class="grid">
   <div class="row"><span class="label">WebCodecs VideoDecoder</span><span class="value" id="webcodecs"></span></div>
   <div class="row"><span class="label">WebCodecs AudioDecoder</span><span class="value" id="webcodecs-audio"></span></div>
-  <div class="row"><span class="label">Hardware Acceleration</span><span class="value" id="hw-accel"></span></div>
+  <div class="row"><span class="label">H.264 1080p (hardware preferred)</span><span class="value" id="hw-accel"></span></div>
 </div>
 
 <h2>Drive-In Runtime</h2>
@@ -102,7 +102,8 @@ const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 yn("audiocontext", typeof AudioContextClass === "function");
 yn("audioworklet", typeof AudioContextClass === "function" && typeof AudioWorkletNode === "function");
 
-// Hardware acceleration probe via WebCodecs
+// Config support with a hardware preference. This is a hint, not proof that
+// the browser will select a hardware decoder at runtime.
 async function probeHwAccel() {
   if (typeof VideoDecoder === "undefined") {
     set("hw-accel", "N/A (no WebCodecs)", "no");
@@ -115,9 +116,8 @@ async function probeHwAccel() {
       width: 1920,
       height: 1080,
     });
-    const hw = result.supported;
-    set("hw-accel", hw ? "Yes (H.264 1080p)" : "Software only", hw ? "yes" : "warn");
-    return hw;
+    set("hw-accel", result.supported ? "Supported" : "Not supported", result.supported ? "yes" : "warn");
+    return result.supported;
   } catch {
     set("hw-accel", "Probe failed", "no");
     return false;
@@ -147,37 +147,36 @@ async function probeCodecs() {
     const row = document.createElement("div");
     row.className = "codec-row";
 
-    let hwStatus = "—", swStatus = "—";
+    let preferHardwareStatus = "—", preferSoftwareStatus = "—";
 
-    // Hardware
+    // These are decoder preferences. A supported result does not expose which
+    // implementation the browser ultimately uses.
     try {
-      const hw = await VideoDecoder.isConfigSupported({
+      const result = await VideoDecoder.isConfigSupported({
         codec: c.codec, hardwareAcceleration: "prefer-hardware",
         width: c.w, height: c.h,
       });
-      hwStatus = hw.supported ? "✓ HW" : "✗";
-    } catch { hwStatus = "✗"; }
+      preferHardwareStatus = result.supported ? "✓ prefer HW" : "✗";
+    } catch { preferHardwareStatus = "✗"; }
 
-    // Software
     try {
-      const sw = await VideoDecoder.isConfigSupported({
+      const result = await VideoDecoder.isConfigSupported({
         codec: c.codec, hardwareAcceleration: "prefer-software",
         width: c.w, height: c.h,
       });
-      swStatus = sw.supported ? "✓ SW" : "✗";
-    } catch { swStatus = "✗"; }
+      preferSoftwareStatus = result.supported ? "✓ prefer SW" : "✗";
+    } catch { preferSoftwareStatus = "✗"; }
 
-    const supported = hwStatus.startsWith("✓") || swStatus.startsWith("✓");
     row.innerHTML = `
       <span class="label">${c.name}</span>
       <span>
-        <span class="${hwStatus.startsWith("✓") ? "yes" : "no"}">${hwStatus}</span>
+        <span class="${preferHardwareStatus.startsWith("✓") ? "yes" : "no"}">${preferHardwareStatus}</span>
         &nbsp;/&nbsp;
-        <span class="${swStatus.startsWith("✓") ? "yes" : "no"}">${swStatus}</span>
+        <span class="${preferSoftwareStatus.startsWith("✓") ? "yes" : "no"}">${preferSoftwareStatus}</span>
       </span>
     `;
     container.appendChild(row);
-    results[`codec_${c.name}`] = `hw=${hwStatus} sw=${swStatus}`;
+    results[`codec_${c.name}`] = `prefer-hardware=${preferHardwareStatus} prefer-software=${preferSoftwareStatus}`;
   }
 }
 

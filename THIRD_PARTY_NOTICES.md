@@ -24,7 +24,7 @@ yt-dlp is invoked as a subprocess and is not bundled with this project. Users mu
 
 - **License**: LGPL-2.1-or-later (default build), GPL-2.0-or-later (with `--enable-gpl`), or non-redistributable (with `--enable-nonfree`)
 - **Source**: https://ffmpeg.org/
-- **Usage**: External CLI tool used as a fallback for HLS remuxing
+- **Usage**: External CLI tool used for split-stream HLS fallback transcoding
 
 FFmpeg is invoked as a subprocess and is not bundled with this project. Users must install it separately. If you redistribute Docker images or binaries that include FFmpeg, verify the license of your FFmpeg build matches your distribution terms. See https://ffmpeg.org/legal.html for details.
 

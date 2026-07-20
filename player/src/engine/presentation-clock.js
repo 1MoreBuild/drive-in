@@ -1,3 +1,40 @@
+const MAX_AUDIO_OUTPUT_LATENCY_SECONDS = 0.5;
+
+function finiteNonNegative(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+export function estimateAudioOutputLatencySeconds(audioContext, now = performance.now()) {
+  if (!audioContext) return 0;
+
+  try {
+    const timestamp = audioContext.getOutputTimestamp?.();
+    const contextTime = Number(timestamp?.contextTime);
+    const performanceTime = Number(timestamp?.performanceTime);
+    const currentTime = Number(audioContext.currentTime);
+    if (
+      Number.isFinite(contextTime)
+      && Number.isFinite(performanceTime)
+      && Number.isFinite(currentTime)
+    ) {
+      const elapsed = Math.max(0, now - performanceTime) / 1000;
+      const audibleContextTime = contextTime + elapsed;
+      return Math.min(
+        MAX_AUDIO_OUTPUT_LATENCY_SECONDS,
+        Math.max(0, currentTime - audibleContextTime),
+      );
+    }
+  } catch {
+    // Older Chromium builds can expose the method without a usable timestamp.
+  }
+
+  return Math.min(
+    MAX_AUDIO_OUTPUT_LATENCY_SECONDS,
+    finiteNonNegative(audioContext.baseLatency) + finiteNonNegative(audioContext.outputLatency),
+  );
+}
+
 export class PresentationClock {
   constructor() {
     this.audioRing = null;
@@ -44,4 +81,3 @@ export class PresentationClock {
     return this.baseMediaTime + this.wallElapsed + activeElapsed;
   }
 }
-

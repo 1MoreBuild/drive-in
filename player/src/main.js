@@ -1,7 +1,7 @@
 import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
-import { initControls, updateAudioGainUI, updatePlayButton, updateVolumeButton } from "./controls.js";
-import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setAudioGain, setPlayerCallbacks } from "./player.js";
+import { initControls, updatePlayButton, updateVolumeButton } from "./controls.js";
+import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
 import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
@@ -27,9 +27,7 @@ initControls({
   onStop: stop,
   onSeekToTime: seekToTime,
   onSetVolume: (v) => { if (state.player) state.player.setVolume(v); },
-  onSetAudioGain: setAudioGain,
 });
-updateAudioGainUI();
 
 // --- Router ----------------------------------------------------------
 
@@ -199,15 +197,16 @@ function connect() {
           btnAudio.classList.add("hidden");
           audioPanel.classList.add("hidden");
           showStatus(`Loading: ${msg.title || "..."}`);
-          play(msg.url, msg.title, {
+          void play(msg.url, msg.title, {
             isLive: msg.isLive,
+            liveDvr: msg.liveDvr || null,
             duration: msg.duration || 0,
             plex: msg.plex || null,
             startTime: msg.startTime || 0,
             sourceUrl: msg.sourceUrl || null,
             mediaSource: msg.mediaSource || null,
             autoplay: msg.autoplay !== false,
-          });
+          }).catch((error) => console.error("[playback] Play transition failed:", error));
           break;
         case "pause":
           if (state.player) {
@@ -224,7 +223,7 @@ function connect() {
           updatePlayButton();
           break;
         case "stop":
-          stop();
+          void stop().catch((error) => console.error("[playback] Stop transition failed:", error));
           break;
         case "subtitlesAvailable":
           state.externalSubs = msg.subtitles || [];

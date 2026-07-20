@@ -27,6 +27,7 @@
   },
   "scripts": {
     "test": "npm test -w player && npm test -w server",
+    "check": "npm test && npm run build",
     "dev": "concurrently -k -n server,vite -c blue,green \"npm:dev:server\" \"npm:dev:vite\"",
     "dev:server": "npm run dev -w server",
     "dev:vite": "npm run dev -w player",

@@ -5,18 +5,22 @@ import { execFile, execSync, spawn } from "child_process";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createHash } from "crypto";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, rmSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
 import log from "./logger.js";
 import {
   describePlexSubtitle,
+  extractEmbeddedPlexSubtitle,
+  isEmbeddedPlexTextSubtitle,
   isPlexTextSubtitle,
   PlexSubtitleCache,
+  plexSubtitleStreamsForPart,
   plexSubtitleVersionInfo,
   readPlexSubtitleFile,
   resolvePlexSubtitleDelivery,
+  SubtitleExtractionQueue,
 } from "./plex-subtitles.js";
 import {
   addPlaylistItem,
@@ -41,6 +45,21 @@ import {
   normalizeTargetHeight,
   targetHeightForViewport,
 } from "./stream-quality.js";
+import { loadHistoryFile, saveHistoryFile } from "./history-store.js";
+import { PlaybackCoordinator, isPlaybackSuperseded } from "./playback-coordinator.js";
+import { fetchPublicImage, MAX_THUMBNAIL_BYTES, resolveSubtitleFile, SafeFetchError } from "./security.js";
+import { normalizePlayerState, normalizePlayerStatus } from "./ws-protocol.js";
+import {
+  PLEX_VIDEO_RESOLUTION,
+  createFixedPlexMediaSource,
+  normalizePlexVideoBitrate,
+} from "./plex-quality.js";
+import {
+  buildYoutubeLiveWindow,
+  parseYoutubeLivePlaylist,
+  segmentUrlForSequence,
+  sequenceForTime,
+} from "./youtube-live-dvr.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -51,16 +70,7 @@ const STREAM_MAX_VIDEO_BITRATE_KBPS = (() => {
     : 4800;
 })();
 const PLEX_URL = process.env.PLEX_URL || "http://localhost:32400";
-const PLEX_ABR_BITRATES = (() => {
-  const parsed = String(process.env.PLEX_ABR_BITRATES || "3000,5000,8000")
-    .split(",")
-    .map((value) => Number(value.trim()))
-    .filter((value) => Number.isFinite(value) && value >= 500 && value <= 20_000)
-    .map(Math.floor);
-  const unique = [...new Set(parsed)].sort((a, b) => a - b);
-  return unique.length ? unique : [3000, 5000, 8000];
-})();
-const PLEX_INITIAL_VIDEO_BITRATE = PLEX_ABR_BITRATES[0];
+const PLEX_VIDEO_BITRATE_KBPS = normalizePlexVideoBitrate(process.env.PLEX_VIDEO_BITRATE_KBPS);
 const MAX_PLEX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
@@ -101,12 +111,19 @@ const HISTORY_PATH = resolve(__dirname, "../.play-history.json");
 const MAX_HISTORY = 30;
 
 function loadHistory() {
-  try { return JSON.parse(readFileSync(HISTORY_PATH, "utf-8")); }
-  catch { return []; }
+  return loadHistoryFile(HISTORY_PATH, {
+    onCorrupt: (error, backupPath, backupError) => {
+      log.error({
+        err: error?.message,
+        backupPath,
+        backupErr: backupError?.message,
+      }, "Play history was corrupt and has been preserved");
+    },
+  });
 }
 
 function saveHistory(history) {
-  writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2));
+  saveHistoryFile(HISTORY_PATH, history);
 }
 
 function addToHistory(entry) {
@@ -129,6 +146,23 @@ function addToHistory(entry) {
 }
 
 const app = express();
+const startedAt = Date.now();
+const playbackCoordinator = new PlaybackCoordinator();
+let activeConnections = 0;
+let isShuttingDown = false;
+
+app.use((req, res, next) => {
+  activeConnections += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeConnections = Math.max(0, activeConnections - 1);
+  };
+  res.once("finish", release);
+  res.once("close", release);
+  next();
+});
 app.use(express.json());
 
 // COOP/COEP headers — required by the shared audio ring buffer.
@@ -405,19 +439,23 @@ function getMetricsSnapshot() {
   };
 }
 
-function broadcast(msg) {
+function sendToPlayer(msg) {
+  if (playerWs?.readyState === 1) playerWs.send(JSON.stringify(msg));
+}
+
+function broadcastAll(msg) {
   const data = JSON.stringify(msg);
-  wss.clients.forEach((c) => {
-    if (c.readyState === 1) c.send(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) client.send(data);
   });
 }
 
 function broadcastQueue() {
-  broadcast({ type: "queueUpdated", queue: listQueue() });
+  sendToPlayer({ type: "queueUpdated", queue: listQueue() });
 }
 
 function broadcastPlaylists() {
-  broadcast({ type: "playlistsUpdated", playlists: listPlaylists() });
+  sendToPlayer({ type: "playlistsUpdated", playlists: listPlaylists() });
 }
 
 function updateState(patch) {
@@ -429,7 +467,7 @@ function updateState(patch) {
 // Common yt-dlp flags — use browser cookies to avoid 429 rate limiting
 const YTDLP_COMMON = ["--cookies-from-browser", "chrome"];
 
-function ytdlpJson(url, { targetHeight = 720 } = {}) {
+function ytdlpJson(url, { targetHeight = 720, signal } = {}) {
   return new Promise((resolve, reject) => {
     execFile(
       "yt-dlp",
@@ -443,9 +481,12 @@ function ytdlpJson(url, { targetHeight = 720 } = {}) {
         }),
         url,
       ],
-      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024, signal },
       (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
+        if (err) {
+          if (signal?.aborted) return reject(signal.reason instanceof Error ? signal.reason : err);
+          return reject(new Error(stderr || err.message));
+        }
         try { resolve(JSON.parse(stdout)); }
         catch { reject(new Error("Failed to parse yt-dlp output")); }
       }
@@ -522,9 +563,9 @@ function extractSubtitles(info) {
   return subs;
 }
 
-function ytdlp(url, { targetHeight = 720 } = {}) {
+function ytdlp(url, { targetHeight = 720, signal } = {}) {
   const selectedTargetHeight = normalizeTargetHeight(targetHeight);
-  return ytdlpJson(url, { targetHeight: selectedTargetHeight }).then((info) => {
+  return ytdlpJson(url, { targetHeight: selectedTargetHeight, signal }).then((info) => {
     const isLive = !!info.is_live;
     const selectedFormats = info.requested_formats?.length ? info.requested_formats : [info];
     const selectedVideo = selectedFormats.find((format) => format.vcodec && format.vcodec !== "none");
@@ -598,7 +639,7 @@ function ytdlp(url, { targetHeight = 720 } = {}) {
   });
 }
 
-// --- ffmpeg muxer (merge video + audio → HLS) ------------------------
+// --- ffmpeg split-stream transcode fallback --------------------------
 
 const hlsBase = resolve(__dirname, "../.hls-cache");
 mkdirSync(hlsBase, { recursive: true });
@@ -608,8 +649,6 @@ for (const d of readdirSync(hlsBase)) {
 }
 
 let ffmpegProc = null;
-let ytdlpProc = null;
-let currentHlsDir = null;
 let currentTranscodeDir = null;
 const DASH_TRANSCODE = ["1", "true", "yes", "on"]
   .includes(String(process.env.DASH_TRANSCODE ?? "").trim().toLowerCase());
@@ -734,7 +773,6 @@ async function waitForTranscodePlaylist(playlistPath, { timeoutMs = DASH_TRANSCO
 function getCurrentTranscodeSnapshot() {
   return {
     process: ffmpegProc,
-    hlsDir: currentHlsDir,
     transcodeDir: currentTranscodeDir,
     state: transcodeState,
   };
@@ -743,7 +781,7 @@ function getCurrentTranscodeSnapshot() {
 async function stopTranscodeSnapshot(snapshot, { clearCurrentRefs = false, timeoutMs = 5000 } = {}) {
   if (!snapshot) return;
 
-  const { process: proc, hlsDir, transcodeDir, state } = snapshot;
+  const { process: proc, transcodeDir, state } = snapshot;
 
   if (state?.readyCheckTimer) {
     clearInterval(state.readyCheckTimer);
@@ -770,14 +808,12 @@ async function stopTranscodeSnapshot(snapshot, { clearCurrentRefs = false, timeo
     }
   }
 
-  const dirToClean = hlsDir || transcodeDir;
-  if (dirToClean) {
-    try { rmSync(dirToClean, { recursive: true, force: true }); } catch {}
+  if (transcodeDir) {
+    try { rmSync(transcodeDir, { recursive: true, force: true }); } catch {}
   }
 
   if (clearCurrentRefs) {
     if (ffmpegProc === proc) ffmpegProc = null;
-    if (currentHlsDir === hlsDir) currentHlsDir = null;
     if (currentTranscodeDir === transcodeDir) currentTranscodeDir = null;
     if (transcodeState === state) resetTranscodeState();
   }
@@ -837,7 +873,6 @@ function startTranscodePipeline(videoUrl, audioUrl, { videoHeaders = null, audio
 
   pipelineState.process = proc;
   ffmpegProc = proc;
-  currentHlsDir = transcodeDir;
   currentTranscodeDir = transcodeDir;
   transcodeState = pipelineState;
 
@@ -910,7 +945,7 @@ function startTranscodePipeline(videoUrl, audioUrl, { videoHeaders = null, audio
   pipelineState.readyCheckTimer = setInterval(readyCheck, 250);
   pipelineState.readyCheckTimer.unref();
 
-  if (previousPipeline.process || previousPipeline.hlsDir || previousPipeline.transcodeDir) {
+  if (previousPipeline.process || previousPipeline.transcodeDir) {
     void stopTranscodeSnapshot(previousPipeline).catch((error) => {
       log.warn({ err: error?.message || String(error) }, "Failed to stop previous DASH transcode");
     });
@@ -926,9 +961,8 @@ function startTranscodePipeline(videoUrl, audioUrl, { videoHeaders = null, audio
 
 async function killPipeline() {
   const snapshot = getCurrentTranscodeSnapshot();
-  if (!snapshot.process && !snapshot.hlsDir && !snapshot.transcodeDir) {
+  if (!snapshot.process && !snapshot.transcodeDir) {
     resetTranscodeState();
-    currentHlsDir = null;
     currentTranscodeDir = null;
     ffmpegProc = null;
     return;
@@ -961,12 +995,9 @@ function subsCacheKey(url) {
   // Extract video ID for known platforms
   const ytMatch = url.match(/(?:v=|youtu\.be\/)([\w-]{11})/);
   if (ytMatch) return ytMatch[1];
-  const bvMatch = url.match(/(BV[\w]+)/);
+  const bvMatch = url.match(/(BV[A-Za-z0-9]{10,20})/);
   if (bvMatch) return bvMatch[1];
-  // Fallback: simple hash
-  let h = 0;
-  for (let i = 0; i < url.length; i++) h = ((h << 5) - h + url.charCodeAt(i)) | 0;
-  return "h" + Math.abs(h).toString(36);
+  return `h${createHash("sha256").update(url).digest("hex").slice(0, 24)}`;
 }
 
 function getCachedSubs(url) {
@@ -974,7 +1005,7 @@ function getCachedSubs(url) {
   if (!existsSync(dir)) return null;
   const results = [];
   for (const f of readdirSync(dir)) {
-    const match = f.match(/^sub_(.+)\.vtt$/);
+    const match = f.match(/^sub_([A-Za-z0-9._-]{1,160})\.vtt$/);
     if (match) results.push({ lang: match[1], name: match[1], auto: match[1].includes("-auto"), filename: f, cached: true });
   }
   return results.length ? { dir, subs: results } : null;
@@ -1038,7 +1069,12 @@ async function downloadSubtitlesDirect(subtitleList, destDir) {
         .replace(/&#39;/g, "'")
         .replace(/&nbsp;/g, " ");
 
-      const filename = `sub_${sub.lang}.vtt`;
+      const safeLanguage = String(sub.lang || "unknown")
+        .normalize("NFKC")
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/^[_\-.]+|[_\-.]+$/g, "")
+        .slice(0, 120) || "unknown";
+      const filename = `sub_${safeLanguage}.vtt`;
       writeFileSync(resolve(destDir, filename), content);
       results.push({ lang: sub.lang, name: sub.name, auto: sub.auto, filename });
     } catch (e) {
@@ -1050,13 +1086,11 @@ async function downloadSubtitlesDirect(subtitleList, destDir) {
 
 // Serve subtitle VTT files from cache or session dir
 app.get("/api/subs/:key/:filename", (req, res) => {
-  const dir = resolve(SUBS_CACHE_DIR, req.params.key);
-  const filePath = resolve(dir, req.params.filename);
-  if (!filePath.startsWith(dir) || !existsSync(filePath)) {
+  const filePath = resolveSubtitleFile(SUBS_CACHE_DIR, req.params.key, req.params.filename);
+  if (!filePath) {
     return res.status(404).json({ error: "Subtitle not found" });
   }
   res.set("Content-Type", "text/vtt");
-  res.set("Access-Control-Allow-Origin", "*");
   res.sendFile(filePath, { dotfiles: "allow" });
 });
 
@@ -1075,7 +1109,7 @@ app.post("/api/subtitles/select", (req, res) => {
   const { lang } = req.body;
   if (!lang) {
     // Disable subtitles
-    broadcast({ type: "subtitleSelect", url: null, lang: null });
+    sendToPlayer({ type: "subtitleSelect", url: null, lang: null });
     return res.json({ ok: true, lang: null });
   }
   if (!currentSubtitles.length) return res.status(400).json({ error: "No video playing or no subtitles available" });
@@ -1086,25 +1120,8 @@ app.post("/api/subtitles/select", (req, res) => {
   }
   const url = `/api/subs/${currentSubsCacheKey}/${sub.filename}`;
   // Notify player to load the subtitle
-  broadcast({ type: "subtitleSelect", url, lang: sub.lang, name: sub.name });
+  sendToPlayer({ type: "subtitleSelect", url, lang: sub.lang, name: sub.name });
   res.json({ ok: true, lang: sub.lang, name: sub.name, url });
-});
-
-// Serve HLS cache files (dynamic directory per session)
-let hlsMiddleware = null;
-let hlsMiddlewareDir = null;
-app.use("/api/hls", (req, res, next) => {
-  if (!currentHlsDir) return res.status(404).json({ error: "No active stream" });
-  if (currentHlsDir !== hlsMiddlewareDir) {
-    hlsMiddlewareDir = currentHlsDir;
-    hlsMiddleware = express.static(currentHlsDir, {
-      setHeaders: (res) => {
-        res.set("Access-Control-Allow-Origin", "*");
-        res.set("Cache-Control", "no-cache");
-      },
-    });
-  }
-  hlsMiddleware(req, res, next);
 });
 
 function rewriteTranscodePlaylist(body) {
@@ -2336,51 +2353,8 @@ async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" 
   throw lastErr;
 }
 
-// --- Stream piping helper --------------------------------------------
-
 function isAbortLikeError(err) {
   return err?.name === "AbortError" || err?.code === "ERR_STREAM_PREMATURE_CLOSE" || err?.code === "ECONNRESET";
-}
-
-async function pipeUpstream(upstream, req, res, { passStatus = true, passRangeHeaders = true, onChunk } = {}) {
-  if (passStatus) res.status(upstream.status);
-  const headersToCopy = ["content-type", "content-length"];
-  if (passRangeHeaders) headersToCopy.push("content-range", "accept-ranges");
-  for (const h of headersToCopy) {
-    const v = upstream.headers.get(h);
-    if (v) res.set(h, v);
-  }
-  res.set("Access-Control-Allow-Origin", "*");
-
-  if (!upstream.body) {
-    res.end();
-    return;
-  }
-
-  const nodeStream = Readable.fromWeb(upstream.body);
-  if (onChunk) {
-    nodeStream.on("data", (chunk) => {
-      onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
-    });
-  }
-
-  const abortUpstream = () => {
-    if (res.writableFinished) return;
-    nodeStream.destroy();
-    const cancelPromise = upstream.body?.cancel?.();
-    if (cancelPromise && typeof cancelPromise.catch === "function") cancelPromise.catch(() => {});
-  };
-
-  req.once("aborted", abortUpstream);
-  res.once("close", abortUpstream);
-  try {
-    await pipeline(nodeStream, res);
-  } catch (err) {
-    if (!isAbortLikeError(err) && !req.destroyed && !res.destroyed) throw err;
-  } finally {
-    req.off("aborted", abortUpstream);
-    res.off("close", abortUpstream);
-  }
 }
 
 function buildProxyRequestHeaders(entry, rangeHeader) {
@@ -2514,48 +2488,72 @@ app.get("/api/proxy", async (req, res) => {
   }
 });
 
-// DASH segment proxy — serve a specific byte range from upstream
-app.get("/api/proxy/range", async (req, res) => {
-  if (!proxyMap.has(req.query.id)) return res.status(404).json({ error: "Unknown stream" });
-  const range = req.query.r;
-  if (!range) return res.status(400).json({ error: "range required" });
-  const metric = beginProxyMetric("/api/proxy/range");
-  trackProxyMetricLifecycle(res, metric);
-
-  try {
-    const proxied = await fetchProxyUpstream(req.query.id, {
-      rangeHeader: `bytes=${range}`,
-      label: "proxy/range",
-      req,
-      metric,
-    });
-    if (!proxied) return res.status(404).json({ error: "Unknown stream" });
-    res.status(200); // Always 200 for DASH segment fetches
-    await pipeUpstream(proxied.upstream, req, res, {
-      passStatus: false,
-      passRangeHeaders: false,
-      onChunk: (bytes) => recordProxyMetricBytes(metric, bytes),
-    });
-  } catch (e) {
-    if (metric) metric.error = e.message || String(e);
-    if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
-      res.status(502).json({ error: e.message });
-    }
-  }
-});
-
 // HLS BANDWIDTH includes audio, so retain a small allowance above the video cap.
 const HLS_MAX_BANDWIDTH = (STREAM_MAX_VIDEO_BITRATE_KBPS + 256) * 1000;
 
-function proxyHlsResourceUrl(resourceUrl, baseUrl, headers = null) {
+function proxyHlsResourceUrl(resourceUrl, baseUrl, headers = null, meta = {}) {
   const absoluteUrl = /^https?:\/\//i.test(resourceUrl)
     ? resourceUrl
     : new URL(resourceUrl, baseUrl).href;
-  const id = proxyRegister(absoluteUrl, headers);
+  const id = proxyRegister(absoluteUrl, headers, meta);
   return /\.m3u8(?:[?#]|$)/i.test(absoluteUrl)
     ? `/api/proxy/hls?id=${id}`
     : `/api/proxy?id=${id}`;
 }
+
+const YOUTUBE_LIVE_SEGMENT_WAIT_MS = 20_000;
+const YOUTUBE_LIVE_PLAYLIST_POLL_MS = 500;
+
+async function waitForYoutubeLiveSegment(entry, sequence) {
+  const deadline = Date.now() + YOUTUBE_LIVE_SEGMENT_WAIT_MS;
+  while (sequence > entry.liveDvr.latestSequence && Date.now() < deadline) {
+    const upstream = await fetch(entry.url, {
+      headers: proxyHeaders(entry),
+      redirect: "follow",
+    });
+    if (upstream.ok) {
+      const refreshed = parseYoutubeLivePlaylist(await upstream.text());
+      if (refreshed) {
+        const { cursorSequence, segmentProxyIds } = entry.liveDvr;
+        entry.liveDvr = { ...refreshed, cursorSequence, segmentProxyIds };
+      }
+    }
+    if (sequence <= entry.liveDvr.latestSequence) break;
+    await new Promise((resolve) => setTimeout(resolve, YOUTUBE_LIVE_PLAYLIST_POLL_MS));
+  }
+  return segmentUrlForSequence(entry.liveDvr, sequence);
+}
+
+app.get("/api/proxy/live-segment", async (req, res) => {
+  const entry = proxyMap.get(req.query.id);
+  const sequence = Number(req.query.sq);
+  if (!entry?.liveDvr || !Number.isInteger(sequence) || sequence < 0) {
+    return res.status(404).json({ error: "Unknown DVR segment" });
+  }
+  const maximumAdvertisedSequence = entry.liveDvr.latestSequence
+    + Math.ceil(180 / entry.liveDvr.segmentDuration);
+  if (sequence > maximumAdvertisedSequence) {
+    return res.status(404).json({ error: "Unknown DVR segment" });
+  }
+
+  const upstreamUrl = await waitForYoutubeLiveSegment(entry, sequence);
+  if (!upstreamUrl) return res.status(404).json({ error: "Unknown DVR segment" });
+
+  if (req.get("X-Drive-In-Prefetch") !== "1") {
+    entry.liveDvr.cursorSequence = sequence;
+  }
+  entry.liveDvr.segmentProxyIds ||= new Map();
+  let proxyId = entry.liveDvr.segmentProxyIds.get(sequence);
+  if (!proxyId || !proxyMap.has(proxyId)) {
+    proxyId = proxyRegister(upstreamUrl, entry.headers, {
+      role: "youtube-live-dvr-segment",
+      pairId: req.query.id,
+    });
+    entry.liveDvr.segmentProxyIds.set(sequence, proxyId);
+  }
+  touchProxyEntry(entry);
+  res.redirect(307, `/api/proxy?id=${encodeURIComponent(proxyId)}`);
+});
 
 // HLS proxy — fetch m3u8 and rewrite all URLs to go through our proxy
 app.get("/api/proxy/hls", async (req, res) => {
@@ -2601,22 +2599,48 @@ app.get("/api/proxy/hls", async (req, res) => {
       body = filtered.join("\n");
     }
 
-    // URI attributes live inside tags such as EXT-X-MAP, EXT-X-KEY, and
-    // EXT-X-MEDIA. Leaving them untouched makes the browser resolve them
-    // relative to /api/proxy/hls instead of the upstream playlist.
-    body = body.replace(/URI="([^"]+)"/g, (match, resourceUrl) => {
-      return `URI="${proxyHlsResourceUrl(resourceUrl, baseUrl, entry.headers)}"`;
-    });
+    const parsedLiveDvr = !isMaster ? parseYoutubeLivePlaylist(body) : null;
+    if (parsedLiveDvr) {
+      const requestedAt = req.query.at ?? entry.liveDvrAt;
+      const requestedSequence = sequenceForTime(parsedLiveDvr, requestedAt);
+      const previousCursor = entry.liveDvr?.cursorSequence;
+      entry.liveDvr = {
+        ...parsedLiveDvr,
+        cursorSequence: requestedSequence ?? previousCursor ?? null,
+        segmentProxyIds: entry.liveDvr?.segmentProxyIds || new Map(),
+      };
+      body = buildYoutubeLiveWindow(entry.liveDvr, {
+        cursorSequence: entry.liveDvr.cursorSequence,
+        sessionId: req.query.id,
+      });
+    }
 
-    // Rewrite each non-comment, non-empty line.
-    body = body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return match;
-      return proxyHlsResourceUrl(trimmed, baseUrl, entry.headers);
-    });
+    const childMeta = req.query.at != null
+      ? { liveDvrAt: Number(req.query.at) }
+      : entry.liveDvrAt != null
+        ? { liveDvrAt: entry.liveDvrAt }
+        : {};
+
+    if (!parsedLiveDvr) {
+      // URI attributes live inside tags such as EXT-X-MAP, EXT-X-KEY, and
+      // EXT-X-MEDIA. Leaving them untouched makes the browser resolve them
+      // relative to /api/proxy/hls instead of the upstream playlist.
+      body = body.replace(/URI="([^"]+)"/g, (match, resourceUrl) => {
+        return `URI="${proxyHlsResourceUrl(resourceUrl, baseUrl, entry.headers, childMeta)}"`;
+      });
+
+      // Rewrite each non-comment, non-empty line.
+      body = body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return match;
+        return proxyHlsResourceUrl(trimmed, baseUrl, entry.headers, childMeta);
+      });
+    }
 
     recordProxyMetricBytes(metric, Buffer.byteLength(body));
+    touchProxyEntry(entry);
     res.set("Content-Type", "application/vnd.apple.mpegurl");
+    res.set("Cache-Control", "no-store");
     res.set("Access-Control-Allow-Origin", "*");
     res.send(body);
   } catch (e) {
@@ -2627,10 +2651,11 @@ app.get("/api/proxy/hls", async (req, res) => {
 
 // --- Plex integration ------------------------------------------------
 
-async function plexApi(path) {
+async function plexApi(path, { signal } = {}) {
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetch(`${PLEX_URL}${path}${sep}X-Plex-Token=${PLEX_TOKEN}`, {
     headers: { Accept: "application/json" },
+    signal,
   });
   if (!res.ok) throw new Error(`Plex API ${res.status}: ${res.statusText}`);
   return res.json();
@@ -2638,6 +2663,7 @@ async function plexApi(path) {
 
 const plexSubtitleCache = new PlexSubtitleCache(resolve(CACHE_DIR, "plex-subtitles"));
 const plexSubtitleDescriptorCache = new Map();
+const plexSubtitleExtractionQueue = new SubtitleExtractionQueue({ maxConcurrent: 1 });
 
 function rememberPlexSubtitleDescriptor(key, descriptor) {
   plexSubtitleDescriptorCache.delete(key);
@@ -2662,13 +2688,10 @@ async function listPlexSubtitles(ratingKey, streams) {
       const title = stream.displayTitle || stream.extendedDisplayTitle || stream.title;
       if (isPlexTextSubtitle(stream) && (!title || /^unknown$/i.test(title))) {
         try {
-          const cached = await plexSubtitleCache.get(
-            ratingKey,
-            stream,
-            loadPlexSubtitleBuffer,
-            versionInfo,
-          );
-          inferredLanguage = cached.inferredLanguage;
+          const cached = isEmbeddedPlexTextSubtitle(stream)
+            ? await plexSubtitleCache.getCached(ratingKey, stream, versionInfo)
+            : await plexSubtitleCache.get(ratingKey, stream, loadPlexSubtitleBuffer, versionInfo);
+          inferredLanguage = cached?.inferredLanguage || null;
         } catch (error) {
           log.warn({ error: error.message, streamId: stream.id }, "[plex] could not inspect text subtitle");
         }
@@ -2685,6 +2708,7 @@ async function listPlexSubtitles(ratingKey, streams) {
 async function loadPlexSubtitleBuffer(stream) {
   const localBuffer = await readPlexSubtitleFile(stream);
   if (localBuffer) return localBuffer;
+  if (isEmbeddedPlexTextSubtitle(stream)) return extractEmbeddedPlexSubtitle(stream);
   if (!stream.key) throw new Error("Plex subtitle stream has no downloadable source");
 
   const sourceUrl = new URL(stream.key, `${PLEX_URL}/`);
@@ -2710,16 +2734,45 @@ async function loadPlexSubtitleBuffer(stream) {
   return Buffer.concat(chunks, totalBytes);
 }
 
-function normalizePlexAbrBitrate(value, fallback = PLEX_INITIAL_VIDEO_BITRATE) {
-  const requested = Number(value);
-  if (PLEX_ABR_BITRATES.includes(requested)) return requested;
-  return PLEX_ABR_BITRATES.includes(fallback) ? fallback : PLEX_INITIAL_VIDEO_BITRATE;
+function scheduleEmbeddedPlexSubtitle(ratingKey, stream, versionInfo) {
+  const taskKey = `${ratingKey}:${stream.id}:${versionInfo.token}`;
+  const alreadyScheduled = plexSubtitleExtractionQueue.has(taskKey);
+  const queuedAt = Date.now();
+  const task = plexSubtitleExtractionQueue.enqueue(taskKey, async () => {
+    log.info({
+      ratingKey,
+      streamId: stream.id,
+      sourceStreamIndex: stream.sourceStreamIndex,
+    }, "[plex] extracting embedded subtitle in background");
+    const cached = await plexSubtitleCache.get(
+      ratingKey,
+      stream,
+      loadPlexSubtitleBuffer,
+      versionInfo,
+    );
+    plexSubtitleDescriptorCache.delete(`${ratingKey}:${stream.id}:${versionInfo.token}`);
+    log.info({
+      ratingKey,
+      streamId: stream.id,
+      elapsedMs: Date.now() - queuedAt,
+      bytes: cached.byteSize,
+    }, "[plex] embedded WebVTT subtitle is ready");
+    return cached;
+  });
+  task.catch((error) => {
+    log.warn({
+      ratingKey,
+      streamId: stream.id,
+      elapsedMs: Date.now() - queuedAt,
+      error: error.message,
+    }, "[plex] background subtitle extraction failed");
+  });
+  return { task, alreadyScheduled };
 }
 
 let plexHlsManifestUrl = null;
 let plexHlsManifestCache = null;
 let activePlexTranscode = null;
-let plexAbrSwitchPromise = null;
 let plexTranscodeGeneration = 0;
 
 function plexTranscodeParams(ratingKey, {
@@ -2727,9 +2780,7 @@ function plexTranscodeParams(ratingKey, {
   audioStreamID,
   offsetSec,
   session,
-  videoBitrate,
 } = {}) {
-  const selectedVideoBitrate = normalizePlexAbrBitrate(videoBitrate);
   return new URLSearchParams({
     hasMDE: "1",
     path: `/library/metadata/${ratingKey}`,
@@ -2740,11 +2791,9 @@ function plexTranscodeParams(ratingKey, {
     directPlay: "0",
     directStream: "1",
     directStreamAudio: "1",
-    videoResolution: "1920x1080",
-    // Resolution stays independent from rate selection. Drive-In changes this
-    // rate inside one Plex HLS session, so segment URLs and playback stay stable.
-    maxVideoBitrate: String(selectedVideoBitrate),
-    videoBitrate: String(selectedVideoBitrate),
+    videoResolution: PLEX_VIDEO_RESOLUTION,
+    maxVideoBitrate: String(PLEX_VIDEO_BITRATE_KBPS),
+    videoBitrate: String(PLEX_VIDEO_BITRATE_KBPS),
     subtitleSize: "100",
     subtitles: subtitleStreamID ? "burn" : "none",
     audioBoost: "280",
@@ -2772,11 +2821,19 @@ function plexTranscodeParams(ratingKey, {
 async function plexTranscodeUrl(ratingKey, opts = {}) {
   const generation = ++plexTranscodeGeneration;
   const session = opts.session || `di-${Date.now()}`;
-  const videoBitrate = normalizePlexAbrBitrate(opts.videoBitrate);
-  const params = plexTranscodeParams(ratingKey, { ...opts, session, videoBitrate });
+  const params = plexTranscodeParams(ratingKey, { ...opts, session });
   // Call decision endpoint first — Plex needs this to set up the transcode pipeline
   const decisionUrl = `${PLEX_URL}/video/:/transcode/universal/decision?${params}`;
-  const decisionRes = await fetch(decisionUrl, { headers: { Accept: "application/json" } });
+  let decisionRes;
+  try {
+    decisionRes = await fetch(decisionUrl, {
+      headers: { Accept: "application/json" },
+      signal: opts.signal,
+    });
+  } catch (error) {
+    if (opts.signal?.aborted) await stopPlexTranscodeSession(session).catch(() => {});
+    throw error;
+  }
   const decisionBody = await decisionRes.json().catch(() => null);
   const mc = decisionBody?.MediaContainer;
   const decisionStream = mc?.Metadata?.[0]?.Media?.[0]?.Part?.[0]?.Stream;
@@ -2784,7 +2841,7 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
   log.info({
     status: decisionRes.status,
     session,
-    videoBitrate,
+    videoBitrate: PLEX_VIDEO_BITRATE_KBPS,
     generalDecisionCode: mc?.generalDecisionCode,
     generalDecisionText: mc?.generalDecisionText,
     transcodeDecisionCode: mc?.transcodeDecisionCode,
@@ -2799,13 +2856,10 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
   const startHlsUrl = `${PLEX_URL}/video/:/transcode/universal/start.m3u8?${params}`;
 
   try {
-    log.info({ session, videoBitrate }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
-    const manifestRes = await fetch(startHlsUrl);
+    log.info({ session, videoBitrate: PLEX_VIDEO_BITRATE_KBPS }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
+    const manifestRes = await fetch(startHlsUrl, { signal: opts.signal });
     if (manifestRes.ok) {
       const upstreamBody = await manifestRes.text();
-      if (opts.prewarmSegments) {
-        await prewarmPlexHlsSegments(upstreamBody, startHlsUrl, opts.prewarmSegments);
-      }
       if (generation !== plexTranscodeGeneration) {
         await stopPlexTranscodeSession(session);
         throw new Error("Plex transcode request was superseded");
@@ -2820,15 +2874,18 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
         ratingKey: String(ratingKey),
         subtitleStreamID: opts.subtitleStreamID || null,
         audioStreamID: opts.audioStreamID || null,
-        videoBitrate,
+        videoBitrate: PLEX_VIDEO_BITRATE_KBPS,
         advertisedBitrate,
         offsetSec: Number(opts.offsetSec) || 0,
       };
-      log.info({ session, videoBitrate, advertisedBitrate, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
+      log.info({ session, videoBitrate: PLEX_VIDEO_BITRATE_KBPS, advertisedBitrate, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
     } else {
       throw new Error(`Plex start.m3u8 failed with ${manifestRes.status}`);
     }
   } catch (e) {
+    if (opts.signal?.aborted || generation !== plexTranscodeGeneration) {
+      await stopPlexTranscodeSession(session).catch(() => {});
+    }
     log.error({ session, err: e.message }, "[plex] start.m3u8 fetch error");
     throw e;
   }
@@ -2846,7 +2903,6 @@ async function stopPlexTranscodeSession(session) {
 
 async function stopActivePlexTranscode() {
   plexTranscodeGeneration += 1;
-  plexAbrSwitchPromise = null;
   const session = activePlexTranscode?.session;
   activePlexTranscode = null;
   plexHlsManifestUrl = null;
@@ -2908,54 +2964,6 @@ function trimPlexHlsResumePlaceholders(body) {
   log.info({ resumeOffset, droppedSegments, nextMediaSequence }, "[plex] trimmed resume placeholders");
   const trimmed = trimmedLines.join("\n");
   return hadTrailingNewline && !trimmed.endsWith("\n") ? `${trimmed}\n` : trimmed;
-}
-
-async function fetchPlexSegmentWithRetry(url) {
-  let response;
-  for (let attempt = 0; attempt < PLEX_SEGMENT_RETRY_DELAYS_MS.length; attempt += 1) {
-    const delayMs = PLEX_SEGMENT_RETRY_DELAYS_MS[attempt];
-    if (delayMs) await sleep(delayMs);
-    response = await fetch(url);
-    if (response.status !== 404 || attempt === PLEX_SEGMENT_RETRY_DELAYS_MS.length - 1) break;
-    await response.arrayBuffer().catch(() => {});
-  }
-  return response;
-}
-
-async function prewarmPlexHlsSegments(masterBody, masterUrl, count) {
-  const mediaPath = masterBody
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line && !line.startsWith("#") && /\.m3u8(?:\?|$)/i.test(line));
-  if (!mediaPath) throw new Error("Plex ABR prewarm could not find media playlist");
-
-  const mediaUrl = new URL(mediaPath, masterUrl);
-  mediaUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
-  const mediaResponse = await fetch(mediaUrl);
-  if (!mediaResponse.ok) throw new Error(`Plex ABR media playlist failed with ${mediaResponse.status}`);
-  const trimmedBody = trimPlexHlsResumePlaceholders(await mediaResponse.text());
-  const segmentUrls = trimmedBody
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"))
-    .slice(0, Math.max(1, Math.floor(count)))
-    .map((line) => {
-      const url = new URL(line, mediaUrl);
-      url.searchParams.set("X-Plex-Token", PLEX_TOKEN);
-      return url;
-    });
-  if (!segmentUrls.length) throw new Error("Plex ABR prewarm found no media segments");
-
-  const startedAt = Date.now();
-  const results = await Promise.all(segmentUrls.map(async (url) => {
-    const response = await fetchPlexSegmentWithRetry(url);
-    const bytes = (await response.arrayBuffer()).byteLength;
-    return { status: response.status, bytes };
-  }));
-  if (results.some((result) => result.status < 200 || result.status >= 300)) {
-    throw new Error(`Plex ABR segment prewarm failed: ${results.map((result) => result.status).join(",")}`);
-  }
-  log.info({ count: results.length, durationMs: Date.now() - startedAt, results }, "[plex-abr] rendition prewarmed");
 }
 
 function rewritePlexHlsManifest(body) {
@@ -3142,7 +3150,7 @@ app.get("/api/plex/subtitles/:id", async (req, res) => {
   try {
     const data = await plexApi(`/library/metadata/${req.params.id}`);
     const part = data.MediaContainer.Metadata[0].Media[0].Part[0];
-    res.json(await listPlexSubtitles(req.params.id, part.Stream || []));
+    res.json(await listPlexSubtitles(req.params.id, plexSubtitleStreamsForPart(part)));
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
@@ -3151,7 +3159,7 @@ app.get("/api/plex/subtitle/:ratingKey/:streamId", async (req, res) => {
   try {
     const data = await plexApi(`/library/metadata/${req.params.ratingKey}`);
     const part = data.MediaContainer.Metadata[0].Media[0].Part[0];
-    const stream = (part.Stream || []).find((candidate) => (
+    const stream = plexSubtitleStreamsForPart(part).find((candidate) => (
       candidate.streamType === 3 && String(candidate.id) === String(req.params.streamId)
     ));
     if (!stream) return res.status(404).json({ error: "Subtitle stream not found" });
@@ -3159,10 +3167,25 @@ app.get("/api/plex/subtitle/:ratingKey/:streamId", async (req, res) => {
       return res.status(415).json({ error: "Image subtitles must be rendered by Plex" });
     }
 
-    const cached = await plexSubtitleCache.get(
+    const versionInfo = await plexSubtitleVersionInfo(stream);
+    let cached = await plexSubtitleCache.getCached(req.params.ratingKey, stream, versionInfo);
+    if (!cached && isEmbeddedPlexTextSubtitle(stream)) {
+      const { alreadyScheduled } = scheduleEmbeddedPlexSubtitle(
+        req.params.ratingKey,
+        stream,
+        versionInfo,
+      );
+      res.set("Retry-After", "5");
+      return res.status(425).json({
+        status: alreadyScheduled ? "extracting" : "queued",
+        message: "WebVTT subtitle is being prepared; Plex burn-in remains available",
+      });
+    }
+    cached ||= await plexSubtitleCache.get(
       req.params.ratingKey,
       stream,
       loadPlexSubtitleBuffer,
+      versionInfo,
     );
     res.set("ETag", cached.etag);
     res.set("Cache-Control", cached.immutable
@@ -3199,7 +3222,6 @@ async function playPlexNow({
   audioStreamID,
   preferredSubtitleLanguages,
   preferredAudioLanguage,
-  estimatedThroughputKbps,
   offset,
 } = {}) {
   if (!ratingKey) {
@@ -3218,14 +3240,18 @@ async function playPlexNow({
     throw err;
   }
 
+  const playbackRequest = playbackCoordinator.begin("plex-play");
+
   updateState({ status: "resolving", url: `plex://${ratingKey}` });
 
-  const data = await plexApi(`/library/metadata/${ratingKey}`);
+  const data = await plexApi(`/library/metadata/${ratingKey}`, { signal: playbackRequest.signal });
+  playbackRequest.assertCurrent();
   const meta = data.MediaContainer.Metadata[0];
   const media = meta.Media[0];
   const part = media.Part[0];
-  const partStreams = part.Stream || [];
+  const partStreams = plexSubtitleStreamsForPart(part);
   const subtitles = await listPlexSubtitles(ratingKey, partStreams);
+  playbackRequest.assertCurrent();
   const subtitleLanguages = Array.isArray(preferredSubtitleLanguages)
     ? preferredSubtitleLanguages.map(String)
     : [];
@@ -3247,18 +3273,41 @@ async function playPlexNow({
       stream.streamType === 3 && String(stream.id) === String(selectedSubtitle.id)
     ));
     const versionInfo = await plexSubtitleVersionInfo(selectedStream);
-    const resolvedDelivery = await resolvePlexSubtitleDelivery(selectedSubtitle, () => (
-      plexSubtitleCache.get(ratingKey, selectedStream, loadPlexSubtitleBuffer, versionInfo)
-    ));
-    selectedSubtitle = resolvedDelivery.subtitle;
-    burnSubtitleStreamID = resolvedDelivery.burnSubtitleStreamID;
-    subtitles[selectedSubtitleIndex] = selectedSubtitle;
-    if (resolvedDelivery.fallback) {
-      log.warn({
-        ratingKey,
-        streamId: selectedSubtitle.id,
-        error: resolvedDelivery.error.message,
-      }, "[plex] text subtitle conversion failed; falling back to burn-in");
+    playbackRequest.assertCurrent();
+    if (isEmbeddedPlexTextSubtitle(selectedStream)) {
+      const cached = await plexSubtitleCache.getCached(ratingKey, selectedStream, versionInfo);
+      playbackRequest.assertCurrent();
+      if (!cached) {
+        const { url: _url, ...burnSubtitle } = selectedSubtitle;
+        selectedSubtitle = {
+          ...burnSubtitle,
+          delivery: "burn",
+          preparingExternal: true,
+        };
+        burnSubtitleStreamID = selectedSubtitle.id;
+        subtitles[selectedSubtitleIndex] = selectedSubtitle;
+        const { alreadyScheduled } = scheduleEmbeddedPlexSubtitle(ratingKey, selectedStream, versionInfo);
+        log.info({
+          ratingKey,
+          streamId: selectedSubtitle.id,
+          alreadyScheduled,
+        }, "[plex] using burn-in while embedded WebVTT is prepared");
+      }
+    } else {
+      const resolvedDelivery = await resolvePlexSubtitleDelivery(selectedSubtitle, () => (
+        plexSubtitleCache.get(ratingKey, selectedStream, loadPlexSubtitleBuffer, versionInfo)
+      ));
+      playbackRequest.assertCurrent();
+      selectedSubtitle = resolvedDelivery.subtitle;
+      burnSubtitleStreamID = resolvedDelivery.burnSubtitleStreamID;
+      subtitles[selectedSubtitleIndex] = selectedSubtitle;
+      if (resolvedDelivery.fallback) {
+        log.warn({
+          ratingKey,
+          streamId: selectedSubtitle.id,
+          error: resolvedDelivery.error.message,
+        }, "[plex] text subtitle conversion failed; falling back to burn-in");
+      }
     }
   }
   const selectedAudioStreamID = audioStreamID || (preferredAudioLanguage
@@ -3282,7 +3331,11 @@ async function playPlexNow({
   if (selectedAudioStreamID) {
     partParams.set("audioStreamID", selectedAudioStreamID);
   }
-  const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, { method: "PUT" });
+  const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, {
+    method: "PUT",
+    signal: playbackRequest.signal,
+  });
+  playbackRequest.assertCurrent();
   log.info({
     status: putRes.status,
     partId: part.id,
@@ -3293,21 +3346,20 @@ async function playPlexNow({
 
   resetDashSegmentSession();
   await killPipeline();
+  playbackRequest.assertCurrent();
   await stopActivePlexTranscode();
+  playbackRequest.assertCurrent();
 
   // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
   const resumeMs = offset || meta.viewOffset || 0;
   const resumeSec = resumeMs ? Math.floor(resumeMs / 1000) : 0;
-  const safeInitialBudget = Number(estimatedThroughputKbps) / 1.5;
-  const selectedVideoBitrate = Number.isFinite(safeInitialBudget) && safeInitialBudget > 0
-    ? PLEX_ABR_BITRATES.filter((bitrate) => bitrate <= safeInitialBudget).pop() || PLEX_INITIAL_VIDEO_BITRATE
-    : PLEX_INITIAL_VIDEO_BITRATE;
   const playerUrl = await plexTranscodeUrl(ratingKey, {
     subtitleStreamID: burnSubtitleStreamID,
     audioStreamID: selectedAudioStreamID,
     offsetSec: resumeSec,
-    videoBitrate: selectedVideoBitrate,
+    signal: playbackRequest.signal,
   });
+  playbackRequest.assertCurrent();
 
   updateState({
     status: "playing",
@@ -3322,24 +3374,14 @@ async function playPlexNow({
     .filter((s) => s.streamType === 2)
     .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));
 
-  broadcast({
+  sendToPlayer({
     type: "play",
     url: playerUrl,
-    mediaSource: {
-      type: "hls",
-      url: playerUrl,
-      abr: {
-        session: activePlexTranscode.session,
-        bitrates: PLEX_ABR_BITRATES,
-        currentBitrate: activePlexTranscode.videoBitrate,
-        advertisedBitrate: activePlexTranscode.advertisedBitrate,
-        switchUrl: "/api/plex/abr",
-      },
-    },
+    mediaSource: createFixedPlexMediaSource(playerUrl),
     title,
     isLive: false,
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-    thumbnail: meta.thumb ? `${PLEX_URL}${meta.thumb}?X-Plex-Token=${PLEX_TOKEN}` : null,
+    thumbnail: meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
     plex: {
       ratingKey, subtitles, audioTracks,
       activeSubtitleID: selectedSubtitleStreamID || null,
@@ -3364,73 +3406,13 @@ app.post("/api/plex/play", async (req, res) => {
   try {
     res.json(await playPlexNow(req.body));
   } catch (e) {
-    updateState({ status: "idle" });
+    if (!isPlaybackSuperseded(e)) updateState({ status: "idle" });
     res.status(e.status || 500).json({ error: e.message });
   }
 });
 
-app.post("/api/plex/abr", async (req, res) => {
-  const { session, videoBitrate, currentTime, switchOffset } = req.body || {};
-  const targetBitrate = Number(videoBitrate);
-  const transcode = activePlexTranscode;
-
-  if (!transcode || !session || session !== transcode.session) {
-    return res.status(409).json({ error: "Plex playback session changed" });
-  }
-  if (!PLEX_ABR_BITRATES.includes(targetBitrate)) {
-    return res.status(400).json({ error: "Unsupported Plex ABR bitrate" });
-  }
-  if (targetBitrate === transcode.videoBitrate) {
-    return res.json({
-      ok: true,
-      videoBitrate: transcode.videoBitrate,
-      advertisedBitrate: transcode.advertisedBitrate,
-    });
-  }
-  if (plexAbrSwitchPromise) {
-    return res.status(409).json({ error: "Plex ABR switch already in progress" });
-  }
-
-  const playbackTime = Math.max(0, Number(currentTime) || 0);
-  // The browser keeps already-prefetched old-rendition segments. Start the
-  // replacement encoder at the end of that buffer so it works on the first
-  // segment the browser does not already own instead of racing playback.
-  const requestedSwitchOffset = Number(switchOffset);
-  const offsetSec = Number.isFinite(requestedSwitchOffset)
-    ? Math.max(playbackTime, Math.min(playbackTime + 30, requestedSwitchOffset))
-    : playbackTime;
-  const fromBitrate = transcode.videoBitrate;
-  const switchPromise = plexTranscodeUrl(transcode.ratingKey, {
-    session: transcode.session,
-    subtitleStreamID: transcode.subtitleStreamID,
-    audioStreamID: transcode.audioStreamID,
-    offsetSec,
-    videoBitrate: targetBitrate,
-    prewarmSegments: 3,
-  });
-  plexAbrSwitchPromise = switchPromise;
-
-  try {
-    await switchPromise;
-    log.info({
-      session,
-      fromBitrate,
-      toBitrate: targetBitrate,
-      advertisedBitrate: activePlexTranscode?.advertisedBitrate || null,
-      playbackTime,
-      offsetSec,
-    }, "[plex-abr] bitrate switched in place");
-    return res.json({
-      ok: true,
-      videoBitrate: activePlexTranscode.videoBitrate,
-      advertisedBitrate: activePlexTranscode.advertisedBitrate,
-    });
-  } catch (error) {
-    log.error({ session, fromBitrate, toBitrate: targetBitrate, err: error.message }, "[plex-abr] switch failed");
-    return res.status(502).json({ error: error.message });
-  } finally {
-    if (plexAbrSwitchPromise === switchPromise) plexAbrSwitchPromise = null;
-  }
+app.post("/api/plex/abr", (_req, res) => {
+  res.status(409).json({ error: "Plex playback is fixed at 720p; automatic bitrate switching is disabled" });
 });
 
 // Report playback progress to Plex (called periodically by player)
@@ -3451,15 +3433,60 @@ app.post("/api/plex/progress", async (req, res) => {
   } catch { res.json({ ok: true }); }
 });
 
+function writeCacheFileAtomic(path, data) {
+  const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, data, { mode: 0o600 });
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    safeUnlink(temporaryPath);
+    throw error;
+  }
+}
+
+async function readLimitedResponse(response, maxBytes = MAX_THUMBNAIL_BYTES) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel?.().catch(() => {});
+    throw new SafeFetchError("Thumbnail is too large", 413);
+  }
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw new SafeFetchError("Thumbnail is too large", 413);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function isSupportedImageType(value) {
+  return /^(?:image\/(?:avif|gif|jpeg|png|webp))$/i.test(String(value || "").split(";", 1)[0].trim());
+}
+
 // Proxy Plex thumbnails — cached to disk (so browser doesn't need token)
 app.get("/api/plex/thumb", async (req, res) => {
-  const path = req.query.path;
-  if (!path || !PLEX_TOKEN) return res.status(400).end();
+  const path = typeof req.query.path === "string" ? req.query.path : "";
+  if (!path || path.length > 4096 || !PLEX_TOKEN) return res.status(400).end();
+  let upstreamUrl;
+  try {
+    const plexBase = new URL(PLEX_URL);
+    upstreamUrl = new URL(path, plexBase);
+    if (upstreamUrl.origin !== plexBase.origin) return res.status(400).end();
+    upstreamUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
+  } catch {
+    return res.status(400).end();
+  }
 
-  // Stable cache key from path
-  let h = 0;
-  for (let i = 0; i < path.length; i++) h = ((h << 5) - h + path.charCodeAt(i)) | 0;
-  const cacheBase = resolve(THUMB_CACHE_DIR, `plex_${Math.abs(h).toString(36)}`);
+  const cacheKey = createHash("sha256").update(path).digest("hex");
+  const cacheBase = resolve(THUMB_CACHE_DIR, `plex_${cacheKey}`);
   const metaFile = cacheBase + ".meta";
   const dataFile = cacheBase + ".dat";
 
@@ -3467,52 +3494,72 @@ app.get("/api/plex/thumb", async (req, res) => {
   if (existsSync(dataFile) && existsSync(metaFile)) {
     try {
       const mime = readFileSync(metaFile, "utf8").trim();
+      if (!isSupportedImageType(mime)) throw new Error("Invalid cached image type");
       res.set("Content-Type", mime);
+      res.set("X-Content-Type-Options", "nosniff");
       res.set("Cache-Control", "public, max-age=604800");
-      return res.sendFile(dataFile, { dotfiles: "allow" });
-    } catch {}
+      return res.sendFile(dataFile);
+    } catch {
+      safeUnlink(metaFile);
+      safeUnlink(dataFile);
+    }
   }
 
   try {
-    const upstream = await fetch(`${PLEX_URL}${path}?X-Plex-Token=${PLEX_TOKEN}`);
+    const upstream = await fetch(upstreamUrl, { signal: AbortSignal.timeout(10_000) });
     if (!upstream.ok) return res.status(upstream.status).end();
-    const mime = upstream.headers.get("content-type") || "image/jpeg";
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    writeFileSync(dataFile, buf);
-    writeFileSync(metaFile, mime);
+    const mime = String(upstream.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+    if (!isSupportedImageType(mime)) return res.status(415).end();
+    const buf = await readLimitedResponse(upstream);
+    writeCacheFileAtomic(dataFile, buf);
+    writeCacheFileAtomic(metaFile, mime);
     res.set("Content-Type", mime);
+    res.set("X-Content-Type-Options", "nosniff");
     res.set("Cache-Control", "public, max-age=604800");
     res.send(buf);
-  } catch { res.status(502).end(); }
+  } catch (error) {
+    res.status(error?.status || 502).end();
+  }
 });
 
 // Proxy external thumbnails — cached to disk
 app.get("/api/thumb", async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).end();
+  const url = typeof req.query.url === "string" ? req.query.url : "";
+  if (!url || url.length > 4096) return res.status(400).end();
 
-  // Stable filename from URL
-  let h = 0;
-  for (let i = 0; i < url.length; i++) h = ((h << 5) - h + url.charCodeAt(i)) | 0;
-  const ext = url.match(/\.(jpe?g|png|webp|avif)/i)?.[1] || "jpg";
-  const cacheFile = resolve(THUMB_CACHE_DIR, `${Math.abs(h).toString(36)}.${ext}`);
+  const cacheKey = createHash("sha256").update(url).digest("hex");
+  const cacheBase = resolve(THUMB_CACHE_DIR, `external_${cacheKey}`);
+  const metaFile = `${cacheBase}.meta`;
+  const dataFile = `${cacheBase}.dat`;
 
   // Serve from cache
-  if (existsSync(cacheFile)) {
-    res.set("Content-Type", ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg");
-    res.set("Cache-Control", "public, max-age=604800");
-    return res.sendFile(cacheFile, { dotfiles: "allow" });
+  if (existsSync(dataFile) && existsSync(metaFile)) {
+    try {
+      const mime = readFileSync(metaFile, "utf8").trim();
+      if (!isSupportedImageType(mime)) throw new Error("Invalid cached image type");
+      res.set("Content-Type", mime);
+      res.set("X-Content-Type-Options", "nosniff");
+      res.set("Cache-Control", "public, max-age=604800");
+      return res.sendFile(dataFile);
+    } catch {
+      safeUnlink(metaFile);
+      safeUnlink(dataFile);
+    }
   }
 
   try {
-    const upstream = await fetch(url, { redirect: "follow" });
-    if (!upstream.ok) return res.status(upstream.status).end();
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    writeFileSync(cacheFile, buf);
-    res.set("Content-Type", upstream.headers.get("content-type") || "image/jpeg");
+    const image = await fetchPublicImage(url);
+    writeCacheFileAtomic(dataFile, image.buffer);
+    writeCacheFileAtomic(metaFile, image.contentType);
+    res.set("Content-Type", image.contentType);
+    res.set("X-Content-Type-Options", "nosniff");
     res.set("Cache-Control", "public, max-age=604800");
-    res.send(buf);
-  } catch { res.status(502).end(); }
+    res.send(image.buffer);
+  } catch (error) {
+    const status = error instanceof SafeFetchError ? error.status : 502;
+    log.warn({ url: truncateUrl(url, 160), err: error?.message, status }, "Thumbnail proxy rejected request");
+    res.status(status).end();
+  }
 });
 
 // --- History API -----------------------------------------------------
@@ -3768,7 +3815,7 @@ app.post("/api/queue/next", async (_req, res) => {
     if (!result) return res.status(404).json({ error: "queue empty" });
     res.json(result);
   } catch (err) {
-    updateState({ status: "idle" });
+    if (!isPlaybackSuperseded(err)) updateState({ status: "idle" });
     res.status(err.status || 500).json({ error: err.message });
   }
 });
@@ -3778,7 +3825,7 @@ app.post("/api/queue/:id/play", async (req, res) => {
   try {
     res.json(await playNextFromQueue(req.params.id));
   } catch (err) {
-    updateState({ status: "idle" });
+    if (!isPlaybackSuperseded(err)) updateState({ status: "idle" });
     res.status(err.status || 500).json({ error: err.message });
   }
 });
@@ -3811,7 +3858,7 @@ app.post("/api/resolve", async (req, res) => {
   }
 });
 
-async function buildDashSplitSource({ resolved, sourceUrl }) {
+async function buildDashSplitSource({ resolved, sourceUrl, playbackRequest }) {
   resolved.isLive = false;
   const pairId = `pair-${Date.now()}`;
   const videoProxyId = proxyRegister(resolved.videoUrl, resolved.videoHeaders, {
@@ -3821,7 +3868,9 @@ async function buildDashSplitSource({ resolved, sourceUrl }) {
     originalUrl: sourceUrl, pairId, role: "audio",
   });
   const videoInfo = await probeMP4Structure(videoProxyId);
+  playbackRequest.assertCurrent();
   const audioInfo = await probeMP4Structure(audioProxyId);
+  playbackRequest.assertCurrent();
   log.info({
     video: { init: videoInfo.initEnd, segs: videoInfo.segments.length, mb: Math.round(videoInfo.totalSize / 1048576) },
     audio: { init: audioInfo.initEnd, segs: audioInfo.segments.length, mb: Math.round(audioInfo.totalSize / 1048576) },
@@ -3851,13 +3900,14 @@ async function buildDashSplitSource({ resolved, sourceUrl }) {
   };
 }
 
-async function buildDashSplitTranscodeAndPlayerUrl({ resolved }) {
+async function buildDashSplitTranscodeAndPlayerUrl({ resolved, playbackRequest }) {
   resolved.isLive = false;
   const session = startTranscodePipeline(resolved.videoUrl, resolved.audioUrl, {
     videoHeaders: resolved.videoHeaders,
     audioHeaders: resolved.audioHeaders,
   });
   const ready = await waitForTranscodePlaylist(session.playlistPath, { timeoutMs: DASH_TRANSCODE_STARTUP_TIMEOUT_MS, pollMs: 150 });
+  playbackRequest.assertCurrent();
   if (ready.ready) {
     log.info({ sessionId: session.sessionId, segmentCount: ready.segmentCount }, "DASH transcode ready for playback");
     return "/api/transcode/playlist.m3u8";
@@ -3892,6 +3942,8 @@ async function playUrlNow({
     throw err;
   }
 
+  const playbackRequest = playbackCoordinator.begin(reason);
+
   updateState({
     status: "resolving",
     url,
@@ -3905,7 +3957,8 @@ async function playUrlNow({
   if (directPattern.test(url)) {
     resolved = { url, title: url, isLive: false, type: /\.m3u8/i.test(url) ? "hls" : "direct", subtitles: [] };
   } else {
-    resolved = await ytdlp(url, { targetHeight: selectedTargetHeight });
+    resolved = await ytdlp(url, { targetHeight: selectedTargetHeight, signal: playbackRequest.signal });
+    playbackRequest.assertCurrent();
   }
 
   log.info({
@@ -3916,6 +3969,7 @@ async function playUrlNow({
   }, "Stream format selected");
 
   await stopActivePlexTranscode();
+  playbackRequest.assertCurrent();
 
   let playerUrl;
   let mediaSource;
@@ -3923,22 +3977,25 @@ async function playUrlNow({
   if (resolved.type === "dash_split") {
     if (shouldTranscode) {
       try {
-        playerUrl = await buildDashSplitTranscodeAndPlayerUrl({ resolved });
+        playerUrl = await buildDashSplitTranscodeAndPlayerUrl({ resolved, playbackRequest });
         mediaSource = { type: "hls", url: playerUrl };
         log.info({ url }, "Using DASH split ffmpeg transcode path");
       } catch (err) {
+        playbackRequest.assertCurrent();
         log.error({ err: err.message }, "DASH transcode pipeline failed, falling back to fMP4 HLS");
         await killPipeline();
-        const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url });
+        playbackRequest.assertCurrent();
+        const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url, playbackRequest });
         playerUrl = dashSplit.playerUrl;
         mediaSource = dashSplit.mediaSource;
       }
     } else {
       log.info({ url }, "DASH split transcode disabled for this request");
-      const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url });
+      const dashSplit = await buildDashSplitSource({ resolved, sourceUrl: url, playbackRequest });
       playerUrl = dashSplit.playerUrl;
       mediaSource = dashSplit.mediaSource;
       await killPipeline();
+      playbackRequest.assertCurrent();
     }
   } else if (resolved.type === "hls") {
     resetDashSegmentSession();
@@ -3946,12 +4003,14 @@ async function playUrlNow({
     playerUrl = `/api/proxy/hls?id=${id}`;
     mediaSource = { type: "hls", url: playerUrl };
     await killPipeline();
+    playbackRequest.assertCurrent();
   } else {
     resetDashSegmentSession();
     const id = proxyRegister(resolved.url);
     playerUrl = `/api/proxy?id=${id}`;
     mediaSource = { type: "mp4", url: playerUrl };
     await killPipeline();
+    playbackRequest.assertCurrent();
   }
 
   // Subtitles — check cache first, download if missing
@@ -3961,10 +4020,11 @@ async function playUrlNow({
     const cached = getCachedSubs(url);
 
     const broadcastSubs = (subs, cacheK) => {
+      try { playbackRequest.assertCurrent(); } catch { return; }
       currentSubtitles = subs;
       currentSubsCacheKey = cacheK;
       if (subs.length) {
-        broadcast({
+        sendToPlayer({
           type: "subtitlesAvailable",
           subtitles: subs.map((s) => ({
             lang: s.lang, name: s.name, auto: s.auto,
@@ -3987,12 +4047,14 @@ async function playUrlNow({
       });
       // Direct fetch from URLs already in yt-dlp JSON — no second yt-dlp call
       downloadSubtitlesDirect(selected, subsDir).then((downloaded) => {
+        try { playbackRequest.assertCurrent(); } catch { return; }
         log.info({ cacheKey, count: downloaded.length }, "Subtitles cached");
         broadcastSubs(downloaded, cacheKey);
       }).catch((e) => log.error({ err: e.message }, "Subtitle download error"));
     }
   }
 
+  playbackRequest.assertCurrent();
   updateState({
     status: autoplay ? "playing" : "paused",
     resolvedUrl: resolved.url || resolved.videoUrl,
@@ -4007,17 +4069,20 @@ async function playUrlNow({
   const history = loadHistory();
   const savedEntry = history.find((h) => h.url === url);
   const numericStartTime = Number(requestedStartTime);
-  const startTime = Number.isFinite(numericStartTime) && numericStartTime >= 0
+  const startTime = resolved.isLive
+    ? 0
+    : Number.isFinite(numericStartTime) && numericStartTime >= 0
     ? numericStartTime
     : savedEntry?.progress || 0;
 
-  broadcast({
+  sendToPlayer({
     type: "play",
     url: playerUrl,
     mediaSource,
     sourceUrl: url,
     title: resolved.title,
     isLive: resolved.isLive,
+    liveDvr: resolved.isLive ? { available: true, defaultLatencySeconds: 30 } : null,
     thumbnail: thumbUrl,
     duration: resolved.duration,
     startTime,
@@ -4109,7 +4174,7 @@ async function applyViewportQualitySwitch() {
       fromHeight,
       targetHeight,
     }, "Viewport quality switch failed");
-    updateState({ status: autoplay ? "playing" : "paused" });
+    if (!isPlaybackSuperseded(err)) updateState({ status: autoplay ? "playing" : "paused" });
   } finally {
     viewportQualitySwitching = false;
     // Only schedule another pass when the viewport changed while this switch
@@ -4126,7 +4191,7 @@ app.post("/api/play", async (req, res) => {
   try {
     res.json(await playUrlNow(req.body));
   } catch (e) {
-    updateState({ status: "idle" });
+    if (!isPlaybackSuperseded(e)) updateState({ status: "idle" });
     res.status(e.status || 500).json({ error: e.message });
   }
 });
@@ -4139,6 +4204,7 @@ app.post("/api/control", async (req, res) => {
   }
 
   if (action === "stop") {
+    playbackCoordinator.cancel();
     await killPipeline();
     await stopActivePlexTranscode();
     resetDashSegmentSession();
@@ -4152,14 +4218,14 @@ app.post("/api/control", async (req, res) => {
   if (action === "pause") updateState({ status: "paused" });
   if (action === "resume") updateState({ status: "playing" });
 
-  broadcast({ type: action });
+  sendToPlayer({ type: action });
   res.json({ ok: true, status: state.status });
 });
 
 // --- Dev tools -------------------------------------------------------
 
 app.post("/api/dev/reload", (_req, res) => {
-  broadcast({ type: "reload" });
+  sendToPlayer({ type: "reload" });
   res.json({ ok: true });
 });
 
@@ -4266,7 +4332,23 @@ app.get("/api/status", (_req, res) => {
 // --- WebSocket -------------------------------------------------------
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 });
+let queueAdvanceInFlight = false;
+
+function isAllowedWebSocketOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  try {
+    const originUrl = new URL(origin);
+    const allowedHosts = new Set([
+      req.headers.host,
+      ...String(req.headers["x-forwarded-host"] || "").split(",").map((value) => value.trim()),
+    ].filter(Boolean));
+    return ["http:", "https:"].includes(originUrl.protocol) && allowedHosts.has(originUrl.host);
+  } catch {
+    return false;
+  }
+}
 
 // Ping all clients every 30s to keep connections alive through Cloudflare Tunnel
 const WS_PING_INTERVAL = setInterval(() => {
@@ -4281,67 +4363,90 @@ WS_PING_INTERVAL.unref();
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
+  ws.on("error", (error) => {
+    log.warn({ err: error?.message }, "Player WebSocket error");
+  });
 
-  const role = new URL(req.url, "http://localhost").searchParams.get("role");
-
-  if (role === "player") {
-    playerWs = ws;
-    log.info("Player WebSocket connected");
-
-    ws.send(JSON.stringify({ type: "queueUpdated", queue: listQueue() }));
-    ws.send(JSON.stringify({ type: "playlistsUpdated", playlists: listPlaylists() }));
-
-    ws.on("close", () => {
-      log.info("Player WebSocket disconnected");
-      if (playerWs === ws) playerWs = null;
-    });
+  let role = null;
+  try { role = new URL(req.url, "http://localhost").searchParams.get("role"); } catch {}
+  if (role !== "player" || !isAllowedWebSocketOrigin(req)) {
+    log.warn({ role, origin: req.headers.origin || null }, "Rejected WebSocket connection");
+    ws.close(1008, "Invalid WebSocket role or origin");
+    return;
   }
 
+  const previousPlayer = playerWs;
+  playerWs = ws;
+  if (previousPlayer && previousPlayer !== ws && previousPlayer.readyState === 1) {
+    previousPlayer.close(1012, "Player connection replaced");
+  }
+  log.info("Player WebSocket connected");
+
+  ws.send(JSON.stringify({ type: "queueUpdated", queue: listQueue() }));
+  ws.send(JSON.stringify({ type: "playlistsUpdated", playlists: listPlaylists() }));
+
+  ws.on("close", () => {
+    log.info("Player WebSocket disconnected");
+    if (playerWs === ws) playerWs = null;
+  });
+
   ws.on("message", (raw) => {
+    if (ws !== playerWs) return;
     try {
-      const msg = JSON.parse(raw);
+      const msg = JSON.parse(raw.toString("utf8"));
+      if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
       // Player reports status changes
       if (msg.type === "status" && msg.status) {
-        updateState(msg.status === "idle"
+        const status = normalizePlayerStatus(msg.status);
+        if (!status) return;
+        updateState(status === "idle"
           ? { status: "idle", url: null, resolvedUrl: null, streamProfile: null, title: null, isLive: false }
-          : { status: msg.status });
+          : { status });
       } else if (msg.type === "playerState") {
+        const reportedState = normalizePlayerState(msg);
         playerState = {
-          currentTime: msg.currentTime,
-          duration: msg.duration,
-          isPlaying: msg.isPlaying,
-          isMuted: msg.isMuted,
-          viewport: msg.viewport || null,
+          currentTime: reportedState.currentTime,
+          duration: reportedState.duration,
+          isPlaying: reportedState.isPlaying,
+          isMuted: reportedState.isMuted,
+          viewport: reportedState.viewport,
           updatedAt: Date.now(),
         };
         scheduleViewportQualitySwitch(playerState.viewport);
         // Save progress for non-Plex content to history
-        if (!msg.plexRatingKey && state.url) {
+        if (!reportedState.plexRatingKey && state.url) {
           const history = loadHistory();
           const entry = history.find((h) => h.url === state.url);
           if (entry) {
             // Mark watched at 90% (same threshold as Plex)
-            const nearEnd = msg.duration > 0 && msg.currentTime >= msg.duration * 0.9;
+            const nearEnd = reportedState.duration > 0
+              && reportedState.currentTime >= reportedState.duration * 0.9;
             if (nearEnd && !entry._markedWatched) {
               entry.viewCount = (entry.viewCount || 0) + 1;
               entry._markedWatched = true;
             }
             if (!nearEnd) entry._markedWatched = false;
-            entry.progress = (nearEnd || msg.currentTime <= 5) ? 0 : Math.floor(msg.currentTime);
+            entry.progress = (nearEnd || reportedState.currentTime <= 5)
+              ? 0
+              : Math.floor(reportedState.currentTime);
             saveHistory(history);
           }
         }
       } else if (msg.type === "pong") {
         ws.lastPong = Date.now();
       } else if (msg.type === "ended") {
+        if (queueAdvanceInFlight) return;
+        queueAdvanceInFlight = true;
         playNextFromQueue().then((result) => {
           if (!result) updateState({ status: "idle" });
         }).catch((err) => {
           log.error({ err: err?.message || String(err) }, "Failed to autoplay next queue item");
-          updateState({ status: "idle" });
-        });
+          if (!isPlaybackSuperseded(err)) updateState({ status: "idle" });
+        }).finally(() => { queueAdvanceInFlight = false; });
       }
-    } catch {}
+    } catch (error) {
+      log.warn({ err: error?.message }, "Rejected invalid player WebSocket message");
+    }
   });
 });
 
@@ -4353,14 +4458,6 @@ setInterval(() => {
 }, 25_000).unref();
 
 // --- Health endpoint --------------------------------------------------
-
-const startedAt = Date.now();
-let activeConnections = 0;
-app.use((req, res, next) => {
-  activeConnections++;
-  res.once("close", () => activeConnections--);
-  next();
-});
 
 app.get("/api/health", (_req, res) => {
   const mem = process.memoryUsage();
@@ -4374,7 +4471,7 @@ app.get("/api/health", (_req, res) => {
       heapTotalMB: Math.round(mem.heapTotal / 1048576),
     },
     connections: { http: activeConnections, websocket: wss.clients.size },
-    pipeline: { ytdlp: !!ytdlpProc, ffmpeg: !!ffmpegProc, hlsActive: !!currentHlsDir },
+    pipeline: { ffmpeg: !!ffmpegProc, transcodeActive: !!currentTranscodeDir },
     proxy: { entries: proxyMap.size, dashMaps: dashSegmentMaps.size },
     player: { connected: !!(playerWs?.readyState === 1), status: state.status },
   });
@@ -4410,30 +4507,49 @@ app.post("/api/diag", (req, res) => {
 
 // --- Start -----------------------------------------------------------
 
-let isShuttingDown = false;
-
-process.on("unhandledRejection", (err) => {
-  log.error({ err: err?.message, stack: err?.stack }, "Unhandled rejection");
-});
-process.on("uncaughtException", (err) => {
-  log.fatal({ err: err?.message, stack: err?.stack }, "Uncaught exception");
-});
-
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   log.info({ signal }, "Shutting down gracefully");
-  broadcast({ type: "serverShutdown" });
-  await killPipeline();
-  await stopActivePlexTranscode();
+  const forceTimer = setTimeout(() => {
+    log.error("Forced exit after 10s timeout");
+    process.exit(exitCode || 1);
+  }, 10_000);
+  forceTimer.unref();
+  playbackCoordinator.cancel("Server shutting down");
+  broadcastAll({ type: "serverShutdown" });
+  clearInterval(WS_PING_INTERVAL);
+  const cleanupResults = await Promise.allSettled([
+    killPipeline(),
+    stopActivePlexTranscode(),
+  ]);
+  for (const result of cleanupResults) {
+    if (result.status === "rejected") {
+      log.error({ err: result.reason?.message || String(result.reason) }, "Shutdown cleanup failed");
+    }
+  }
   wss.clients.forEach((ws) => { try { ws.close(1001, "Server shutting down"); } catch {} });
+  if (!server.listening) {
+    clearTimeout(forceTimer);
+    process.exit(exitCode);
+  }
   server.close(() => {
+    clearTimeout(forceTimer);
     log.info("All connections drained, exiting");
-    process.exit(0);
+    process.exit(exitCode);
   });
-  setTimeout(() => { log.error("Forced exit after 10s timeout"); process.exit(1); }, 10_000).unref();
 }
 
+function terminateOnFatal(kind, error) {
+  log.fatal({ err: error?.message, stack: error?.stack }, kind);
+  void gracefulShutdown(kind, { exitCode: 1 }).catch((shutdownError) => {
+    log.fatal({ err: shutdownError?.message }, "Fatal shutdown failed");
+    process.exit(1);
+  });
+}
+
+process.on("unhandledRejection", (err) => terminateOnFatal("Unhandled rejection", err));
+process.on("uncaughtException", (err) => terminateOnFatal("Uncaught exception", err));
 process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
 process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
 
