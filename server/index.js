@@ -3498,7 +3498,7 @@ app.get("/api/plex/thumb", async (req, res) => {
       res.set("Content-Type", mime);
       res.set("X-Content-Type-Options", "nosniff");
       res.set("Cache-Control", "public, max-age=604800");
-      return res.sendFile(dataFile);
+      return res.sendFile(dataFile, { dotfiles: "allow" });
     } catch {
       safeUnlink(metaFile);
       safeUnlink(dataFile);
@@ -3540,7 +3540,7 @@ app.get("/api/thumb", async (req, res) => {
       res.set("Content-Type", mime);
       res.set("X-Content-Type-Options", "nosniff");
       res.set("Cache-Control", "public, max-age=604800");
-      return res.sendFile(dataFile);
+      return res.sendFile(dataFile, { dotfiles: "allow" });
     } catch {
       safeUnlink(metaFile);
       safeUnlink(dataFile);
