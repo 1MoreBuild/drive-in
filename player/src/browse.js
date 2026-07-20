@@ -4,6 +4,7 @@ import { fmt, timeAgo, escHtml } from "./utils.js";
 import { navigate } from "./router.js";
 import { showStatus } from "./player.js";
 import { loadSubtitleTrack, disableExternalSubtitle, removeSubtitleTrack } from "./subtitles.js";
+import { requestJson, requestJsonData, requestOk } from "./network.js";
 
 function escAttr(value) {
   return escHtml(String(value || "")).replace(/"/g, "&quot;");
@@ -185,11 +186,11 @@ export function toggleSubtitle(lang) {
     state.activeExternalSubs.add(lang);
     const sub = state.externalSubs.find((s) => s.lang === lang);
     if (sub) {
-      fetch(`${location.origin}/api/subtitles/select`, {
+      requestJsonData(`${location.origin}/api/subtitles/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lang }),
-      }).then((r) => r.json()).then((data) => {
+      }, { label: "Subtitle selection" }).then((data) => {
         if (data.url) loadSubtitleTrack(lang, data.url);
       }).catch((err) => console.error("[subs] Error:", err));
     }
@@ -256,10 +257,10 @@ function selectAudioTrack(audioId) {
 
 export async function loadBrowseScreen() {
   const [queueRes, playlistsRes, historyRes, libsRes] = await Promise.allSettled([
-    fetch(`${location.origin}/api/queue`).then((r) => r.json()),
-    fetch(`${location.origin}/api/playlists`).then((r) => r.json()),
-    fetch(`${location.origin}/api/history`).then((r) => r.json()),
-    fetch(`${location.origin}/api/plex/libraries`).then((r) => r.json()),
+    requestJsonData(`${location.origin}/api/queue`, {}, { label: "Queue" }),
+    requestJsonData(`${location.origin}/api/playlists`, {}, { label: "Playlists" }),
+    requestJsonData(`${location.origin}/api/history`, {}, { label: "History" }),
+    requestJsonData(`${location.origin}/api/plex/libraries`, {}, { label: "Plex libraries" }),
   ]);
 
   const queue = queueRes.status === "fulfilled" ? queueRes.value : [];
@@ -299,8 +300,8 @@ export async function loadBrowseScreen() {
   const showLib = libs.find((l) => l.type === "show");
 
   const [moviesRes, showsRes] = await Promise.allSettled([
-    movieLib ? fetch(`${location.origin}/api/plex/library/${movieLib.id}?size=0`).then((r) => r.json()) : Promise.resolve(null),
-    showLib ? fetch(`${location.origin}/api/plex/library/${showLib.id}?size=0`).then((r) => r.json()) : Promise.resolve(null),
+    movieLib ? requestJsonData(`${location.origin}/api/plex/library/${movieLib.id}?size=0`, {}, { label: "Plex movies" }) : Promise.resolve(null),
+    showLib ? requestJsonData(`${location.origin}/api/plex/library/${showLib.id}?size=0`, {}, { label: "Plex shows" }) : Promise.resolve(null),
   ]);
 
   if (moviesRes.status === "fulfilled" && moviesRes.value?.items?.length) {
@@ -370,9 +371,12 @@ export function renderPlaylists(playlists = []) {
 
 async function enqueuePlaylist(id) {
   try {
-    const res = await fetch(`${location.origin}/api/playlists/${encodeURIComponent(id)}/enqueue`, { method: "POST" });
-    if (!res.ok) return;
-    const data = await res.json();
+    const { ok, data } = await requestJson(
+      `${location.origin}/api/playlists/${encodeURIComponent(id)}/enqueue`,
+      { method: "POST" },
+      { label: "Enqueue playlist" },
+    );
+    if (!ok) return;
     if (data.queue) renderQueue(data.queue);
   } catch (err) {
     console.error("[playlist] Enqueue failed:", err);
@@ -424,7 +428,11 @@ async function playQueueItem(id) {
   browseScreen.classList.add("hidden");
   statusScreen.style.display = "";
   try {
-    await fetch(`${location.origin}/api/queue/${encodeURIComponent(id)}/play`, { method: "POST" });
+    await requestOk(
+      `${location.origin}/api/queue/${encodeURIComponent(id)}/play`,
+      { method: "POST" },
+      { label: "Play queue item", timeoutMs: 90_000 },
+    );
   } catch (err) {
     console.error("[queue] Play failed:", err);
   }
@@ -434,8 +442,8 @@ async function removeQueueItem(id) {
   const current = state.queue.slice();
   renderQueue(current.filter((item) => item.id !== id));
   try {
-    const res = await fetch(`${location.origin}/api/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
-    if (!res.ok) renderQueue(current);
+    const ok = await requestOk(`${location.origin}/api/queue/${encodeURIComponent(id)}`, { method: "DELETE" }, { label: "Remove queue item" });
+    if (!ok) renderQueue(current);
   } catch (err) {
     renderQueue(current);
   }
@@ -446,8 +454,8 @@ queueClear?.addEventListener("click", async (e) => {
   const current = state.queue.slice();
   renderQueue([]);
   try {
-    const res = await fetch(`${location.origin}/api/queue`, { method: "DELETE" });
-    if (!res.ok) renderQueue(current);
+    const ok = await requestOk(`${location.origin}/api/queue`, { method: "DELETE" }, { label: "Clear queue" });
+    if (!ok) renderQueue(current);
   } catch {
     renderQueue(current);
   }
@@ -455,11 +463,11 @@ queueClear?.addEventListener("click", async (e) => {
 
 async function addToQueue(body, { playNext = false } = {}) {
   try {
-    await fetch(`${location.origin}/api/queue`, {
+    await requestOk(`${location.origin}/api/queue`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...body, playNext }),
-    });
+    }, { label: "Add to queue" });
   } catch (err) {
     console.error("[queue] Add failed:", err);
   }
@@ -632,11 +640,11 @@ function commitHistoryDeletes() {
   for (const { item, el } of pendingDeletes) {
     const key = item.plex?.ratingKey;
     const body = key ? { ratingKey: String(key) } : { url: item.url };
-    fetch(`${location.origin}/api/history`, {
+    requestOk(`${location.origin}/api/history`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }).catch(() => {});
+    }, { label: "Delete history item" }).catch(() => {});
     el.remove();
   }
   pendingDeletes.length = 0;
@@ -650,11 +658,11 @@ function commitHistoryDeletes() {
 function playItem(item) {
   if (item.plex?.ratingKey) playPlexItem(item.plex.ratingKey);
   else if (item.url) {
-    fetch(`${location.origin}/api/play`, {
+    requestOk(`${location.origin}/api/play`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: item.url }),
-    }).catch(() => {});
+    }, { label: "Start playback", timeoutMs: 90_000 }).catch(() => {});
   }
   showStatus("Loading...");
   browseScreen.classList.add("hidden");
@@ -685,8 +693,11 @@ export async function openEpisodes(show) {
   showsSection.classList.add("hidden");
 
   try {
-    const res = await fetch(`${location.origin}/api/plex/show/${show.ratingKey}/episodes`);
-    const eps = await res.json();
+    const eps = await requestJsonData(
+      `${location.origin}/api/plex/show/${show.ratingKey}/episodes`,
+      {},
+      { label: "Plex episodes" },
+    );
 
     const seasons = new Map();
     for (const ep of eps) {

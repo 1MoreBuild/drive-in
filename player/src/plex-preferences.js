@@ -31,14 +31,15 @@ export function plexPlaybackRequest(ratingKey, extra = {}) {
 }
 
 export async function requestPlexPlayback(payload) {
-  const response = await fetch(`${location.origin}/api/plex/play`, {
+  const response = await requestJson(`${location.origin}/api/plex/play`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
-  const result = await response.json().catch(() => ({}));
+  }, { label: "Plex playback", timeoutMs: 90_000 });
+  const result = response.data || {};
   if (!response.ok) {
     throw new Error(result.error || `Plex playback failed with ${response.status}`);
   }
   return result;
 }
+import { requestJson } from "./network.js";

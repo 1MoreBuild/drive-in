@@ -5,6 +5,7 @@ import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, 
 import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
+import { requestJson } from "./network.js";
 
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
@@ -114,13 +115,13 @@ async function restoreConnectedRoute() {
     const body = route.plex ? plexPlaybackRequest(route.plex) : { url: route.url };
     const playbackRequest = route.plex
       ? requestPlexPlayback(body)
-      : fetch(`${location.origin}${endpoint}`, {
+      : requestJson(`${location.origin}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      }).then(async (response) => {
+      }, { label: "Resume playback", timeoutMs: 90_000 }).then(async (response) => {
         if (response.ok) return response;
-        const result = await response.json().catch(() => ({}));
+        const result = response.data || {};
         throw new Error(result.error || `Playback failed with ${response.status}`);
       });
     playbackRequest.catch((error) => {
@@ -205,7 +206,9 @@ function connect() {
             startTime: msg.startTime || 0,
             sourceUrl: msg.sourceUrl || null,
             mediaSource: msg.mediaSource || null,
+            streamProfile: msg.streamProfile || null,
             autoplay: msg.autoplay !== false,
+            __recovery: msg.recovery === true,
           }).catch((error) => console.error("[playback] Play transition failed:", error));
           break;
         case "pause":

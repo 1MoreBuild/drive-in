@@ -3,12 +3,18 @@ import { PlaybackGeneration } from "./playback-generation.js";
 import {
   showControls, updateTimeDisplay, updateProgress, updatePlayButton,
   updateVolumeButton, showBuffering, hideBuffering, isDraggingProgress,
-  mediaTitle,
+  showPlaybackNotice, hidePlaybackNotice, mediaTitle,
 } from "./controls.js";
 import { renderSubtitle, loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { navigate } from "./router.js";
 import { MediabunnyPlayer } from "./engine/mediabunny-player.js";
 import { PageMemoryMonitor } from "./telemetry/page-memory-monitor.js";
+import { requestJson, requestOk } from "./network.js";
+import { assessBandwidthHealth } from "./bandwidth-health.js";
+import {
+  buildFreshPlaybackSessionRequest,
+  playbackRecoveryDelayMs,
+} from "./playback-recovery.js";
 
 // --- Callbacks (set by main.js to avoid circular deps) ---------------
 
@@ -34,9 +40,10 @@ const STUTTER_LONG_TASK_THRESHOLD_MS = 50;
 const STUTTER_MEMORY_SAMPLE_INTERVAL_MS = 15_000;
 const STUTTER_FLUSH_IDLE_TIMEOUT_MS = 1_000;
 const PLAYER_HEALTH_HEARTBEAT_INTERVAL_MS = 30_000;
-const PLAYER_RECOVERY_MAX_ATTEMPTS = 2;
 const PLAYER_RECOVERY_STABLE_MS = 60_000;
-const PLAYER_RECOVERY_BACKOFF_MS = [1_000, 3_000];
+// A car can be offline for minutes. Recovery stays active until playback is
+// stable again or the user starts/stops something else; the capped backoff
+// prevents a retry storm while still healing after connectivity returns.
 const VIDEO_FREEZE_THRESHOLD_MS = 8_000;
 const VIDEO_FREEZE_DRIFT_MS = 5_000;
 const PLAYER_LOG_ENDPOINT = "/api/dev/player-log";
@@ -67,6 +74,8 @@ let scheduledStutterFlushReason = "interval";
 let longTaskObserver = null;
 let decodeHealthInterval = null;
 let playerHealthHeartbeatInterval = null;
+let bandwidthDiagnosisInterval = null;
+let bandwidthBufferingStartedAt = 0;
 const playbackRecoveryState = {
   attempts: 0,
   retryTimer: null,
@@ -130,7 +139,35 @@ function getPlaybackRecoveryPosition(player) {
   return Math.max(0, Math.min(state.duration || Infinity, state.currentTime || 0));
 }
 
+function stopBandwidthDiagnosis() {
+  if (bandwidthDiagnosisInterval) clearInterval(bandwidthDiagnosisInterval);
+  bandwidthDiagnosisInterval = null;
+  bandwidthBufferingStartedAt = 0;
+  hidePlaybackNotice();
+}
+
+function startBandwidthDiagnosis(player, streamProfile) {
+  if (bandwidthDiagnosisInterval || !streamProfile) return;
+  bandwidthBufferingStartedAt = performance.now();
+  const update = () => {
+    if (state.player !== player || !state.isBuffering) {
+      stopBandwidthDiagnosis();
+      return;
+    }
+    const diagnosis = assessBandwidthHealth({
+      bufferingMs: performance.now() - bandwidthBufferingStartedAt,
+      streamProfile,
+      stats: summarizePlayerStats(player),
+    });
+    if (diagnosis) showPlaybackNotice(diagnosis.message);
+    else hidePlaybackNotice();
+  };
+  bandwidthDiagnosisInterval = setInterval(update, 2_000);
+  update();
+}
+
 function isRecoverablePlaybackError(error) {
+  if (["HLS_SEGMENT_FETCH_FAILED", "HLS_SEGMENT_INACTIVITY"].includes(error?.code)) return true;
   const message = error?.message || String(error || "");
   return /demux error|decod|encodingerror|network|fetch|timeout|connection|video.*(stall|frozen)|stream.*(closed|ended)/i.test(message);
 }
@@ -147,32 +184,45 @@ function markPlaybackStable(player) {
   }, PLAYER_RECOVERY_STABLE_MS);
 }
 
+async function requestFreshPlaybackSession(request, startTime) {
+  const freshRequest = buildFreshPlaybackSessionRequest(request, startTime);
+  if (!freshRequest) return false;
+
+  const response = await requestJson(freshRequest.endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(freshRequest.body),
+  }, {
+    label: "Playback recovery",
+    // yt-dlp plus DASH probing can legitimately take tens of seconds. Keep the
+    // request bounded below Cloudflare's 100-second request ceiling.
+    timeoutMs: 90_000,
+  });
+  const result = response.data || {};
+  if (!response.ok) {
+    throw new Error(`Network recovery could not create a fresh stream: ${result.error || response.status}`);
+  }
+  return true;
+}
+
 function schedulePlaybackRecovery(player, error) {
-  if (state.player !== player || !playbackRecoveryState.request || !isRecoverablePlaybackError(error)) {
+  const playerIsCurrent = player ? state.player === player : !state.player;
+  if (!playerIsCurrent || !playbackRecoveryState.request || !isRecoverablePlaybackError(error)) {
     return false;
   }
   if (playbackRecoveryState.retryTimer) return true;
-  if (playbackRecoveryState.attempts >= PLAYER_RECOVERY_MAX_ATTEMPTS) {
-    state.isPlaying = false;
-    showStatus("Video stream failed. Reload to try again.");
-    postPlayerRuntimeLog("playback_recovery_exhausted", {
-      error: error?.message || String(error),
-      attempts: playbackRecoveryState.attempts,
-    });
-    return false;
-  }
 
   if (playbackRecoveryState.stableTimer) {
     clearTimeout(playbackRecoveryState.stableTimer);
     playbackRecoveryState.stableTimer = null;
   }
   const attempt = playbackRecoveryState.attempts + 1;
-  const delayMs = PLAYER_RECOVERY_BACKOFF_MS[Math.min(attempt - 1, PLAYER_RECOVERY_BACKOFF_MS.length - 1)];
+  const delayMs = playbackRecoveryDelayMs(attempt);
   const startTime = getPlaybackRecoveryPosition(player);
   playbackRecoveryState.attempts = attempt;
   state.isPlaying = false;
-  player.pause?.().catch(() => {});
-  showStatus(`Recovering video (${attempt}/${PLAYER_RECOVERY_MAX_ATTEMPTS})...`);
+  player?.pause?.().catch(() => {});
+  showStatus(`Recovering video (attempt ${attempt})...`);
   postPlayerRuntimeLog("playback_recovery_scheduled", {
     error: error?.message || String(error),
     attempt,
@@ -182,14 +232,26 @@ function schedulePlaybackRecovery(player, error) {
 
   const runRecovery = async () => {
     playbackRecoveryState.retryTimer = null;
-    if (state.player !== player) return;
+    if (player ? state.player !== player : state.player) return;
     const request = playbackRecoveryState.request;
     if (!request) return;
-    await play(request.url, request.title, {
-      ...request.meta,
-      startTime,
-      __recovery: true,
-    });
+    try {
+      if (await requestFreshPlaybackSession(request, startTime)) return;
+      await play(request.url, request.title, {
+        ...request.meta,
+        startTime,
+        __recovery: true,
+      });
+    } catch (recoveryError) {
+      postPlayerRuntimeLog("playback_recovery_attempt_failed", {
+        error: recoveryError?.message || String(recoveryError),
+        attempt,
+        startTime,
+      });
+      if (!schedulePlaybackRecovery(player, recoveryError)) {
+        showStatus(`Recovery error: ${recoveryError.message}`);
+      }
+    }
   };
   playbackRecoveryState.retryTimer = setTimeout(runRecovery, delayMs);
   return true;
@@ -586,6 +648,16 @@ function collectBufferState(player = state.player) {
     hlsBufferedBytes: normalizeMetricNumber(stats?.hlsBufferedBytes),
     hlsCachedSegments: normalizeMetricNumber(stats?.hlsCachedSegments),
     hlsPendingSegments: normalizeMetricNumber(stats?.hlsPendingSegments),
+    hlsActiveDownloads: normalizeMetricNumber(stats?.hlsActiveDownloads),
+    hlsQueuedSegments: normalizeMetricNumber(stats?.hlsQueuedSegments),
+    hlsRetryWaitingSegments: normalizeMetricNumber(stats?.hlsRetryWaitingSegments),
+    hlsOldestActiveDownloadMs: normalizeMetricNumber(stats?.hlsOldestActiveDownloadMs),
+    hlsNetworkRetryCount: normalizeMetricNumber(stats?.hlsNetworkRetryCount),
+    hlsTimeoutCount: normalizeMetricNumber(stats?.hlsTimeoutCount),
+    hlsFailureCount: normalizeMetricNumber(stats?.hlsFailureCount),
+    hlsLastFailure: stats?.hlsLastFailure && typeof stats.hlsLastFailure === "object"
+      ? stats.hlsLastFailure
+      : null,
     hlsBufferMaxBytes: normalizeMetricNumber(stats?.hlsBufferMaxBytes),
     hlsBufferTargetSeconds: normalizeMetricNumber(stats?.hlsBufferTargetSeconds),
     hlsBufferCacheUtilization: safeRound(normalizeMetricNumber(stats?.hlsBufferCacheUtilization)),
@@ -641,7 +713,6 @@ async function maybeMeasurePageMemory() {
 }
 
 function postPlayerRuntimeLog(type, fields = {}) {
-  if (!originalFetch) return;
   const payload = {
     type,
     timestamp: Date.now(),
@@ -653,11 +724,11 @@ function postPlayerRuntimeLog(type, fields = {}) {
     playbackSessionId: playerRuntimeLogState.playbackSessionId,
     ...fields,
   };
-  originalFetch(PLAYER_LOG_ENDPOINT, {
+  requestOk(PLAYER_LOG_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }).catch(() => {});
+  }, { label: "Player runtime log", timeoutMs: 5_000 }).catch(() => {});
 }
 
 function isPlayerMediaResourceUrl(url) {
@@ -806,9 +877,20 @@ function summarizePlayerStats(player) {
     width: normalizeMetricNumber(stats.width),
     height: normalizeMetricNumber(stats.height),
     hlsBufferedAheadSeconds: normalizeMetricNumber(stats.hlsBufferedAheadSeconds),
+    hlsThroughputSampleCount: normalizeMetricNumber(stats.hlsThroughputSampleCount),
     hlsBufferedBytes: normalizeMetricNumber(stats.hlsBufferedBytes),
     hlsCachedSegments: normalizeMetricNumber(stats.hlsCachedSegments),
     hlsPendingSegments: normalizeMetricNumber(stats.hlsPendingSegments),
+    hlsActiveDownloads: normalizeMetricNumber(stats.hlsActiveDownloads),
+    hlsQueuedSegments: normalizeMetricNumber(stats.hlsQueuedSegments),
+    hlsRetryWaitingSegments: normalizeMetricNumber(stats.hlsRetryWaitingSegments),
+    hlsOldestActiveDownloadMs: normalizeMetricNumber(stats.hlsOldestActiveDownloadMs),
+    hlsNetworkRetryCount: normalizeMetricNumber(stats.hlsNetworkRetryCount),
+    hlsTimeoutCount: normalizeMetricNumber(stats.hlsTimeoutCount),
+    hlsFailureCount: normalizeMetricNumber(stats.hlsFailureCount),
+    hlsLastFailure: stats.hlsLastFailure && typeof stats.hlsLastFailure === "object"
+      ? stats.hlsLastFailure
+      : null,
     hlsBufferMaxBytes: normalizeMetricNumber(stats.hlsBufferMaxBytes),
     hlsBufferTargetSeconds: normalizeMetricNumber(stats.hlsBufferTargetSeconds),
     hlsBufferCacheUtilization: safeRound(normalizeMetricNumber(stats.hlsBufferCacheUtilization)),
@@ -1000,12 +1082,12 @@ function postStutterTelemetry(payload, keepalive = false) {
     } catch {}
   }
 
-  return fetch("/api/dev/stutter-log", {
+  return requestOk("/api/dev/stutter-log", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,
     keepalive,
-  }).then((response) => response.ok);
+  }, { label: "Stutter telemetry", timeoutMs: 5_000 });
 }
 
 function flushStutterTelemetry(reason = "interval", { keepalive = false } = {}) {
@@ -1196,7 +1278,7 @@ function reportPlayerMetrics() {
   detectVideoFreeze(playerStats);
   const reportedCurrentTime = getReportedCurrentTime();
 
-  fetch("/api/metrics/player", {
+  requestOk("/api/metrics/player", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1222,7 +1304,7 @@ function reportPlayerMetrics() {
         crossOriginIsolated: CAPABILITY_PROFILE.crossOriginIsolated,
       },
     }),
-  }).catch(() => {});
+  }, { label: "Player metrics", timeoutMs: 5_000 }).catch(() => {});
 }
 
 function detectCapabilityProfile() {
@@ -1257,11 +1339,11 @@ function reportDecodeInfo(data) {
     playerRuntimeLogState.lastDecodePath = data.path;
     playerMetricsState.decodePath = data.path;
   }
-  fetch("/api/dev/decode-log", {
+  requestOk("/api/dev/decode-log", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  }).catch(() => {});
+  }, { label: "Decode telemetry", timeoutMs: 5_000 }).catch(() => {});
 }
 
 async function logDecodePath(player, phase, extra = {}) {
@@ -1366,14 +1448,14 @@ export function reportProgress() {
     state.ws.send(JSON.stringify({ type: "playerState", ...ps }));
   }
   if (state.plexInfo?.ratingKey) {
-    fetch("/api/plex/progress", {
+    requestOk("/api/plex/progress", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ratingKey: state.plexInfo.ratingKey,
         timeMs: reportedCurrentTime * 1000,
       }),
-    }).catch(() => {});
+    }, { label: "Plex progress", timeoutMs: 5_000 }).catch(() => {});
   }
   reportPlayerMetrics();
 }
@@ -1512,16 +1594,20 @@ function createMediabunnyPlayer(meta) {
     onStateChange: (nextState, detail) => {
       if (state.player !== player) return;
       if (["loading", "seeking", "buffering"].includes(nextState)) {
+        if (nextState !== "buffering") stopBandwidthDiagnosis();
         beginStall();
         showBuffering();
         if (nextState === "buffering") state.isPlaying = true;
+        if (nextState === "buffering") startBandwidthDiagnosis(player, meta.streamProfile);
       } else if (nextState === "playing") {
+        stopBandwidthDiagnosis();
         endStall();
         hideBuffering();
         state.isPlaying = true;
         updatePlayButton();
         updateMediaSession();
       } else if (nextState === "paused") {
+        stopBandwidthDiagnosis();
         endStall();
         hideBuffering();
         state.isPlaying = false;
@@ -1540,6 +1626,7 @@ function createMediabunnyPlayer(meta) {
       markPlaybackStable(player);
     },
     onEnded: () => {
+      stopBandwidthDiagnosis();
       endStall();
       hideBuffering();
       state.isPlaying = false;
@@ -1553,6 +1640,7 @@ function createMediabunnyPlayer(meta) {
       showControls();
     },
     onError: (error) => {
+      stopBandwidthDiagnosis();
       endStall();
       console.error("[mediabunny] Playback error:", error);
       if (!schedulePlaybackRecovery(player, error)) {
@@ -1576,7 +1664,7 @@ function createMediabunnyPlayer(meta) {
         reason,
         network,
       });
-      const response = await fetch(switchUrl, {
+      const response = await requestJson(switchUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1585,8 +1673,8 @@ function createMediabunnyPlayer(meta) {
           currentTime,
           switchOffset: currentTime + Math.max(0, Number(network?.bufferedAheadSeconds) || 0),
         }),
-      });
-      const result = await response.json().catch(() => ({}));
+      }, { label: "Stream quality switch", timeoutMs: 30_000 });
+      const result = response.data || {};
       if (!response.ok) throw new Error(result.error || `ABR switch failed with ${response.status}`);
       if (meta.mediaSource?.abr) {
         meta.mediaSource.abr.currentBitrate = result.videoBitrate;
@@ -1656,6 +1744,7 @@ export async function play(url, title, meta = {}) {
 
   let player = null;
   try {
+    stopBandwidthDiagnosis();
     ensureLongTaskObserver();
     resetPlayerMetrics();
     resetStutterTelemetry();
@@ -1667,6 +1756,7 @@ export async function play(url, title, meta = {}) {
     stopStutterTelemetryReporting();
     stopPlayerHealthHeartbeat();
     stopDecodeHealthMonitoring();
+    stopBandwidthDiagnosis();
     const previousPlayer = state.player;
     state.player = null;
     state.isPlaying = false;
@@ -1797,7 +1887,9 @@ export async function play(url, title, meta = {}) {
     state.isPlaying = false;
     hideBuffering();
     updatePlayButton();
-    showStatus(`Error: ${e.message}`);
+    if (!isRecovery || !schedulePlaybackRecovery(null, e)) {
+      showStatus(`Error: ${e.message}`);
+    }
   }
 }
 
@@ -1812,6 +1904,7 @@ export async function stop() {
   stopStutterTelemetryReporting();
   stopPlayerHealthHeartbeat();
   stopDecodeHealthMonitoring();
+  stopBandwidthDiagnosis();
   const player = state.player;
   state.player = null;
   container.innerHTML = "";

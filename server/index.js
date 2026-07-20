@@ -23,22 +23,8 @@ import {
   SubtitleExtractionQueue,
 } from "./plex-subtitles.js";
 import {
-  addPlaylistItem,
-  createPlaylist,
-  addQueueItem,
-  clearQueue,
-  deletePlaylist,
-  enqueuePlaylist,
-  getPlaylist,
-  getQueueItem,
   listPlaylists,
   listQueue,
-  removeQueueItem,
-  removePlaylistItem,
-  reorderQueue,
-  reorderPlaylistItems,
-  shiftQueueItem,
-  updatePlaylist,
 } from "./queue-store.js";
 import {
   buildFormatSelector,
@@ -60,6 +46,17 @@ import {
   segmentUrlForSequence,
   sequenceForTime,
 } from "./youtube-live-dvr.js";
+import {
+  DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
+  fetchBufferWithRetry,
+  fetchTextWithRetry,
+  fetchWithRetry,
+  openUpstreamStream,
+} from "./upstream-fetch.js";
+import { createSegmentCachePathResolver, snapshotProxyUrl } from "./segment-cache-key.js";
+import { rewritePlexHlsManifest as rewritePlexHlsManifestBody } from "./plex-hls.js";
+import { registerQueuePlaylistApi } from "./queue-playlist-api.js";
+import { buildDashHlsSession, parseMp4Structure } from "./dash-hls.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -76,6 +73,7 @@ const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000]
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
 const SEGMENT_CACHE_DIR = resolve(__dirname, "../.segment-cache");
+const getSegmentCachePaths = createSegmentCachePathResolver(SEGMENT_CACHE_DIR);
 const SEGMENT_CACHE_MAX_BYTES = (() => {
   const parsed = Number(process.env.SEGMENT_CACHE_MAX_BYTES);
   if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
@@ -90,6 +88,7 @@ const SEGMENT_CACHE_MAX_PREFETCHES = 1;
 // Keep roughly 30 seconds of split-stream media warm. The canvas player only
 // holds a small decoded-frame queue, so network jitter must be absorbed here.
 const SEGMENT_PREFETCH_AHEAD = 6;
+const UPSTREAM_RESPONSE_TIMEOUT_MS = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS;
 const DASH_SEGMENT_INACTIVITY_TIMEOUT_MS = 6_000;
 const DASH_SEGMENT_FETCH_RETRIES = 2;
 const DASH_SEGMENT_MAX_BYTES = 32 * 1024 * 1024;
@@ -1024,20 +1023,38 @@ async function downloadSubtitlesDirect(subtitleList, destDir) {
         // Inline data (Bilibili etc) — already converted to VTT
         content = sub.data;
       } else if (sub.url) {
-        const resp = await fetch(sub.url);
+        const fetchedSubtitle = await fetchTextWithRetry(sub.url, {}, {
+          retries: 2,
+          label: `subtitle-${sub.lang}`,
+          timeoutMs: 30_000,
+          maxBytes: MAX_PLEX_SUBTITLE_BYTES,
+        });
+        const resp = fetchedSubtitle.response;
         if (!resp.ok) {
           log.warn({ lang: sub.lang, status: resp.status }, "Subtitle fetch failed");
           continue;
         }
-        content = await resp.text();
+        content = fetchedSubtitle.body;
 
         // YouTube returns HLS playlist for long videos — fetch all segments
         if (content.startsWith("#EXTM3U")) {
           const segUrls = content.split("\n").filter((l) => l.startsWith("http"));
           const parts = [];
+          let combinedBytes = 0;
           for (const segUrl of segUrls) {
-            const segResp = await fetch(segUrl);
-            if (segResp.ok) parts.push(await segResp.text());
+            const fetchedSegment = await fetchTextWithRetry(segUrl, {}, {
+              retries: 2,
+              label: `subtitle-segment-${sub.lang}`,
+              timeoutMs: 30_000,
+              maxBytes: MAX_PLEX_SUBTITLE_BYTES,
+            });
+            if (fetchedSegment.response.ok) {
+              combinedBytes += Buffer.byteLength(fetchedSegment.body);
+              if (combinedBytes > MAX_PLEX_SUBTITLE_BYTES) {
+                throw new Error("Combined subtitle segments are larger than 20 MiB");
+              }
+              parts.push(fetchedSegment.body);
+            }
           }
           content = parts.map((p, i) => {
             if (i === 0) return p;
@@ -1183,131 +1200,40 @@ const dashHlsSessions = new Map();
 
 // Probe MP4 structure: find init segment end, parse sidx for segment byte ranges
 async function probeMP4Structure(proxyId) {
-  // Fetch first 128KB — should contain ftyp + moov + sidx
-  const resp = await fetchWithRetry(
+  const response = await fetchWithRetry(
     `http://localhost:${PORT}/api/proxy?id=${proxyId}`,
     { headers: { Range: "bytes=0-131071" } },
     { retries: 3, label: "dash-probe" },
   );
-  const buf = Buffer.from(await resp.arrayBuffer());
-  const totalSize = parseInt((resp.headers.get("content-range") || "").split("/")[1] || "0");
-
-  let initEnd = 0;
-  let sidxOffset = -1;
-  let mdatOffset = 0;
-  let pos = 0;
-
-  // Find top-level boxes
-  while (pos < buf.length - 8) {
-    const size = buf.readUInt32BE(pos);
-    const type = buf.toString("ascii", pos + 4, pos + 8);
-    if (size < 8) break;
-
-    if (type === "moov") initEnd = pos + size - 1;
-    else if (type === "sidx") sidxOffset = pos;
-    else if (type === "mdat") { mdatOffset = pos; break; }
-    pos += size;
-  }
-
-  // Parse sidx to extract segment byte ranges
-  const segments = [];
-  let timescale = 1000;
-  if (sidxOffset >= 0 && sidxOffset + 12 < buf.length) {
-    const sidxSize = buf.readUInt32BE(sidxOffset);
-    const version = buf[sidxOffset + 8];
-    let off = sidxOffset + 12;
-    // reference_ID (4) + timescale (4)
-    off += 4; // reference_ID
-    timescale = buf.readUInt32BE(off); off += 4;
-    // earliest_presentation_time + first_offset
-    let firstOffset = 0;
-    if (version === 0) {
-      off += 4; // earliest_presentation_time
-      firstOffset = buf.readUInt32BE(off); off += 4;
-    } else {
-      off += 8; // earliest_presentation_time
-      firstOffset = Number(buf.readBigUInt64BE(off)); off += 8;
-    }
-    // reserved (2) + reference_count (2)
-    off += 2;
-    const referenceCount = buf.readUInt16BE(off); off += 2;
-
-    let segStart = sidxOffset + sidxSize + firstOffset;
-    for (let i = 0; i < referenceCount && off + 12 <= buf.length; i++) {
-      const firstWord = buf.readUInt32BE(off);
-      const referenceType = firstWord >>> 31;
-      if (referenceType === 1) break; // nested sidx not supported here
-      const referencedSize = firstWord & 0x7FFFFFFF;
-      const subsegDuration = buf.readUInt32BE(off + 4);
-      segments.push({
-        start: segStart,
-        end: segStart + referencedSize - 1,
-        duration: subsegDuration / timescale,
-        durationTicks: subsegDuration,
-      });
-      segStart += referencedSize;
-      off += 12;
-    }
-  }
-
-  return { initEnd, segments, totalSize, timescale };
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const totalSize = Number((response.headers.get("content-range") || "").split("/")[1]) || 0;
+  return parseMp4Structure(buffer, totalSize);
 }
 
 function generateDashHls(sessionId, videoFormat, audioFormat, videoProxyId, audioProxyId, videoInfo, audioInfo) {
-  if (!videoInfo.segments.length || !audioInfo.segments.length) return null;
-
-  const videoMapId = `seg-${videoProxyId}`;
-  const audioMapId = `seg-${audioProxyId}`;
-  dashSegmentMaps.set(videoMapId, {
+  const session = buildDashHlsSession({
+    sessionId,
+    videoFormat,
+    audioFormat,
+    videoProxyId,
+    audioProxyId,
+    videoInfo,
+    audioInfo,
+  });
+  if (!session) return null;
+  dashSegmentMaps.set(session.videoMapId, {
     proxyId: videoProxyId,
     initEnd: videoInfo.initEnd,
     segments: videoInfo.segments,
     createdAt: Date.now(),
   });
-  dashSegmentMaps.set(audioMapId, {
+  dashSegmentMaps.set(session.audioMapId, {
     proxyId: audioProxyId,
     initEnd: audioInfo.initEnd,
     segments: audioInfo.segments,
     createdAt: Date.now(),
   });
-  const videoCodec = videoFormat.vcodec || "avc1.640028";
-  const audioCodec = audioFormat.acodec || "mp4a.40.2";
-  const videoBandwidth = Math.round((videoFormat.tbr || 2000) * 1000);
-  const audioBandwidth = Math.round((audioFormat.tbr || 128) * 1000);
-  const width = videoFormat.width || 1920;
-  const height = videoFormat.height || 1080;
-  const fps = videoFormat.fps || 30;
-
-  const mediaPlaylist = (mapId, segments) => {
-    const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map((segment) => segment.duration))));
-    const body = segments.flatMap((segment, index) => [
-      `#EXTINF:${segment.duration.toFixed(6)},`,
-      `/api/dash/${mapId}/${index}.mp4`,
-    ]).join("\n");
-    return `#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-TARGETDURATION:${targetDuration}
-#EXT-X-MEDIA-SEQUENCE:0
-#EXT-X-PLAYLIST-TYPE:VOD
-#EXT-X-MAP:URI="/api/dash/${mapId}/init.mp4"
-${body}
-#EXT-X-ENDLIST
-`;
-  };
-
-  const master = `#EXTM3U
-#EXT-X-VERSION:7
-#EXT-X-INDEPENDENT-SEGMENTS
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Default",DEFAULT=YES,AUTOSELECT=YES,URI="/api/dash/hls/${sessionId}/audio.m3u8"
-#EXT-X-STREAM-INF:BANDWIDTH=${videoBandwidth + audioBandwidth},RESOLUTION=${width}x${height},FRAME-RATE=${fps},CODECS="${videoCodec},${audioCodec}",AUDIO="audio"
-/api/dash/hls/${sessionId}/video.m3u8
-`;
-
-  return {
-    master,
-    video: mediaPlaylist(videoMapId, videoInfo.segments),
-    audio: mediaPlaylist(audioMapId, audioInfo.segments),
-  };
+  return { master: session.master, video: session.video, audio: session.audio };
 }
 
 // DASH segment maps: mapId → { proxyId, initEnd, segments: [{start,end,duration}] }
@@ -1610,105 +1536,9 @@ let segmentCacheHealthSnapshot = {
   misses: 0,
 };
 
-function sha256Hex(value) {
-  return createHash("sha256").update(String(value)).digest("hex");
-}
-
 function safeUnlink(filePath) {
   if (!filePath) return;
   try { unlinkSync(filePath); } catch {}
-}
-
-function snapshotProxyUrl(url) {
-  try {
-    const parsed = new URL(url);
-    return {
-      host: parsed.host.toLowerCase(),
-      pathname: parsed.pathname || "/",
-      params: Object.fromEntries(parsed.searchParams.entries()),
-    };
-  } catch {
-    return {
-      host: "",
-      pathname: "",
-      params: {},
-    };
-  }
-}
-
-function normalizeRangeForCacheKey(rangeHeader = "") {
-  const match = String(rangeHeader).match(/^bytes=(\d+)?-(\d+)?$/i);
-  return {
-    start: match?.[1] || "*",
-    end: match?.[2] || "*",
-  };
-}
-
-function computeCacheKey(upstreamUrl, rangeHeader = "", cacheContext = null) {
-  const urlInfo = snapshotProxyUrl(upstreamUrl);
-  const hostCandidates = [urlInfo.host, cacheContext?.registeredUrlHost, cacheContext?.originalUrlHost]
-    .filter(Boolean)
-    .map((value) => value.toLowerCase());
-  const mergedParams = {
-    ...(cacheContext?.registeredUrlParams || {}),
-    ...(cacheContext?.originalUrlParams || {}),
-    ...urlInfo.params,
-  };
-  const isYouTubeSource = hostCandidates.some((host) => host.includes("googlevideo.com") || host.includes("youtube.com") || host.includes("youtu.be"));
-  if (isYouTubeSource) {
-    const required = ["id", "itag", "clen", "lmt"];
-    if (required.every((key) => mergedParams[key])) {
-      const range = normalizeRangeForCacheKey(rangeHeader);
-      const logicalKey = `yt:${mergedParams.id}:${mergedParams.itag}:${mergedParams.clen}:${mergedParams.lmt}:${range.start}-${range.end}`;
-      return {
-        kind: "logical",
-        sourceType: "youtube",
-        logicalKey,
-        filenameKey: sha256Hex(logicalKey),
-      };
-    }
-  }
-
-  const isBilibiliSource = hostCandidates.some((host) => host.includes("bilivideo.com"));
-  if (isBilibiliSource && /\.m4s$/i.test(urlInfo.pathname)) {
-    const range = normalizeRangeForCacheKey(rangeHeader);
-    const logicalKey = `bili:${urlInfo.pathname}:${range.start}-${range.end}`;
-    return {
-      kind: "logical",
-      sourceType: "bilibili",
-      logicalKey,
-      filenameKey: sha256Hex(logicalKey),
-    };
-  }
-
-  const hlsPath = urlInfo.pathname || cacheContext?.registeredUrlPathname || cacheContext?.originalUrlPathname || "";
-  if (hlsPath.toLowerCase().endsWith(".ts")) {
-    const logicalKey = `hls:${sha256Hex(hlsPath)}`;
-    return {
-      kind: "logical",
-      sourceType: "hls",
-      logicalKey,
-      filenameKey: sha256Hex(logicalKey),
-    };
-  }
-
-  const fallbackHash = sha256Hex(`${upstreamUrl}\n${rangeHeader || ""}`);
-  return {
-    kind: "hash",
-    sourceType: "fallback",
-    logicalKey: `hash:${fallbackHash}`,
-    filenameKey: fallbackHash,
-  };
-}
-
-function getSegmentCachePaths(upstreamUrl, rangeHeader = "", cacheContext = null) {
-  const cacheKey = computeCacheKey(upstreamUrl, rangeHeader, cacheContext);
-  return {
-    ...cacheKey,
-    key: cacheKey.filenameKey,
-    dataPath: resolve(SEGMENT_CACHE_DIR, `${cacheKey.filenameKey}.dat`),
-    metaPath: resolve(SEGMENT_CACHE_DIR, `${cacheKey.filenameKey}.meta`),
-  };
 }
 
 function parseSegmentCacheMeta(path) {
@@ -2320,39 +2150,6 @@ function runSegmentPrefetchQueue() {
   }
 }
 
-// --- Fetch with retry (exponential backoff + jitter) -----------------
-
-async function fetchWithRetry(url, options = {}, { retries = 3, label = "fetch" } = {}) {
-  let lastResp, lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    if (options.signal?.aborted) throw options.signal.reason || new Error("Fetch aborted");
-    try {
-      const resp = await fetch(url, options);
-      if (resp.ok || resp.status === 206) return resp; // success or partial content
-      // Retry on transient errors
-      if ((resp.status === 403 || resp.status === 429 || resp.status >= 500) && attempt < retries) {
-        await resp.body?.cancel(); // consume body to free resources
-        const delay = Math.min(500 * 2 ** attempt, 5000) + Math.random() * 500;
-        log.warn({ label, status: resp.status, attempt: attempt + 1, retries }, "Retrying fetch");
-        await new Promise((r) => setTimeout(r, delay));
-        lastResp = resp;
-        continue;
-      }
-      return resp; // non-retryable status (404, 416, etc.)
-    } catch (err) {
-      if (options.signal?.aborted || err.name === "AbortError") throw err;
-      lastErr = err;
-      if (attempt < retries) {
-        const delay = Math.min(500 * 2 ** attempt, 5000) + Math.random() * 500;
-        log.warn({ label, err: err.message, attempt: attempt + 1, retries }, "Retrying fetch after error");
-        await new Promise((r) => setTimeout(r, delay));
-      }
-    }
-  }
-  if (lastResp) return lastResp;
-  throw lastErr;
-}
-
 function isAbortLikeError(err) {
   return err?.name === "AbortError" || err?.code === "ERR_STREAM_PREMATURE_CLOSE" || err?.code === "ECONNRESET";
 }
@@ -2507,12 +2304,13 @@ const YOUTUBE_LIVE_PLAYLIST_POLL_MS = 500;
 async function waitForYoutubeLiveSegment(entry, sequence) {
   const deadline = Date.now() + YOUTUBE_LIVE_SEGMENT_WAIT_MS;
   while (sequence > entry.liveDvr.latestSequence && Date.now() < deadline) {
-    const upstream = await fetch(entry.url, {
-      headers: proxyHeaders(entry),
-      redirect: "follow",
-    });
+    const { response: upstream, body } = await fetchTextWithRetry(
+      entry.url,
+      { headers: proxyHeaders(entry), redirect: "follow" },
+      { retries: 0, label: "youtube-live-playlist", timeoutMs: 5_000 },
+    );
     if (upstream.ok) {
-      const refreshed = parseYoutubeLivePlaylist(await upstream.text());
+      const refreshed = parseYoutubeLivePlaylist(body);
       if (refreshed) {
         const { cursorSequence, segmentProxyIds } = entry.liveDvr;
         entry.liveDvr = { ...refreshed, cursorSequence, segmentProxyIds };
@@ -2566,8 +2364,15 @@ app.get("/api/proxy/hls", async (req, res) => {
   try {
     const upstreamStartedAt = Date.now();
     let upstream;
+    let body;
     try {
-      upstream = await fetch(entry.url, { headers: proxyHeaders(entry), redirect: "follow" });
+      const fetched = await fetchTextWithRetry(
+        entry.url,
+        { headers: proxyHeaders(entry), redirect: "follow" },
+        { retries: 2, label: "hls-playlist" },
+      );
+      upstream = fetched.response;
+      body = fetched.body;
     } catch (err) {
       metric.error = err.message || String(err);
       logProxyUrlHealth({ level: "error", proxyId: req.query.id, entry, err, event: "fetch_failed" });
@@ -2575,7 +2380,6 @@ app.get("/api/proxy/hls", async (req, res) => {
     }
     setProxyMetricUpstream(metric, upstream, Date.now() - upstreamStartedAt);
     warnOnProxyStatus(req.query.id, entry, upstream, "upstream_status");
-    let body = await upstream.text();
     const baseUrl = new URL(entry.url);
 
     // Filter master playlist — drop variants above bitrate cap
@@ -2653,12 +2457,17 @@ app.get("/api/proxy/hls", async (req, res) => {
 
 async function plexApi(path, { signal } = {}) {
   const sep = path.includes("?") ? "&" : "?";
-  const res = await fetch(`${PLEX_URL}${path}${sep}X-Plex-Token=${PLEX_TOKEN}`, {
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  if (!res.ok) throw new Error(`Plex API ${res.status}: ${res.statusText}`);
-  return res.json();
+  const fetched = await fetchTextWithRetry(
+    `${PLEX_URL}${path}${sep}X-Plex-Token=${PLEX_TOKEN}`,
+    { headers: { Accept: "application/json" }, signal },
+    { retries: 2, label: "plex-api" },
+  );
+  if (!fetched.response.ok) throw new Error(`Plex API ${fetched.response.status}: ${fetched.response.statusText}`);
+  try {
+    return JSON.parse(fetched.body);
+  } catch (cause) {
+    throw new Error("Plex API returned invalid JSON", { cause });
+  }
 }
 
 const plexSubtitleCache = new PlexSubtitleCache(resolve(CACHE_DIR, "plex-subtitles"));
@@ -2713,25 +2522,15 @@ async function loadPlexSubtitleBuffer(stream) {
 
   const sourceUrl = new URL(stream.key, `${PLEX_URL}/`);
   sourceUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
-  const response = await fetch(sourceUrl);
+  const fetched = await fetchBufferWithRetry(sourceUrl, {}, {
+    retries: 2,
+    label: "plex-subtitle",
+    timeoutMs: 30_000,
+    maxBytes: MAX_PLEX_SUBTITLE_BYTES,
+  });
+  const response = fetched.response;
   if (!response.ok) throw new Error(`Plex subtitle fetch failed with ${response.status}`);
-  const declaredBytes = Number(response.headers.get("content-length"));
-  if (declaredBytes > MAX_PLEX_SUBTITLE_BYTES) throw new Error("Plex subtitle is larger than 20 MiB");
-  if (!response.body) throw new Error("Plex subtitle response has no body");
-  const reader = response.body.getReader();
-  const chunks = [];
-  let totalBytes = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    totalBytes += value.byteLength;
-    if (totalBytes > MAX_PLEX_SUBTITLE_BYTES) {
-      await reader.cancel();
-      throw new Error("Plex subtitle is larger than 20 MiB");
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks, totalBytes);
+  return fetched.buffer;
 }
 
 function scheduleEmbeddedPlexSubtitle(ratingKey, stream, versionInfo) {
@@ -2826,20 +2625,24 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
   const decisionUrl = `${PLEX_URL}/video/:/transcode/universal/decision?${params}`;
   let decisionRes;
   try {
-    decisionRes = await fetch(decisionUrl, {
-      headers: { Accept: "application/json" },
-      signal: opts.signal,
-    });
+    decisionRes = await fetchTextWithRetry(
+      decisionUrl,
+      { headers: { Accept: "application/json" }, signal: opts.signal },
+      { retries: 1, label: "plex-transcode-decision" },
+    );
   } catch (error) {
     if (opts.signal?.aborted) await stopPlexTranscodeSession(session).catch(() => {});
     throw error;
   }
-  const decisionBody = await decisionRes.json().catch(() => null);
+  const decisionBody = (() => {
+    try { return JSON.parse(decisionRes.body); } catch { return null; }
+  })();
+  const decisionResponse = decisionRes.response;
   const mc = decisionBody?.MediaContainer;
   const decisionStream = mc?.Metadata?.[0]?.Media?.[0]?.Part?.[0]?.Stream;
   const subStreams = decisionStream?.filter((s) => s.streamType === 3) || [];
   log.info({
-    status: decisionRes.status,
+    status: decisionResponse.status,
     session,
     videoBitrate: PLEX_VIDEO_BITRATE_KBPS,
     generalDecisionCode: mc?.generalDecisionCode,
@@ -2848,8 +2651,8 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
     transcodeDecisionText: mc?.transcodeDecisionText,
     subtitleDecision: subStreams.map((s) => ({ id: s.id, codec: s.codec, decision: s.decision, burn: s.burn })),
   }, "[plex] transcode decision");
-  if (!decisionRes.ok) {
-    throw new Error(`Plex transcode decision failed with ${decisionRes.status}`);
+  if (!decisionResponse.ok) {
+    throw new Error(`Plex transcode decision failed with ${decisionResponse.status}`);
   }
   // Fetch the master playlist eagerly so Plex starts transcoding before the
   // browser asks for its first media segment.
@@ -2857,9 +2660,14 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
 
   try {
     log.info({ session, videoBitrate: PLEX_VIDEO_BITRATE_KBPS }, "[plex] Fetching start.m3u8 (this triggers transcode)...");
-    const manifestRes = await fetch(startHlsUrl, { signal: opts.signal });
+    const fetchedManifest = await fetchTextWithRetry(
+      startHlsUrl,
+      { signal: opts.signal },
+      { retries: 1, label: "plex-start-playlist" },
+    );
+    const manifestRes = fetchedManifest.response;
     if (manifestRes.ok) {
-      const upstreamBody = await manifestRes.text();
+      const upstreamBody = fetchedManifest.body;
       if (generation !== plexTranscodeGeneration) {
         await stopPlexTranscodeSession(session);
         throw new Error("Plex transcode request was superseded");
@@ -2898,7 +2706,11 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
 async function stopPlexTranscodeSession(session) {
   if (!session || !PLEX_TOKEN) return;
   const params = new URLSearchParams({ session, "X-Plex-Token": PLEX_TOKEN });
-  await fetch(`${PLEX_URL}/video/:/transcode/universal/stop?${params}`);
+  await fetchWithRetry(`${PLEX_URL}/video/:/transcode/universal/stop?${params}`, {}, {
+    retries: 0,
+    label: "plex-transcode-stop",
+    responseTimeoutMs: 5_000,
+  });
 }
 
 async function stopActivePlexTranscode() {
@@ -2914,61 +2726,10 @@ async function stopActivePlexTranscode() {
   }
 }
 
-function trimPlexHlsResumePlaceholders(body) {
-  const hadTrailingNewline = body.endsWith("\n");
-  const lines = body.split(/\r?\n/);
-  const startLine = lines.find((line) => line.startsWith("#EXT-X-START:"));
-  const offsetMatch = startLine?.match(/TIME-OFFSET=(-?\d+(?:\.\d+)?)/i);
-  const resumeOffset = Number(offsetMatch?.[1]);
-  if (!Number.isFinite(resumeOffset) || resumeOffset <= 0) return body;
-
-  const firstSegmentIndex = lines.findIndex((line) => line.startsWith("#EXTINF:"));
-  if (firstSegmentIndex === -1) return body;
-
-  let accumulatedDuration = 0;
-  let droppedSegments = 0;
-  let firstKeptSegmentIndex = -1;
-  for (let index = firstSegmentIndex; index < lines.length; index += 1) {
-    if (!lines[index].startsWith("#EXTINF:")) continue;
-    const duration = Number(lines[index].slice("#EXTINF:".length).split(",", 1)[0]);
-    if (!Number.isFinite(duration) || duration < 0) return body;
-    if (accumulatedDuration + duration > resumeOffset) {
-      firstKeptSegmentIndex = index;
-      break;
-    }
-    accumulatedDuration += duration;
-    droppedSegments += 1;
-  }
-
-  if (!droppedSegments || firstKeptSegmentIndex === -1) return body;
-
-  const mediaSequenceIndex = lines.findIndex((line) => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
-  const originalMediaSequence = mediaSequenceIndex === -1
-    ? 0
-    : Number(lines[mediaSequenceIndex].slice("#EXT-X-MEDIA-SEQUENCE:".length));
-  if (!Number.isInteger(originalMediaSequence) || originalMediaSequence < 0) return body;
-
-  const trimmedLines = [
-    ...lines.slice(0, firstSegmentIndex),
-    ...lines.slice(firstKeptSegmentIndex),
-  ].filter((line) => !line.startsWith("#EXT-X-START:"));
-  const nextMediaSequence = originalMediaSequence + droppedSegments;
-  const trimmedMediaSequenceIndex = trimmedLines.findIndex((line) => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
-  if (trimmedMediaSequenceIndex === -1) {
-    const nextSegmentIndex = trimmedLines.findIndex((line) => line.startsWith("#EXTINF:"));
-    trimmedLines.splice(nextSegmentIndex, 0, `#EXT-X-MEDIA-SEQUENCE:${nextMediaSequence}`);
-  } else {
-    trimmedLines[trimmedMediaSequenceIndex] = `#EXT-X-MEDIA-SEQUENCE:${nextMediaSequence}`;
-  }
-
-  log.info({ resumeOffset, droppedSegments, nextMediaSequence }, "[plex] trimmed resume placeholders");
-  const trimmed = trimmedLines.join("\n");
-  return hadTrailingNewline && !trimmed.endsWith("\n") ? `${trimmed}\n` : trimmed;
-}
-
 function rewritePlexHlsManifest(body) {
-  const rewritten = body.replace(/\/video\/:\/transcode\/universal\//g, "/api/plex/hls/");
-  return trimPlexHlsResumePlaceholders(rewritten);
+  return rewritePlexHlsManifestBody(body, {
+    onTrim: (details) => log.info(details, "[plex] trimmed resume placeholders"),
+  });
 }
 
 app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
@@ -2981,9 +2742,14 @@ app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
   }
 
   try {
-    const upstream = await fetch(plexHlsManifestUrl);
+    const fetched = await fetchTextWithRetry(
+      plexHlsManifestUrl,
+      {},
+      { retries: 1, label: "plex-master-playlist" },
+    );
+    const upstream = fetched.response;
     if (!upstream.ok) return res.status(upstream.status).json({ error: `Plex HLS ${upstream.status}` });
-    plexHlsManifestCache = rewritePlexHlsManifest(await upstream.text());
+    plexHlsManifestCache = rewritePlexHlsManifest(fetched.body);
     res.set("Content-Type", "application/vnd.apple.mpegurl");
     res.set("Cache-Control", "no-cache");
     res.set("Access-Control-Allow-Origin", "*");
@@ -3004,10 +2770,15 @@ app.use("/api/plex/hls/*path", async (req, res) => {
     trackProxyMetricLifecycle(res, metric);
     try {
       const startedAt = Date.now();
-      const upstream = await fetch(`${PLEX_URL}${tokenizedPath}`);
+      const fetched = await fetchTextWithRetry(
+        `${PLEX_URL}${tokenizedPath}`,
+        {},
+        { retries: 1, label: "plex-media-playlist" },
+      );
+      const upstream = fetched.response;
       setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
       if (!upstream.ok) return res.status(upstream.status).json({ error: `Plex HLS ${upstream.status}` });
-      const body = rewritePlexHlsManifest(await upstream.text());
+      const body = rewritePlexHlsManifest(fetched.body);
       recordProxyMetricBytes(metric, Buffer.byteLength(body));
       res.set("Content-Type", "application/vnd.apple.mpegurl");
       res.set("Cache-Control", "no-cache");
@@ -3027,16 +2798,24 @@ app.use("/api/plex/hls/*path", async (req, res) => {
   const upstreamUrl = `${PLEX_URL}${tokenizedPath}`;
   const startedAt = Date.now();
 
+  let streamRequest = null;
   try {
     let upstream;
     for (let attempt = 0; attempt < PLEX_SEGMENT_RETRY_DELAYS_MS.length; attempt += 1) {
       const delayMs = PLEX_SEGMENT_RETRY_DELAYS_MS[attempt];
       if (delayMs) await sleep(delayMs);
-      upstream = await fetch(upstreamUrl, {
+      streamRequest = await openUpstreamStream(upstreamUrl, {
         headers: req.headers.range ? { Range: req.headers.range } : {},
+      }, {
+        label: "plex-hls-segment",
+        responseTimeoutMs: UPSTREAM_RESPONSE_TIMEOUT_MS,
+        inactivityTimeoutMs: DASH_SEGMENT_INACTIVITY_TIMEOUT_MS,
       });
+      upstream = streamRequest.response;
       if (upstream.status !== 404 || attempt === PLEX_SEGMENT_RETRY_DELAYS_MS.length - 1) break;
-      await upstream.arrayBuffer().catch(() => {});
+      await upstream.body?.cancel?.().catch(() => {});
+      streamRequest.cleanup();
+      streamRequest = null;
     }
 
     setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
@@ -3058,12 +2837,15 @@ app.use("/api/plex/hls/*path", async (req, res) => {
 
     const source = Readable.fromWeb(upstream.body);
     source.on("data", (chunk) => {
+      streamRequest?.touch();
       recordProxyMetricBytes(metric, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
     });
     await pipeline(source, res);
   } catch (error) {
     metric.error = error.message || String(error);
     if (!res.headersSent) res.status(502).json({ error: error.message });
+  } finally {
+    streamRequest?.cleanup();
   }
 });
 // Plex API routes
@@ -3223,6 +3005,7 @@ async function playPlexNow({
   preferredSubtitleLanguages,
   preferredAudioLanguage,
   offset,
+  recovery = false,
 } = {}) {
   if (!ratingKey) {
     const err = new Error("ratingKey required");
@@ -3331,10 +3114,10 @@ async function playPlexNow({
   if (selectedAudioStreamID) {
     partParams.set("audioStreamID", selectedAudioStreamID);
   }
-  const putRes = await fetch(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, {
+  const putRes = await fetchWithRetry(`${PLEX_URL}/library/parts/${part.id}?${partParams}`, {
     method: "PUT",
     signal: playbackRequest.signal,
-  });
+  }, { retries: 0, label: "plex-part-selection" });
   playbackRequest.assertCurrent();
   log.info({
     status: putRes.status,
@@ -3378,6 +3161,14 @@ async function playPlexNow({
     type: "play",
     url: playerUrl,
     mediaSource: createFixedPlexMediaSource(playerUrl),
+    streamProfile: {
+      width: 1280,
+      height: 720,
+      targetHeight: 720,
+      videoKbps: PLEX_VIDEO_BITRATE_KBPS,
+      audioKbps: 128,
+      split: false,
+    },
     title,
     isLive: false,
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
@@ -3388,6 +3179,7 @@ async function playPlexNow({
       activeAudioID: selectedAudioStreamID || null,
     },
     startTime: resumeMs ? resumeMs / 1000 : 0,
+    recovery: recovery === true,
   });
 
   addToHistory({
@@ -3428,7 +3220,11 @@ app.post("/api/plex/progress", async (req, res) => {
       "X-Plex-Token": PLEX_TOKEN,
       "X-Plex-Client-Identifier": "drive-in-player",
     });
-    await fetch(`${PLEX_URL}/:/progress?${params}`);
+    await fetchWithRetry(`${PLEX_URL}/:/progress?${params}`, {}, {
+      retries: 0,
+      label: "plex-progress",
+      responseTimeoutMs: 5_000,
+    });
     res.json({ ok: true });
   } catch { res.json({ ok: true }); }
 });
@@ -3506,11 +3302,17 @@ app.get("/api/plex/thumb", async (req, res) => {
   }
 
   try {
-    const upstream = await fetch(upstreamUrl, { signal: AbortSignal.timeout(10_000) });
+    const fetched = await fetchBufferWithRetry(upstreamUrl, {}, {
+      retries: 1,
+      label: "plex-thumbnail",
+      timeoutMs: 10_000,
+      maxBytes: MAX_THUMBNAIL_BYTES,
+    });
+    const upstream = fetched.response;
     if (!upstream.ok) return res.status(upstream.status).end();
     const mime = String(upstream.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
     if (!isSupportedImageType(mime)) return res.status(415).end();
-    const buf = await readLimitedResponse(upstream);
+    const buf = fetched.buffer;
     writeCacheFileAtomic(dataFile, buf);
     writeCacheFileAtomic(metaFile, mime);
     res.set("Content-Type", mime);
@@ -3615,232 +3417,19 @@ app.get("/api/history", async (_req, res) => {
   }
 });
 
-// --- Playlist API ----------------------------------------------------
-
-async function buildPlaylistItemInput(body = {}) {
-  return buildQueueItemInput(body);
-}
-
-async function playlistItemsFromUrl(url) {
-  const info = await ytdlpFlatPlaylist(url);
-  const entries = Array.isArray(info.entries) ? info.entries : [];
-  const items = entries.map((entry) => {
-    const entryUrl = playlistEntryUrl(entry);
-    if (!entryUrl) return null;
-    const thumb = Array.isArray(entry.thumbnails) && entry.thumbnails.length
-      ? entry.thumbnails[entry.thumbnails.length - 1]?.url
-      : entry.thumbnail || null;
-    return {
-      url: entryUrl,
-      title: entry.title || entry.fulltitle || entryUrl,
-      thumbnail: thumb,
-      duration: Number.isFinite(Number(entry.duration)) ? Math.floor(Number(entry.duration)) : null,
-      metadata: {
-        importedFrom: url,
-        extractor: entry.extractor_key || entry.ie_key || info.extractor_key || null,
-        playlistTitle: info.title || null,
-      },
-    };
-  }).filter(Boolean);
-  return {
-    title: info.title || info.playlist_title || "Imported Playlist",
-    items,
-  };
-}
-
-app.get("/api/playlists", (_req, res) => {
-  res.json(listPlaylists());
-});
-
-app.post("/api/playlists", (req, res) => {
-  try {
-    const playlist = createPlaylist(req.body || {});
-    broadcastPlaylists();
-    res.status(201).json({ ok: true, playlist });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/playlists/import-url", async (req, res) => {
-  const { url, name, enqueue } = req.body || {};
-  if (!url) return res.status(400).json({ error: "url required" });
-  try {
-    const imported = await playlistItemsFromUrl(url);
-    if (!imported.items.length) return res.status(400).json({ error: "No playlist entries found" });
-    const playlist = createPlaylist({ name: name || imported.title, description: `Imported from ${url}` });
-    for (const item of imported.items) addPlaylistItem(playlist.id, item);
-    const hydrated = getPlaylist(playlist.id);
-    broadcastPlaylists();
-    if (enqueue) {
-      enqueuePlaylist(playlist.id);
-      broadcastQueue();
-    }
-    res.status(201).json({ ok: true, playlist: hydrated, imported: imported.items.length, queue: listQueue() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/playlists/:id", (req, res) => {
-  const playlist = getPlaylist(req.params.id);
-  if (!playlist) return res.status(404).json({ error: "playlist not found" });
-  res.json(playlist);
-});
-
-app.patch("/api/playlists/:id", (req, res) => {
-  try {
-    const playlist = updatePlaylist(req.params.id, req.body || {});
-    if (!playlist) return res.status(404).json({ error: "playlist not found" });
-    broadcastPlaylists();
-    res.json({ ok: true, playlist });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.delete("/api/playlists/:id", (req, res) => {
-  const playlist = deletePlaylist(req.params.id);
-  if (!playlist) return res.status(404).json({ error: "playlist not found" });
-  broadcastPlaylists();
-  res.json({ ok: true, playlist });
-});
-
-app.post("/api/playlists/:id/items", async (req, res) => {
-  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
-  try {
-    const item = addPlaylistItem(req.params.id, await buildPlaylistItemInput(req.body || {}));
-    broadcastPlaylists();
-    res.status(201).json({ ok: true, item, playlist: getPlaylist(req.params.id) });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.delete("/api/playlists/:id/items/:itemId", (req, res) => {
-  const item = removePlaylistItem(req.params.id, req.params.itemId);
-  if (!item) return res.status(404).json({ error: "playlist item not found" });
-  broadcastPlaylists();
-  res.json({ ok: true, item, playlist: getPlaylist(req.params.id) });
-});
-
-app.post("/api/playlists/:id/reorder", (req, res) => {
-  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
-  if (!ids) return res.status(400).json({ error: "ids array required" });
-  const playlist = reorderPlaylistItems(req.params.id, ids);
-  broadcastPlaylists();
-  res.json({ ok: true, playlist });
-});
-
-app.post("/api/playlists/:id/enqueue", (req, res) => {
-  if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
-  const added = enqueuePlaylist(req.params.id, { playNext: !!req.body?.playNext });
-  broadcastQueue();
-  res.json({ ok: true, added, queue: listQueue() });
-});
-
-// --- Queue API -------------------------------------------------------
-
-async function buildQueueItemInput(body = {}) {
-  const ratingKey = body.ratingKey ? String(body.ratingKey) : null;
-  if (!ratingKey || body.title || !PLEX_TOKEN) return body;
-
-  try {
-    const data = await plexApi(`/library/metadata/${ratingKey}`);
-    const meta = data.MediaContainer.Metadata[0];
-    const title = meta.grandparentTitle
-      ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
-      : meta.title;
-    return {
-      ...body,
-      title,
-      thumbnail: meta.art
-        ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
-        : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
-      duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-    };
-  } catch (err) {
-    log.warn({ err: err?.message, ratingKey }, "Failed to enrich queued Plex item");
-    return body;
-  }
-}
-
-async function playQueueItem(item) {
-  if (item.sourceType === "plex") {
-    return playPlexNow({ ratingKey: item.ratingKey });
-  }
-  return playUrlNow({ url: item.url });
-}
-
-async function playNextFromQueue(id = null) {
-  const item = shiftQueueItem(id);
-  if (!item) return null;
-  broadcastQueue();
-  try {
-    const result = await playQueueItem(item);
-    return { ok: true, item, result, queue: listQueue() };
-  } catch (err) {
-    addQueueItem(item, { playNext: true });
-    broadcastQueue();
-    throw err;
-  }
-}
-
-app.get("/api/queue", (_req, res) => {
-  res.json(listQueue());
-});
-
-app.post("/api/queue", async (req, res) => {
-  try {
-    const item = addQueueItem(await buildQueueItemInput(req.body), { playNext: !!req.body?.playNext });
-    broadcastQueue();
-    res.status(201).json({ ok: true, item, queue: listQueue() });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.post("/api/queue/reorder", (req, res) => {
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
-  if (!ids) return res.status(400).json({ error: "ids array required" });
-  const queue = reorderQueue(ids);
-  broadcastQueue();
-  res.json({ ok: true, queue });
-});
-
-app.post("/api/queue/next", async (_req, res) => {
-  try {
-    const result = await playNextFromQueue();
-    if (!result) return res.status(404).json({ error: "queue empty" });
-    res.json(result);
-  } catch (err) {
-    if (!isPlaybackSuperseded(err)) updateState({ status: "idle" });
-    res.status(err.status || 500).json({ error: err.message });
-  }
-});
-
-app.post("/api/queue/:id/play", async (req, res) => {
-  if (!getQueueItem(req.params.id)) return res.status(404).json({ error: "queue item not found" });
-  try {
-    res.json(await playNextFromQueue(req.params.id));
-  } catch (err) {
-    if (!isPlaybackSuperseded(err)) updateState({ status: "idle" });
-    res.status(err.status || 500).json({ error: err.message });
-  }
-});
-
-app.delete("/api/queue/:id", (req, res) => {
-  const item = removeQueueItem(req.params.id);
-  if (!item) return res.status(404).json({ error: "queue item not found" });
-  broadcastQueue();
-  res.json({ ok: true, item, queue: listQueue() });
-});
-
-app.delete("/api/queue", (_req, res) => {
-  const cleared = clearQueue();
-  broadcastQueue();
-  res.json({ ok: true, cleared, queue: [] });
+const { playNextFromQueue } = registerQueuePlaylistApi(app, {
+  ytdlpFlatPlaylist,
+  playlistEntryUrl,
+  plexApi,
+  hasPlex: !!PLEX_TOKEN,
+  playPlexNow,
+  playUrlNow,
+  broadcastQueue,
+  broadcastPlaylists,
+  onPlaybackError: (error) => {
+    if (!isPlaybackSuperseded(error)) updateState({ status: "idle" });
+  },
+  log,
 });
 
 // --- HTTP API --------------------------------------------------------
@@ -4088,6 +3677,7 @@ async function playUrlNow({
     startTime,
     autoplay,
     streamProfile: resolved.streamProfile || null,
+    recovery: reason === "recovery",
   });
 
   addToHistory({
@@ -4104,86 +3694,6 @@ async function playUrlNow({
     isLive: resolved.isLive,
     streamProfile: resolved.streamProfile || null,
   };
-}
-
-const VIEWPORT_QUALITY_SWITCH_DEBOUNCE_MS = 2_000;
-let viewportQualitySwitchTimer = null;
-let viewportQualitySwitching = false;
-let pendingViewport = null;
-
-function scheduleViewportQualitySwitch(viewport) {
-  pendingViewport = viewport;
-  if (viewportQualitySwitchTimer) {
-    clearTimeout(viewportQualitySwitchTimer);
-    viewportQualitySwitchTimer = null;
-  }
-
-  const targetHeight = targetHeightForViewport(viewport);
-  if (
-    viewportQualitySwitching
-    || !state.url
-    || !state.streamProfile
-    || state.streamProfile.targetHeight === targetHeight
-    || state.resolvedUrl?.startsWith("plex://")
-  ) return;
-
-  viewportQualitySwitchTimer = setTimeout(() => {
-    viewportQualitySwitchTimer = null;
-    void applyViewportQualitySwitch();
-  }, VIEWPORT_QUALITY_SWITCH_DEBOUNCE_MS);
-}
-
-async function applyViewportQualitySwitch() {
-  if (viewportQualitySwitching) return;
-  const viewport = pendingViewport;
-  const targetHeight = targetHeightForViewport(viewport);
-  const fromHeight = state.streamProfile?.targetHeight;
-  const sourceUrl = state.url;
-  if (!sourceUrl || !fromHeight || fromHeight === targetHeight) return;
-
-  const startTime = Math.max(0, Number(playerState.currentTime) || 0);
-  const autoplay = playerState.isPlaying !== false;
-  viewportQualitySwitching = true;
-  log.info({
-    sourceUrl,
-    fromHeight,
-    targetHeight,
-    startTime,
-    autoplay,
-    viewport,
-  }, "Viewport quality switch starting");
-
-  try {
-    const result = await playUrlNow({
-      url: sourceUrl,
-      targetHeight,
-      startTime,
-      autoplay,
-      reason: "viewport-change",
-    });
-    log.info({
-      sourceUrl,
-      fromHeight,
-      targetHeight,
-      selected: result.streamProfile,
-    }, "Viewport quality switch complete");
-  } catch (err) {
-    log.error({
-      err: err?.message || String(err),
-      sourceUrl,
-      fromHeight,
-      targetHeight,
-    }, "Viewport quality switch failed");
-    if (!isPlaybackSuperseded(err)) updateState({ status: autoplay ? "playing" : "paused" });
-  } finally {
-    viewportQualitySwitching = false;
-    // Only schedule another pass when the viewport changed while this switch
-    // was in flight. A resolver failure should wait for the next real resize
-    // instead of retrying forever.
-    if (targetHeight !== targetHeightForViewport(pendingViewport)) {
-      scheduleViewportQualitySwitch(pendingViewport);
-    }
-  }
 }
 
 // Play a URL (resolve + push to player)
@@ -4412,7 +3922,6 @@ wss.on("connection", (ws, req) => {
           viewport: reportedState.viewport,
           updatedAt: Date.now(),
         };
-        scheduleViewportQualitySwitch(playerState.viewport);
         // Save progress for non-Plex content to history
         if (!reportedState.plexRatingKey && state.url) {
           const history = loadHistory();

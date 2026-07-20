@@ -1,6 +1,7 @@
 // --- VTT subtitle renderer -------------------------------------------
 
 import { buildCueEndPrefix, findActiveCues, parseVTT } from "./subtitle-cues.js";
+import { requestText } from "./network.js";
 
 export { parseVTT } from "./subtitle-cues.js";
 
@@ -55,10 +56,13 @@ export async function loadSubtitleTrack(lang, url) {
     const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
     const existingTrack = subtitleTracks.find((track) => track.lang === lang && track.url === absUrl);
     if (existingTrack) return;
-    const resp = await fetch(absUrl);
+    const resp = await requestText(absUrl, {}, {
+      label: "Subtitle",
+      timeoutMs: 20_000,
+      maxBytes: 20 * 1024 * 1024,
+    });
     if (!resp.ok) throw new Error(`Subtitle fetch failed with ${resp.status}`);
-    const text = await resp.text();
-    const cues = parseVTT(text);
+    const cues = parseVTT(resp.text);
     subtitleTracks = subtitleTracks.filter((t) => t.lang !== lang);
     // Prefix maxima let lookup stop as soon as no earlier overlapping cue can still be active.
     subtitleTracks.push({ lang, url: absUrl, cues, cueEndPrefix: buildCueEndPrefix(cues) });

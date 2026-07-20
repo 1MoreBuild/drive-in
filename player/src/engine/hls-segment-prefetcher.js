@@ -1,5 +1,67 @@
 const SEGMENT_PATTERN = /\.(?:m4s|mp4|ts)(?:[?#]|$)/i;
 const PLAYLIST_PATTERN = /(?:\.m3u8|\/api\/proxy\/hls)(?:[?#]|$)/i;
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 12_000;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+const DEFAULT_RETRY_CYCLE_MAX_DELAY_MS = 30_000;
+
+class SegmentInactivityError extends Error {
+  constructor(timeoutMs) {
+    super(`HLS segment made no network progress for ${timeoutMs}ms`);
+    this.name = "SegmentInactivityError";
+    this.code = "HLS_SEGMENT_INACTIVITY";
+  }
+}
+
+function segmentDownloadFailure() {
+  const error = new Error("HLS segment network fetch failed after bounded retries");
+  error.code = "HLS_SEGMENT_FETCH_FAILED";
+  return error;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readResponseBytes(response, controller, timeoutMs) {
+  if (!response.body?.getReader) return response.arrayBuffer();
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      let timer = null;
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new SegmentInactivityError(timeoutMs);
+            controller.abort(error);
+            reject(error);
+          }, timeoutMs);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (result.done) break;
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value);
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } catch (error) {
+    try { await reader.cancel(error); } catch {}
+    throw error;
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes.buffer;
+}
 
 function requestUrl(input) {
   if (typeof input === "string") return new URL(input, location.href).href;
@@ -21,11 +83,19 @@ export class HlsSegmentPrefetcher {
     targetAheadSeconds = 180,
     maxBytes = 96 * 1024 * 1024,
     maxConcurrent = 1,
+    inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
+    maxRetries = DEFAULT_MAX_RETRIES,
+    retryBaseDelayMs = DEFAULT_RETRY_BASE_DELAY_MS,
+    retryCycleMaxDelayMs = DEFAULT_RETRY_CYCLE_MAX_DELAY_MS,
   } = {}) {
     this.ahead = ahead;
     this.targetAheadSeconds = targetAheadSeconds;
     this.maxBytes = maxBytes;
     this.maxConcurrent = maxConcurrent;
+    this.inactivityTimeoutMs = inactivityTimeoutMs;
+    this.maxRetries = maxRetries;
+    this.retryBaseDelayMs = retryBaseDelayMs;
+    this.retryCycleMaxDelayMs = retryCycleMaxDelayMs;
     this.playlists = new Map();
     this.segmentIndexes = new Map();
     this.prefetches = new Map();
@@ -39,6 +109,12 @@ export class HlsSegmentPrefetcher {
     this.peakBufferedAheadSeconds = 0;
     this.peakManagedBytesEstimate = 0;
     this.byteCapHitCount = 0;
+    this.networkRetryCount = 0;
+    this.timeoutCount = 0;
+    this.failureCount = 0;
+    this.retryTimer = null;
+    this.retryTimerAt = 0;
+    this.lastFailure = null;
     this.atByteCap = false;
     this.generation = 0;
     this.destroyed = false;
@@ -49,12 +125,53 @@ export class HlsSegmentPrefetcher {
     if (!url) return globalThis.fetch(input, init);
 
     if (PLAYLIST_PATTERN.test(url)) {
-      const response = await globalThis.fetch(input, init);
-      if (response.ok) {
-        const body = await response.clone().text();
-        this.updatePlaylist(body, response.url || url);
+      const controller = new AbortController();
+      const externalSignal = init.signal || input?.signal;
+      const forwardAbort = () => controller.abort(externalSignal.reason || new Error("Fetch aborted"));
+      externalSignal?.addEventListener("abort", forwardAbort, { once: true });
+      let response = null;
+      try {
+        let headerTimer = null;
+        response = await Promise.race([
+          globalThis.fetch(input, { ...init, signal: controller.signal }),
+          new Promise((_, reject) => {
+            headerTimer = setTimeout(() => {
+              const error = new SegmentInactivityError(this.inactivityTimeoutMs);
+              controller.abort(error);
+              reject(error);
+            }, this.inactivityTimeoutMs);
+          }),
+        ]).finally(() => clearTimeout(headerTimer));
+        const bytes = await readResponseBytes(response, controller, this.inactivityTimeoutMs);
+        const bufferedResponse = new Response(bytes, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+        if (response.ok) {
+          const body = new TextDecoder().decode(bytes);
+          this.updatePlaylist(body, response.url || url);
+        }
+        return bufferedResponse;
+      } catch (error) {
+        const reason = controller.signal.reason;
+        const timedOut = error?.code === "HLS_SEGMENT_INACTIVITY"
+          || reason?.code === "HLS_SEGMENT_INACTIVITY";
+        if (timedOut) this.timeoutCount += 1;
+        this.lastFailure = {
+          playlistUrl: url,
+          segmentIndex: null,
+          error: error?.message || String(error),
+          attempt: 1,
+          at: Date.now(),
+        };
+        throw error;
+      } finally {
+        externalSignal?.removeEventListener("abort", forwardAbort);
+        try {
+          if (response && !response.bodyUsed) await response.body?.cancel();
+        } catch {}
       }
-      return response;
     }
 
     const prefetched = this.prefetches.get(url);
@@ -66,7 +183,9 @@ export class HlsSegmentPrefetcher {
       : false;
 
     if (prefetched) {
-      if (prefetched.state === "queued") this.startPrefetchEntry(prefetched);
+      if (prefetched.state === "queued" || prefetched.state === "retry_wait") {
+        this.startPrefetchEntry(prefetched, { foreground: true });
+      }
       if (advanced && !this.awaitingPlaylistUpdate) {
         this.scheduleAhead(segmentRef.playlistUrl, segmentRef.index + 1);
       }
@@ -74,27 +193,30 @@ export class HlsSegmentPrefetcher {
       this.prefetches.delete(url);
       this.pumpPrefetches();
       if (entry) return responseFromCache(entry);
-      for (const [pendingUrl, pendingEntry] of this.prefetches) {
-        if (pendingEntry.playlistUrl !== prefetched.playlistUrl) continue;
-        if (pendingEntry.state === "ready") continue;
-        pendingEntry.controller?.abort();
-        this.prefetches.delete(pendingUrl);
-      }
+      throw segmentDownloadFailure();
     }
 
-    const response = await globalThis.fetch(input, init);
-    if (!this.awaitingPlaylistUpdate && segmentRef && advanced) {
-      if (response.ok) {
-        void this.scheduleAfterForegroundDownload(
-          response.clone(),
-          segmentRef.playlistUrl,
-          segmentRef.index + 1,
-        );
-      } else {
+    if (segmentRef) {
+      const entry = {
+        url,
+        playlistUrl: segmentRef.playlistUrl,
+        index: segmentRef.index,
+        state: "queued",
+        promise: null,
+        controller: null,
+      };
+      this.prefetches.set(url, entry);
+      this.startPrefetchEntry(entry, { foreground: true });
+      if (advanced && !this.awaitingPlaylistUpdate) {
         this.scheduleAhead(segmentRef.playlistUrl, segmentRef.index + 1);
       }
+      const downloaded = await entry.promise;
+      this.prefetches.delete(url);
+      this.pumpPrefetches();
+      if (downloaded) return responseFromCache(downloaded);
+      throw segmentDownloadFailure();
     }
-    return response;
+
   }
 
   advancePlaylist(playlist, index, url) {
@@ -228,8 +350,11 @@ export class HlsSegmentPrefetcher {
     }
     let active = [...this.prefetches.values()].filter((entry) => entry.state === "pending").length;
     if (active >= this.maxConcurrent) return;
+    const now = performance.now();
     const queued = [...this.prefetches.values()]
-      .filter((entry) => entry.state === "queued")
+      .filter((entry) => entry.state === "queued" || (
+        entry.state === "retry_wait" && (entry.retryAt || 0) <= now
+      ))
       .sort((a, b) => {
         const aCurrent = this.playlists.get(a.playlistUrl)?.currentIndex ?? -1;
         const bCurrent = this.playlists.get(b.playlistUrl)?.currentIndex ?? -1;
@@ -252,68 +377,151 @@ export class HlsSegmentPrefetcher {
       this.startPrefetchEntry(entry);
       active += 1;
     }
+    this.scheduleRetryPump();
   }
 
-  startPrefetchEntry(entry) {
-    if (!entry || entry.state !== "queued") return entry?.promise || null;
+  startPrefetchEntry(entry, { foreground = false } = {}) {
+    if (!entry || !["queued", "retry_wait"].includes(entry.state)) return entry?.promise || null;
     entry.state = "pending";
-    entry.promise = this.prefetch(entry, this.generation).then((result) => {
-      entry.state = result ? "ready" : "failed";
+    entry.startedAt = performance.now();
+    entry.promise = this.prefetch(entry, this.generation, { foreground }).then((result) => {
+      const stillCurrent = !this.destroyed && this.prefetches.get(entry.url) === entry;
+      if (result) {
+        entry.state = "ready";
+        entry.failureCycles = 0;
+        entry.retryAt = 0;
+      } else if (stillCurrent) {
+        entry.state = "retry_wait";
+        entry.failureCycles = (entry.failureCycles || 0) + 1;
+        const retryDelayMs = Math.min(
+          this.retryCycleMaxDelayMs,
+          this.retryBaseDelayMs * 2 ** Math.min(entry.failureCycles, 8),
+        );
+        entry.retryAt = performance.now() + retryDelayMs;
+        this.failureCount += 1;
+      } else {
+        entry.state = "failed";
+      }
       entry.byteLength = result?.bytes?.byteLength || 0;
       entry.estimatedByteLength = 0;
+      entry.startedAt = 0;
       if (result) {
         this.updateCachePeaks();
         this.trimReadyCacheToBudget();
       }
       return result;
-    }).finally(() => this.pumpPrefetches());
+    }).finally(() => {
+      this.pumpPrefetches();
+      this.scheduleRetryPump();
+    });
     this.updateCachePeaks();
     return entry.promise;
   }
 
-  async prefetch(entry, generation) {
+  async prefetch(entry, generation, { foreground = false } = {}) {
     const { url, playlistUrl, index: segmentIndex } = entry;
-    const controller = new AbortController();
-    entry.controller = controller;
-    this.controllers.add(controller);
-    const startedAt = performance.now();
-    try {
-      const response = await globalThis.fetch(url, {
-        headers: { Range: "bytes=0-", "X-Drive-In-Prefetch": "1" },
-        priority: "low",
-        signal: controller.signal,
-      });
-      if (!response.ok || generation !== this.generation || this.destroyed) return null;
-      const bytes = await response.arrayBuffer();
-      this.recordDownload(bytes.byteLength, performance.now() - startedAt, segmentIndex, playlistUrl);
-      return {
-        bytes,
-        status: response.status,
-        statusText: response.statusText,
-        headers: [...response.headers.entries()],
-      };
-    } catch (error) {
-      if (error?.name !== "AbortError") console.warn("[hls-prefetch] Segment prefetch failed:", error);
-      return null;
-    } finally {
-      entry.controller = null;
-      this.controllers.delete(controller);
+    for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      if (generation !== this.generation || this.destroyed) return null;
+      const controller = new AbortController();
+      entry.controller = controller;
+      this.controllers.add(controller);
+      const startedAt = performance.now();
+      let response = null;
+      try {
+        let headerTimer = null;
+        response = await Promise.race([
+          globalThis.fetch(url, {
+            headers: {
+              Range: "bytes=0-",
+              ...(!foreground ? { "X-Drive-In-Prefetch": "1" } : {}),
+            },
+            ...(foreground ? {} : { priority: "low" }),
+            signal: controller.signal,
+          }),
+          new Promise((_, reject) => {
+            headerTimer = setTimeout(() => {
+              const error = new SegmentInactivityError(this.inactivityTimeoutMs);
+              controller.abort(error);
+              reject(error);
+            }, this.inactivityTimeoutMs);
+          }),
+        ]).finally(() => clearTimeout(headerTimer));
+        if (generation !== this.generation || this.destroyed) return null;
+        if (!response.ok) {
+          const retryable = response.status === 408
+            || response.status === 425
+            || response.status === 429
+            || response.status >= 500;
+          try { await response.body?.cancel(); } catch {}
+          if (!retryable) {
+            this.rememberFailure(entry, `HTTP ${response.status}`, attempt + 1);
+            return null;
+          }
+          throw new Error(`HLS segment returned ${response.status}`);
+        }
+        const bytes = await readResponseBytes(response, controller, this.inactivityTimeoutMs);
+        this.recordDownload(bytes.byteLength, performance.now() - startedAt, segmentIndex, playlistUrl);
+        return {
+          bytes,
+          status: response.status,
+          statusText: response.statusText,
+          headers: [...response.headers.entries()],
+        };
+      } catch (error) {
+        const reason = controller.signal.reason;
+        const timedOut = error?.code === "HLS_SEGMENT_INACTIVITY"
+          || reason?.code === "HLS_SEGMENT_INACTIVITY";
+        const cancelled = controller.signal.aborted && !timedOut;
+        if (timedOut) this.timeoutCount += 1;
+        if (cancelled || generation !== this.generation || this.destroyed) return null;
+        this.rememberFailure(entry, error?.message || String(error), attempt + 1);
+        if (attempt >= this.maxRetries) {
+          console.warn("[hls-prefetch] Segment download failed after retries:", error);
+          return null;
+        }
+        this.networkRetryCount += 1;
+        await wait(this.retryBaseDelayMs * 2 ** attempt);
+      } finally {
+        entry.controller = null;
+        this.controllers.delete(controller);
+        try {
+          if (response && !response.bodyUsed) await response.body?.cancel();
+        } catch {}
+      }
     }
+    return null;
   }
 
-  async scheduleAfterForegroundDownload(response, playlistUrl, nextIndex) {
-    try {
-      await response.arrayBuffer();
-    } catch {}
-    const playlist = this.playlists.get(playlistUrl);
-    if (
-      !this.destroyed
-      && !this.awaitingPlaylistUpdate
-      && playlist
-      && nextIndex > playlist.currentIndex
-    ) {
-      this.scheduleAhead(playlistUrl, nextIndex);
+  rememberFailure(entry, error, attempt) {
+    this.lastFailure = {
+      playlistUrl: entry.playlistUrl,
+      segmentIndex: entry.index,
+      error,
+      attempt,
+      at: Date.now(),
+    };
+  }
+
+  scheduleRetryPump() {
+    if (this.destroyed) return;
+    const now = performance.now();
+    const retryAt = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "retry_wait")
+      .reduce((earliest, entry) => Math.min(earliest, entry.retryAt || now), Infinity);
+    if (!Number.isFinite(retryAt)) {
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.retryTimerAt = 0;
+      return;
     }
+    if (this.retryTimer && this.retryTimerAt <= retryAt) return;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimerAt = retryAt;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.retryTimerAt = 0;
+      this.pumpPrefetches();
+    }, Math.max(0, retryAt - now));
   }
 
   recordDownload(byteLength, durationMs, segmentIndex, playlistUrl = null) {
@@ -358,7 +566,7 @@ export class HlsSegmentPrefetcher {
       }
       for (let index = playlist.currentIndex + 1; index < playlist.segments.length; index += 1) {
         const entry = this.prefetches.get(playlist.segments[index].url);
-        if (entry?.state === "pending" || entry?.state === "queued") pendingSegments += 1;
+        if (["pending", "queued", "retry_wait"].includes(entry?.state)) pendingSegments += 1;
       }
       return {
         playlistUrl: playlist.url,
@@ -380,6 +588,15 @@ export class HlsSegmentPrefetcher {
     const cachedBytes = this.cachedBytes;
     const cachedSegments = [...this.prefetches.values()]
       .filter((entry) => entry.state === "ready").length;
+    const activeDownloads = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "pending").length;
+    const queuedSegments = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "queued").length;
+    const retryWaitingSegments = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "retry_wait").length;
+    const oldestActiveDownloadMs = [...this.prefetches.values()]
+      .filter((entry) => entry.state === "pending" && entry.startedAt)
+      .reduce((oldest, entry) => Math.max(oldest, performance.now() - entry.startedAt), 0);
     this.updateCachePeaks(bufferedAheadSeconds);
     const managedBytesEstimate = cachedBytes + this.pendingEstimatedBytes;
     const livePlaylists = activePlaylists.filter((playlist) => (
@@ -402,6 +619,10 @@ export class HlsSegmentPrefetcher {
       bufferedAheadSeconds,
       readySegments,
       pendingSegments,
+      activeDownloads,
+      queuedSegments,
+      retryWaitingSegments,
+      oldestActiveDownloadMs: Math.round(oldestActiveDownloadMs),
       cachedBytes,
       cachedSegments,
       maxBytes: this.maxBytes,
@@ -416,6 +637,10 @@ export class HlsSegmentPrefetcher {
       activePlaylistCount: activePlaylists.length,
       playlistStats,
       completedDownloads: this.completedDownloads,
+      networkRetryCount: this.networkRetryCount,
+      timeoutCount: this.timeoutCount,
+      failureCount: this.failureCount,
+      lastFailure: this.lastFailure,
       lastDownload: this.lastDownload || null,
       liveDvrStartTime,
       liveEdgeTime,
@@ -516,6 +741,11 @@ export class HlsSegmentPrefetcher {
 
   cancelPrefetches() {
     this.generation += 1;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.retryTimerAt = 0;
+    }
     for (const controller of this.controllers) controller.abort();
     this.controllers.clear();
     this.prefetches.clear();

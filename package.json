@@ -27,6 +27,7 @@
   },
   "scripts": {
     "test": "npm test -w player && npm test -w server",
+    "test:chaos": "node --test player/test/network-chaos.test.js server/test/upstream-fetch.test.js",
     "check": "npm test && npm run build",
     "dev": "concurrently -k -n server,vite -c blue,green \"npm:dev:server\" \"npm:dev:vite\"",
     "dev:server": "npm run dev -w server",

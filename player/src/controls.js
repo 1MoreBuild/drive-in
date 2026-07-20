@@ -15,6 +15,7 @@ const progressPlayed = document.getElementById("progress-played");
 const progressScrubber = document.getElementById("progress-scrubber");
 const seekIndicatorLeft = document.getElementById("seek-indicator-left");
 const seekIndicatorRight = document.getElementById("seek-indicator-right");
+const playbackNotice = document.getElementById("playback-notice");
 const btnSubs = document.getElementById("btn-subs");
 const subsPanel = document.getElementById("subs-panel");
 const btnAudio = document.getElementById("btn-audio");
@@ -114,6 +115,18 @@ export function showBuffering() {
 export function hideBuffering() {
   state.isBuffering = false;
   btnCenterPlay.classList.remove("buffering");
+}
+
+export function showPlaybackNotice(text) {
+  if (!playbackNotice || !text) return;
+  playbackNotice.textContent = text;
+  playbackNotice.classList.remove("hidden");
+}
+
+export function hidePlaybackNotice() {
+  if (!playbackNotice) return;
+  playbackNotice.textContent = "";
+  playbackNotice.classList.add("hidden");
 }
 
 // --- Double-tap seek indicator ---------------------------------------

@@ -29,6 +29,14 @@ function playlistBody(segments) {
   return `#EXTM3U\n${segments.map((item) => `#EXTINF:${item.duration},\n${item.url}`).join("\n")}\n`;
 }
 
+async function waitFor(check, timeoutMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test("buffer health stops at the first missing segment", () => {
   const prefetcher = new HlsSegmentPrefetcher();
   const segments = [segment(0), segment(1), segment(2), segment(3)];
@@ -300,4 +308,115 @@ test("ready cache trims the farthest segments to stay within its byte budget", (
   assert.equal(prefetcher.cachedBytes, 4);
   assert.equal(prefetcher.peakCachedBytes, 8);
   assert.equal(prefetcher.byteCapHitCount, 1);
+});
+
+test("a hung segment times out without locking the prefetch queue", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const requested = [];
+  let firstSegmentAttempts = 0;
+  globalThis.fetch = (url, { signal } = {}) => {
+    requested.push(url);
+    if (url.endsWith("/1.m4s") && firstSegmentAttempts++ === 0) {
+      return new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
+    return Promise.resolve(new Response(url.endsWith("/1.m4s") ? "one" : "two", {
+      headers: { "content-type": "video/mp4" },
+    }));
+  };
+
+  const prefetcher = new HlsSegmentPrefetcher({
+    inactivityTimeoutMs: 10,
+    maxRetries: 0,
+    retryBaseDelayMs: 5,
+    retryCycleMaxDelayMs: 10,
+  });
+  t.after(() => prefetcher.destroy());
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  const segments = [segment(0), segment(1), segment(2)];
+  prefetcher.updatePlaylist(playlistBody(segments), playlistUrl);
+  prefetcher.playlists.get(playlistUrl).currentIndex = 0;
+
+  prefetcher.scheduleAhead(playlistUrl, 1);
+  await waitFor(() => prefetcher.getStats().readySegments === 2);
+
+  const stats = prefetcher.getStats();
+  assert.deepEqual(requested, [segments[1].url, segments[2].url, segments[1].url]);
+  assert.equal(stats.activeDownloads, 0);
+  assert.equal(stats.queuedSegments, 0);
+  assert.equal(stats.retryWaitingSegments, 0);
+  assert.equal(stats.timeoutCount, 1);
+  assert.equal(stats.failureCount, 1);
+  assert.equal(stats.completedDownloads, 2);
+});
+
+test("a foreground segment fails in bounded time when the connection never responds", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = (_url, { signal } = {}) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+
+  const prefetcher = new HlsSegmentPrefetcher({
+    inactivityTimeoutMs: 10,
+    maxRetries: 0,
+    retryBaseDelayMs: 5,
+  });
+  t.after(() => prefetcher.destroy());
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  const segments = [segment(0)];
+  prefetcher.updatePlaylist(playlistBody(segments), playlistUrl);
+
+  await assert.rejects(
+    prefetcher.fetch(segments[0].url),
+    (error) => error.code === "HLS_SEGMENT_FETCH_FAILED",
+  );
+  assert.equal(prefetcher.getStats().timeoutCount, 1);
+});
+
+test("a hung playlist request is also bounded", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = (_url, { signal } = {}) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+
+  const prefetcher = new HlsSegmentPrefetcher({ inactivityTimeoutMs: 10 });
+  t.after(() => prefetcher.destroy());
+
+  await assert.rejects(
+    prefetcher.fetch("https://drivein.test/video.m3u8"),
+    /made no network progress/,
+  );
+  assert.equal(prefetcher.getStats().timeoutCount, 1);
+  assert.match(prefetcher.getStats().lastFailure.error, /made no network progress/);
+});
+
+test("slow progress is allowed when every chunk arrives before the inactivity deadline", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    async start(controller) {
+      for (const value of [1, 2, 3, 4]) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        controller.enqueue(Uint8Array.of(value));
+      }
+      controller.close();
+    },
+  }), { headers: { "content-type": "video/mp4" } });
+
+  const prefetcher = new HlsSegmentPrefetcher({
+    inactivityTimeoutMs: 10,
+    maxRetries: 0,
+  });
+  t.after(() => prefetcher.destroy());
+  const playlistUrl = "https://drivein.test/video.m3u8";
+  const segments = [segment(0)];
+  prefetcher.updatePlaylist(playlistBody(segments), playlistUrl);
+
+  const response = await prefetcher.fetch(segments[0].url);
+  assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [1, 2, 3, 4]);
+  assert.equal(prefetcher.getStats().timeoutCount, 0);
 });

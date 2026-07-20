@@ -173,6 +173,26 @@ html, body {
 #btn-center-play.buffering #center-pause { display: none; }
 #btn-center-play.buffering #center-spinner { display: block; }
 
+#playback-notice {
+  position: absolute;
+  inset: auto 24px 112px;
+  z-index: 24;
+  width: fit-content;
+  max-width: min(680px, calc(100% - 48px));
+  margin-inline: auto;
+  padding: 12px 18px;
+  border: 1px solid oklch(78% 0.13 75 / 0.5);
+  border-radius: 12px;
+  background: oklch(15% 0.02 70 / 0.94);
+  color: oklch(93% 0.04 75);
+  box-shadow: 0 10px 30px oklch(0% 0 0 / 0.35);
+  font-size: clamp(0.875rem, 1.8vw, 1rem);
+  line-height: 1.4;
+  text-align: center;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
 /* --- Seek indicators (left / right) ---------------------------------- */
 
 #seek-indicator-left,

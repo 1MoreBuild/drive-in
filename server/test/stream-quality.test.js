@@ -14,12 +14,12 @@ test("windowed Tesla viewport selects 720p", () => {
   }), 720);
 });
 
-test("fullscreen viewport selects 1080p", () => {
+test("fullscreen viewport stays at fixed 720p", () => {
   assert.equal(targetHeightForViewport({
     innerWidth: 1920,
     innerHeight: 1080,
     visualViewport: { width: 1920, height: 1080 },
-  }), 1080);
+  }), 720);
 });
 
 test("format selector prefers 60fps before same-height fallback", () => {
