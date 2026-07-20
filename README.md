@@ -28,7 +28,7 @@ The player decodes these streams with Mediabunny and WebCodecs, uses consumed Au
 
 ## Requirements
 
-- Node.js 20.19 or newer
+- Node.js 22.12 or newer
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [FFmpeg](https://ffmpeg.org/)
 - [Deno](https://deno.com/) for current YouTube extraction

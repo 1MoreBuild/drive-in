@@ -2,7 +2,7 @@
 
 ## Setup
 
-Drive-In requires Node.js 20.19 or newer, yt-dlp, FFmpeg, and Deno.
+Drive-In requires Node.js 22.12 or newer, yt-dlp, FFmpeg, and Deno.
 
 ```bash
 git clone https://github.com/1MoreBuild/drive-in.git
