@@ -146,10 +146,10 @@ test("seek resets HLS position and pending prefetches", () => {
   assert.equal(prefetcher.prefetches.size, 0);
 });
 
-test("prefetch defaults target a 90-second in-car buffer", () => {
+test("prefetch defaults target a 180-second in-car buffer", () => {
   const prefetcher = new HlsSegmentPrefetcher();
-  assert.equal(prefetcher.targetAheadSeconds, 90);
-  assert.equal(prefetcher.ahead, 36);
+  assert.equal(prefetcher.targetAheadSeconds, 180);
+  assert.equal(prefetcher.ahead, 90);
   assert.equal(prefetcher.maxBytes, 96 * 1024 * 1024);
   assert.equal(prefetcher.maxConcurrent, 1);
 });

@@ -28,9 +28,9 @@ const ABR_UPSHIFT_COOLDOWN_MS = 30_000;
 const ABR_REBUFFER_UPSHIFT_HOLD_MS = 120_000;
 // In-car connections often disappear for tens of seconds at a time. Keep the
 // encoded HLS buffer large and make ABR protect it before quality.
-const HLS_BUFFER_TARGET_SECONDS = 90;
+const HLS_BUFFER_TARGET_SECONDS = 180;
 const HLS_START_SECONDS = 15;
-const HLS_BUFFER_MAX_SEGMENTS = 36;
+const HLS_BUFFER_MAX_SEGMENTS = 90;
 const HLS_BUFFER_MAX_BYTES = 96 * 1024 * 1024;
 // ABR throughput is measured per segment request. Keep one download in flight
 // so the sample represents the link instead of one share of parallel traffic.
