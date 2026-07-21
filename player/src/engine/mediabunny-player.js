@@ -215,7 +215,6 @@ export class MediabunnyPlayer {
         poolSize: VIDEO_QUEUE_MAX_CAPACITY + 2,
         fit: "contain",
         decoderOptions: {
-          hardwareAcceleration: "prefer-hardware",
           optimizeForLatency: true,
         },
       });
