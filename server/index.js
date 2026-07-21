@@ -4104,6 +4104,10 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
     log.info("All connections drained, exiting");
     process.exit(exitCode);
   });
+  // Media proxy responses can remain open indefinitely. Once shutdown starts,
+  // the player has already been notified, so do not let active streams block a
+  // restart until the force-exit deadline.
+  server.closeAllConnections?.();
 }
 
 function terminateOnFatal(kind, error) {

@@ -4,6 +4,7 @@ import {
   HLS_FORMATS,
   Input,
   UrlSource,
+  WEBM,
 } from "mediabunny";
 import { AudioRingBuffer } from "./audio-ring-buffer.js";
 import { HlsSegmentPrefetcher } from "./hls-segment-prefetcher.js";
@@ -251,7 +252,7 @@ export class MediabunnyPlayer {
         maxCacheSize: 16 * 1024 * 1024,
         parallelism: 2,
       }),
-      formats: HLS_FORMATS,
+      formats: [...HLS_FORMATS, WEBM],
     });
   }
 

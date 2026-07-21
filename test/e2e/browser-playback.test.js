@@ -14,7 +14,7 @@ const execFileAsync = promisify(execFile);
 const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
 async function createMediaOrigin(t, runtimeDir) {
-  const mediaPath = `${runtimeDir}/browser-e2e.mp4`;
+  const mediaPath = `${runtimeDir}/browser-e2e.webm`;
   await execFileAsync("ffmpeg", [
     "-hide_banner",
     "-loglevel", "error",
@@ -23,11 +23,11 @@ async function createMediaOrigin(t, runtimeDir) {
     "-f", "lavfi",
     "-i", "sine=frequency=440:sample_rate=48000",
     "-t", "4",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-movflags", "+faststart",
+    "-c:v", "libvpx-vp9",
+    "-deadline", "realtime",
+    "-cpu-used", "8",
+    "-b:v", "1M",
+    "-c:a", "libopus",
     "-y",
     mediaPath,
   ]);
@@ -35,7 +35,7 @@ async function createMediaOrigin(t, runtimeDir) {
   const origin = createServer((request, response) => {
     const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || "");
     response.setHeader("Accept-Ranges", "bytes");
-    response.setHeader("Content-Type", "video/mp4");
+    response.setHeader("Content-Type", "video/webm");
     if (!range) {
       response.setHeader("Content-Length", media.byteLength);
       response.end(media);
@@ -61,7 +61,7 @@ async function createMediaOrigin(t, runtimeDir) {
     origin.closeAllConnections();
     origin.close(resolveClose);
   }));
-  return `http://127.0.0.1:${origin.address().port}/browser-e2e.mp4`;
+  return `http://127.0.0.1:${origin.address().port}/browser-e2e.webm`;
 }
 
 test("the browser decodes media, paints the Canvas, and advances presentation time", async (t) => {
