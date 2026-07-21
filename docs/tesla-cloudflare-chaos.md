@@ -1,6 +1,6 @@
 # Tesla and Cloudflare chaos check
 
-Use this after playback or networking changes. The automated equivalent runs with `npm run test:chaos`; this checklist validates the real Tesla renderer, mobile connection, Cloudflare path, and launchd service together.
+Use this after playback or networking changes. `npm run test:e2e` validates the local HTTP/WebSocket playback journey and rewind cache reuse. This checklist covers what local automation cannot reproduce: the real Tesla renderer, mobile connection, Cloudflare path, and launchd service together.
 
 ## Before testing
 

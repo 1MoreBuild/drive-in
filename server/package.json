@@ -14,7 +14,9 @@
   },
   "main": "index.js",
   "scripts": {
-    "test": "node --test",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
     "start": "node index.js",
     "dev": "SERVE_SOURCE=1 node --watch index.js"
   },

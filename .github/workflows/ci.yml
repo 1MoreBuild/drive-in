@@ -30,7 +30,7 @@ jobs:
       - run: npm ci
 
       - name: Test and build
-        run: npm run check
+        run: npm run check:core
 
       - name: Verify production pages
         run: test -f player/dist/index.html && test -f player/dist/diag.html && test -f player/dist/metrics.html
@@ -45,6 +45,26 @@ jobs:
 
       - name: Smoke test — CLI help
         run: node cli/bin/drivein.js --help
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.0
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install browser and media dependencies
+        run: |
+          npx playwright install --with-deps chromium
+          sudo apt-get install --yes ffmpeg
+
+      - name: Run product E2E tests
+        run: npm run test:e2e
 
   docker:
     runs-on: ubuntu-latest

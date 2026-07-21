@@ -4,6 +4,7 @@ export const state = {
   player: null,
   ws: null,
   audioUnlocked: false,
+  playbackIntent: "paused",
   isPlaying: false,
   isMuted: false,
   isBuffering: false,

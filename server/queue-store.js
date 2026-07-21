@@ -1,9 +1,7 @@
 import Database from "better-sqlite3";
-import { dirname, resolve } from "path";
-import { fileURLToPath } from "url";
+import { runtimePath } from "./runtime-paths.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DB_PATH = process.env.DRIVEIN_DB || resolve(__dirname, "../.drive-in.sqlite");
+const DB_PATH = process.env.DRIVEIN_DB || runtimePath(".drive-in.sqlite");
 
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");

@@ -48,17 +48,17 @@ let lastProgressPct = "";
 // bounded future runway exposed by the HLS proxy.
 const LIVE_SEEK_LEAD_SECONDS = 11;
 
-export function updateTimeDisplay() {
+export function updateTimeDisplay(currentTime = state.currentTime) {
   const hasLiveTimeline = state.isLive
     && state.liveDvrAvailable
     && state.liveEdgeTime > state.liveStartTime;
-  const liveLatency = hasLiveTimeline ? state.liveEdgeTime - state.currentTime : Infinity;
+  const liveLatency = hasLiveTimeline ? state.liveEdgeTime - currentTime : Infinity;
   const atLiveEdge = liveLatency <= 10;
   const nextCurrentTimeText = state.isLive
     ? hasLiveTimeline && !atLiveEdge
-      ? fmt(Math.max(0, state.currentTime - state.liveStartTime))
+      ? fmt(Math.max(0, currentTime - state.liveStartTime))
       : ""
-    : fmt(state.currentTime);
+    : fmt(currentTime);
   const nextDurationText = state.isLive ? "" : fmt(state.duration);
 
   if (nextCurrentTimeText !== lastCurrentTimeText || timeCurrent.textContent !== nextCurrentTimeText) {
@@ -78,10 +78,10 @@ export function updateTimeDisplay() {
   const seekEnd = hasLiveTimeline ? state.liveEdgeTime : state.duration;
   progressWrap.setAttribute("aria-valuemin", "0");
   progressWrap.setAttribute("aria-valuemax", String(Math.max(0, Math.round(seekEnd - seekStart))));
-  progressWrap.setAttribute("aria-valuenow", String(Math.max(0, Math.round(state.currentTime - seekStart))));
+  progressWrap.setAttribute("aria-valuenow", String(Math.max(0, Math.round(currentTime - seekStart))));
   progressWrap.setAttribute("aria-valuetext", state.isLive
-    ? atLiveEdge ? "Live" : `${fmt(Math.max(0, state.currentTime - seekStart))} from start`
-    : `${fmt(state.currentTime)} of ${fmt(state.duration)}`);
+    ? atLiveEdge ? "Live" : `${fmt(Math.max(0, currentTime - seekStart))} from start`
+    : `${fmt(currentTime)} of ${fmt(state.duration)}`);
 }
 
 export function updateProgress(fraction) {
@@ -96,7 +96,7 @@ export function updateProgress(fraction) {
 // --- Play button state -----------------------------------------------
 
 export function updatePlayButton() {
-  btnCenterPlay.classList.toggle("paused", !state.isPlaying);
+  btnCenterPlay.classList.toggle("paused", state.playbackIntent !== "playing");
 }
 
 // --- Volume button state ---------------------------------------------
@@ -142,6 +142,7 @@ function flashSeek(side, accum) {
 // --- Init (wires up event listeners with callbacks) ------------------
 
 let isDragging = false;
+let dragPreviewTime = null;
 
 export function isDraggingProgress() {
   return isDragging;
@@ -263,20 +264,20 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     progressWrap.setPointerCapture(e.pointerId);
     const frac = getSeekFraction(e);
     updateProgress(frac);
-    state.currentTime = state.isLive
+    dragPreviewTime = state.isLive
       ? state.liveStartTime + frac * (state.liveEdgeTime - state.liveStartTime)
       : frac * state.duration;
-    updateTimeDisplay();
+    updateTimeDisplay(dragPreviewTime);
   });
 
   progressWrap.addEventListener("pointermove", (e) => {
     if (!isDragging) return;
     const frac = getSeekFraction(e);
     updateProgress(frac);
-    state.currentTime = state.isLive
+    dragPreviewTime = state.isLive
       ? state.liveStartTime + frac * (state.liveEdgeTime - state.liveStartTime)
       : frac * state.duration;
-    updateTimeDisplay();
+    updateTimeDisplay(dragPreviewTime);
     showControls();
   });
 
@@ -285,6 +286,7 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
     isDragging = false;
     progressWrap.classList.remove("dragging");
     const fraction = getSeekFraction(e);
+    dragPreviewTime = null;
     onSeekToTime(state.isLive
       ? state.liveStartTime + fraction * (state.liveEdgeTime - state.liveStartTime)
       : fraction * state.duration);
@@ -292,7 +294,12 @@ export function initControls({ onTogglePlayPause, onStop, onSeekToTime, onSetVol
 
   progressWrap.addEventListener("pointercancel", () => {
     isDragging = false;
+    dragPreviewTime = null;
     progressWrap.classList.remove("dragging");
+    updateTimeDisplay();
+    updateProgress(state.isLive && state.liveEdgeTime > state.liveStartTime
+      ? (state.currentTime - state.liveStartTime) / (state.liveEdgeTime - state.liveStartTime)
+      : state.duration > 0 ? state.currentTime / state.duration : 0);
   });
 
 }

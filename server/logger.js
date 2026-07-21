@@ -1,9 +1,8 @@
 import pino from "pino";
-import { resolve, dirname } from "path";
-import { fileURLToPath } from "url";
+import { resolve } from "path";
+import { runtimePath } from "./runtime-paths.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const logDir = resolve(__dirname, "../.logs");
+const logDir = runtimePath(".logs");
 const isDev = process.env.NODE_ENV !== "production";
 
 const targets = [];

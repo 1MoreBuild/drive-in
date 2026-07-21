@@ -13,7 +13,10 @@ import { requestJson, requestOk } from "./network.js";
 import { assessBandwidthHealth } from "./bandwidth-health.js";
 import {
   buildFreshPlaybackSessionRequest,
+  hasRecoveryPlaybackProgress,
+  hasSeekPlaybackProgress,
   playbackRecoveryDelayMs,
+  resolvePlaybackPosition,
 } from "./playback-recovery.js";
 
 // --- Callbacks (set by main.js to avoid circular deps) ---------------
@@ -41,11 +44,14 @@ const STUTTER_MEMORY_SAMPLE_INTERVAL_MS = 15_000;
 const STUTTER_FLUSH_IDLE_TIMEOUT_MS = 1_000;
 const PLAYER_HEALTH_HEARTBEAT_INTERVAL_MS = 30_000;
 const PLAYER_RECOVERY_STABLE_MS = 60_000;
+const PLAYER_RECOVERY_CONFIRM_TIMEOUT_MS = 20_000;
 // A car can be offline for minutes. Recovery stays active until playback is
 // stable again or the user starts/stops something else; the capped backoff
 // prevents a retry storm while still healing after connectivity returns.
 const VIDEO_FREEZE_THRESHOLD_MS = 8_000;
 const VIDEO_FREEZE_DRIFT_MS = 5_000;
+const SEEK_STALL_TIMEOUT_MS = 5_000;
+const SEEK_MAX_WAIT_MS = 30_000;
 const PLAYER_LOG_ENDPOINT = "/api/dev/player-log";
 const SLOW_SEGMENT_FETCH_MS = 3_000;
 const MEMORY_PRESSURE_GROWTH_BYTES = 8 * 1024 * 1024;
@@ -79,8 +85,18 @@ let bandwidthBufferingStartedAt = 0;
 const playbackRecoveryState = {
   attempts: 0,
   retryTimer: null,
+  confirmationTimer: null,
+  pendingConfirmation: null,
   stableTimer: null,
   request: null,
+};
+const seekWatchdogState = {
+  requestId: 0,
+  timer: null,
+  player: null,
+  targetTime: 0,
+  startedAt: 0,
+  progressSnapshot: null,
 };
 const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
 const pageMemoryMonitor = new PageMemoryMonitor({ intervalMs: PAGE_MEMORY_SAMPLE_INTERVAL_MS });
@@ -122,6 +138,11 @@ function clearPlaybackRecoveryTimers() {
     clearTimeout(playbackRecoveryState.stableTimer);
     playbackRecoveryState.stableTimer = null;
   }
+  if (playbackRecoveryState.confirmationTimer) {
+    clearTimeout(playbackRecoveryState.confirmationTimer);
+    playbackRecoveryState.confirmationTimer = null;
+  }
+  playbackRecoveryState.pendingConfirmation = null;
 }
 
 function resetPlaybackRecovery({ clearRequest = false } = {}) {
@@ -130,13 +151,90 @@ function resetPlaybackRecovery({ clearRequest = false } = {}) {
   if (clearRequest) playbackRecoveryState.request = null;
 }
 
+function clearSeekWatchdog({ invalidate = true } = {}) {
+  if (seekWatchdogState.timer) clearTimeout(seekWatchdogState.timer);
+  seekWatchdogState.timer = null;
+  seekWatchdogState.player = null;
+  seekWatchdogState.progressSnapshot = null;
+  if (invalidate) seekWatchdogState.requestId += 1;
+}
+
+function armSeekWatchdog(player, targetTime, expectedToPlay) {
+  clearSeekWatchdog();
+  const requestId = seekWatchdogState.requestId;
+  if (!expectedToPlay) return requestId;
+
+  seekWatchdogState.player = player;
+  seekWatchdogState.targetTime = targetTime;
+  seekWatchdogState.startedAt = performance.now();
+  seekWatchdogState.progressSnapshot = summarizePlayerStats(player);
+
+  const checkProgress = () => {
+    seekWatchdogState.timer = null;
+    if (
+      requestId !== seekWatchdogState.requestId
+      || seekWatchdogState.player !== player
+      || state.player !== player
+    ) return;
+
+    const playbackState = player.getStatus?.();
+    if (!["seeking", "buffering"].includes(playbackState)) {
+      clearSeekWatchdog();
+      return;
+    }
+
+    const nextSnapshot = summarizePlayerStats(player);
+    if (hasSeekPlaybackProgress(
+      seekWatchdogState.progressSnapshot,
+      nextSnapshot,
+      targetTime,
+    )) {
+      seekWatchdogState.progressSnapshot = nextSnapshot;
+      postPlayerRuntimeLog("seek_progress_observed", {
+        requestId,
+        targetTime,
+        elapsedMs: Math.round(performance.now() - seekWatchdogState.startedAt),
+        playerStats: nextSnapshot,
+      });
+      seekWatchdogState.timer = setTimeout(checkProgress, SEEK_STALL_TIMEOUT_MS);
+      return;
+    }
+    const networkStillWorking = [
+      nextSnapshot?.hlsActiveDownloads,
+      nextSnapshot?.hlsQueuedSegments,
+      nextSnapshot?.hlsRetryWaitingSegments,
+    ].some((value) => Number(value) > 0);
+    const elapsedMs = Math.round(performance.now() - seekWatchdogState.startedAt);
+    if (networkStillWorking && elapsedMs < SEEK_MAX_WAIT_MS) {
+      postPlayerRuntimeLog("seek_waiting_for_network", {
+        requestId,
+        targetTime,
+        elapsedMs: Math.round(performance.now() - seekWatchdogState.startedAt),
+        playerStats: nextSnapshot,
+      });
+      seekWatchdogState.timer = setTimeout(checkProgress, SEEK_STALL_TIMEOUT_MS);
+      return;
+    }
+
+    postPlayerRuntimeLog("seek_stall_detected", {
+      requestId,
+      targetTime,
+      elapsedMs,
+      playerStatus: playbackState,
+      playerStats: nextSnapshot,
+      buffer: collectBufferState(player),
+    });
+    const error = new Error(`seek made no playback progress for ${SEEK_STALL_TIMEOUT_MS}ms`);
+    error.code = "SEEK_STALLED";
+    clearSeekWatchdog();
+    schedulePlaybackRecovery(player, error, { startTime: targetTime });
+  };
+  seekWatchdogState.timer = setTimeout(checkProgress, SEEK_STALL_TIMEOUT_MS);
+  return requestId;
+}
+
 function getPlaybackRecoveryPosition(player) {
-  const stats = summarizePlayerStats(player);
-  const videoSeconds = stats?.videoCurrentTimeMs != null ? stats.videoCurrentTimeMs / 1000 : null;
-  if (Number.isFinite(videoSeconds) && videoSeconds > 0) {
-    return Math.max(0, Math.min(state.duration || Infinity, state.currentTime || videoSeconds, videoSeconds));
-  }
-  return Math.max(0, Math.min(state.duration || Infinity, state.currentTime || 0));
+  return getReportedCurrentTime(player);
 }
 
 function stopBandwidthDiagnosis() {
@@ -167,7 +265,15 @@ function startBandwidthDiagnosis(player, streamProfile) {
 }
 
 function isRecoverablePlaybackError(error) {
-  if (["HLS_SEGMENT_FETCH_FAILED", "HLS_SEGMENT_INACTIVITY"].includes(error?.code)) return true;
+  if ([
+    "HLS_SEGMENT_FETCH_FAILED",
+    "HLS_SEGMENT_INACTIVITY",
+    "SEEK_FAILED",
+    "SEEK_STALLED",
+    "RECOVERY_NOT_CONFIRMED",
+  ].includes(error?.code)) {
+    return true;
+  }
   const message = error?.message || String(error || "");
   return /demux error|decod|encodingerror|network|fetch|timeout|connection|video.*(stall|frozen)|stream.*(closed|ended)/i.test(message);
 }
@@ -179,13 +285,81 @@ function markPlaybackStable(player) {
     if (state.player !== player || !state.isPlaying) return;
     playbackRecoveryState.attempts = 0;
     postPlayerRuntimeLog("playback_recovery_stable", {
-      currentTime: state.currentTime,
+      currentTime: getReportedCurrentTime(player),
     });
   }, PLAYER_RECOVERY_STABLE_MS);
 }
 
+function confirmPlaybackRecovery(player, currentTime) {
+  const pending = playbackRecoveryState.pendingConfirmation;
+  if (!pending || state.player !== player) return false;
+  const status = player.getStatus?.();
+  if (status !== "playing") return false;
+  const stats = summarizePlayerStats(player);
+  const hasVideo = Boolean(stats?.videoCodec);
+  const presentationTime = hasVideo
+    ? Number(stats?.videoCurrentTimeMs) / 1000
+    : currentTime;
+  if (!Number.isFinite(presentationTime)) return false;
+  if (!Number.isFinite(pending.baselineTime)) {
+    pending.baselineTime = presentationTime;
+    return false;
+  }
+  if (!hasRecoveryPlaybackProgress({
+    status,
+    baselineTime: pending.baselineTime,
+    currentTime: presentationTime,
+    hasVideo,
+    videoFrameRenderCount: stats?.videoFrameRenderCount,
+  })) return false;
+
+  if (playbackRecoveryState.confirmationTimer) {
+    clearTimeout(playbackRecoveryState.confirmationTimer);
+    playbackRecoveryState.confirmationTimer = null;
+  }
+  playbackRecoveryState.pendingConfirmation = null;
+  postPlayerRuntimeLog("playback_recovery_confirmed", {
+    attempt: pending.attempt,
+    requestedStartTime: pending.startTime,
+    baselineTime: pending.baselineTime,
+    currentTime,
+    presentationTime,
+  });
+  markPlaybackStable(player);
+  return true;
+}
+
+function armPlaybackRecoveryConfirmation(attempt, startTime) {
+  if (playbackRecoveryState.confirmationTimer) {
+    clearTimeout(playbackRecoveryState.confirmationTimer);
+  }
+  playbackRecoveryState.pendingConfirmation = {
+    attempt,
+    startTime,
+    baselineTime: null,
+  };
+  playbackRecoveryState.confirmationTimer = setTimeout(() => {
+    playbackRecoveryState.confirmationTimer = null;
+    const pending = playbackRecoveryState.pendingConfirmation;
+    if (!pending || pending.attempt !== attempt) return;
+    playbackRecoveryState.pendingConfirmation = null;
+    const error = new Error(`recovery session made no playback progress for ${PLAYER_RECOVERY_CONFIRM_TIMEOUT_MS}ms`);
+    error.code = "RECOVERY_NOT_CONFIRMED";
+    postPlayerRuntimeLog("playback_recovery_unconfirmed", {
+      attempt,
+      startTime,
+      playerStatus: state.player?.getStatus?.() || null,
+      playerStats: summarizePlayerStats(state.player),
+    });
+    schedulePlaybackRecovery(state.player, error, { startTime: getPlaybackRecoveryPosition(state.player) });
+  }, PLAYER_RECOVERY_CONFIRM_TIMEOUT_MS);
+  confirmPlaybackRecovery(state.player, getReportedCurrentTime());
+}
+
 async function requestFreshPlaybackSession(request, startTime) {
-  const freshRequest = buildFreshPlaybackSessionRequest(request, startTime);
+  const freshRequest = buildFreshPlaybackSessionRequest(request, startTime, {
+    autoplay: state.playbackIntent === "playing",
+  });
   if (!freshRequest) return false;
 
   const response = await requestJson(freshRequest.endpoint, {
@@ -205,12 +379,18 @@ async function requestFreshPlaybackSession(request, startTime) {
   return true;
 }
 
-function schedulePlaybackRecovery(player, error) {
+function schedulePlaybackRecovery(player, error, { startTime: requestedStartTime } = {}) {
   const playerIsCurrent = player ? state.player === player : !state.player;
   if (!playerIsCurrent || !playbackRecoveryState.request || !isRecoverablePlaybackError(error)) {
     return false;
   }
   if (playbackRecoveryState.retryTimer) return true;
+
+  if (playbackRecoveryState.confirmationTimer) {
+    clearTimeout(playbackRecoveryState.confirmationTimer);
+    playbackRecoveryState.confirmationTimer = null;
+  }
+  playbackRecoveryState.pendingConfirmation = null;
 
   if (playbackRecoveryState.stableTimer) {
     clearTimeout(playbackRecoveryState.stableTimer);
@@ -218,8 +398,12 @@ function schedulePlaybackRecovery(player, error) {
   }
   const attempt = playbackRecoveryState.attempts + 1;
   const delayMs = playbackRecoveryDelayMs(attempt);
-  const startTime = getPlaybackRecoveryPosition(player);
+  const fallbackStartTime = getPlaybackRecoveryPosition(player);
+  const startTime = Number.isFinite(requestedStartTime)
+    ? Math.max(0, Math.min(state.duration || Infinity, requestedStartTime))
+    : fallbackStartTime;
   playbackRecoveryState.attempts = attempt;
+  clearSeekWatchdog();
   state.isPlaying = false;
   player?.pause?.().catch(() => {});
   showStatus(`Recovering video (attempt ${attempt})...`);
@@ -236,7 +420,10 @@ function schedulePlaybackRecovery(player, error) {
     const request = playbackRecoveryState.request;
     if (!request) return;
     try {
-      if (await requestFreshPlaybackSession(request, startTime)) return;
+      if (await requestFreshPlaybackSession(request, startTime)) {
+        armPlaybackRecoveryConfirmation(attempt, startTime);
+        return;
+      }
       await play(request.url, request.title, {
         ...request.meta,
         startTime,
@@ -248,7 +435,7 @@ function schedulePlaybackRecovery(player, error) {
         attempt,
         startTime,
       });
-      if (!schedulePlaybackRecovery(player, recoveryError)) {
+      if (!schedulePlaybackRecovery(state.player, recoveryError, { startTime })) {
         showStatus(`Recovery error: ${recoveryError.message}`);
       }
     }
@@ -343,7 +530,7 @@ function recordStutterEvent(type, fields = {}) {
   slot.seq = stutterTelemetryState.nextSeq++;
   slot.type = type;
   slot.timestamp = fields.timestamp ?? Date.now();
-  slot.playbackPosition = fields.playbackPosition ?? state.currentTime ?? 0;
+  slot.playbackPosition = fields.playbackPosition ?? getReportedCurrentTime() ?? 0;
   slot.durationMs = fields.durationMs ?? 0;
   slot.stallStartedAt = fields.stallStartedAt ?? 0;
   slot.usedJSHeapSize = fields.usedJSHeapSize ?? 0;
@@ -363,7 +550,7 @@ function beginStall() {
   });
   if (!stutterTelemetryState.pendingStallStartedAt) {
     stutterTelemetryState.pendingStallStartedAt = Date.now();
-    stutterTelemetryState.pendingStallPlaybackPosition = state.currentTime;
+    stutterTelemetryState.pendingStallPlaybackPosition = getReportedCurrentTime();
   }
 }
 
@@ -716,7 +903,7 @@ function postPlayerRuntimeLog(type, fields = {}) {
   const payload = {
     type,
     timestamp: Date.now(),
-    playbackPosition: Number((state.currentTime || 0).toFixed(3)),
+    playbackPosition: Number(getReportedCurrentTime().toFixed(3)),
     playbackState: getPlaybackState(),
     duration: state.duration || 0,
     isPlaying: !!state.isPlaying,
@@ -863,6 +1050,10 @@ function summarizePlayerStats(player) {
     bufferDropBytes: normalizeMetricNumber(stats.bufferDropBytes),
     audioStutter: normalizeMetricNumber(stats.audioStutter),
     videoStutter: normalizeMetricNumber(stats.videoStutter),
+    seekRequestCount: normalizeMetricNumber(stats.seekRequestCount),
+    seekSupersededCount: normalizeMetricNumber(stats.seekSupersededCount),
+    iteratorCloseTimeoutCount: normalizeMetricNumber(stats.iteratorCloseTimeoutCount),
+    lastSeekTarget: normalizeMetricNumber(stats.lastSeekTarget),
     audioCurrentTimeMs: normalizeMetricNumber(stats.audioCurrentTime),
     audibleAudioCurrentTimeMs: normalizeMetricNumber(stats.audibleAudioCurrentTime),
     audioOutputLatencyMs: normalizeMetricNumber(stats.audioOutputLatencyMs),
@@ -903,11 +1094,6 @@ function summarizePlayerStats(player) {
     liveEdgeTime: normalizeMetricNumber(stats.liveEdgeTime),
     livePlayStartTime: normalizeMetricNumber(stats.livePlayStartTime),
     liveLatencyMs: normalizeMetricNumber(stats.liveLatencyMs),
-    abrCurrentBitrate: normalizeMetricNumber(stats.abrCurrentBitrate),
-    abrAdvertisedBitrate: normalizeMetricNumber(stats.abrAdvertisedBitrate),
-    abrLastDecision: stats.abrLastDecision && typeof stats.abrLastDecision === "object"
-      ? stats.abrLastDecision
-      : null,
     jitterBuffer,
   };
 }
@@ -1045,7 +1231,7 @@ function buildStutterReportPayload(reason) {
     payload: {
       reason,
       events,
-      currentTime: state.currentTime,
+      currentTime: getReportedCurrentTime(),
       duration: state.duration,
       memory: memorySnapshot,
       buffer: collectBufferState(),
@@ -1164,7 +1350,7 @@ function sendPlayerHealthHeartbeat() {
   void maybeMeasurePageMemory();
 
   postPlayerRuntimeLog("health_heartbeat", {
-    currentTime: state.currentTime,
+    currentTime: getReportedCurrentTime(),
     viewport: describeViewport(),
     buffer: collectBufferState(),
     frameCountSinceLastHeartbeat,
@@ -1207,7 +1393,7 @@ function ensureLongTaskObserver() {
         playerRuntimeLogState.jankCount += 1;
         recordStutterEvent("long_task", {
           timestamp: Math.round(performance.timeOrigin + entry.startTime),
-          playbackPosition: state.currentTime,
+          playbackPosition: getReportedCurrentTime(),
           durationMs: entry.duration,
         });
       }
@@ -1227,15 +1413,21 @@ function detectVideoFreeze(playerStats) {
   const videoCurrentTimeMs = playerStats?.videoCurrentTimeMs;
   const audioCurrentTimeMs = playerStats?.audioCurrentTimeMs;
   const hasRenderedVideo = (playerStats?.videoFrameRenderCount || 0) > 0;
+  const hasVideo = Boolean(playerStats?.videoCodec);
 
-  if (!state.isPlaying || !hasRenderedVideo || !Number.isFinite(videoCurrentTimeMs)) {
+  if (
+    !state.isPlaying
+    || !hasVideo
+    || document.visibilityState === "hidden"
+    || !Number.isFinite(videoCurrentTimeMs)
+  ) {
     playerMetricsState.lastVideoCurrentTimeMs = videoCurrentTimeMs || 0;
     playerMetricsState.lastVideoProgressAt = now;
     playerMetricsState.freezeRecoveryTriggered = false;
     return;
   }
 
-  if (videoCurrentTimeMs > playerMetricsState.lastVideoCurrentTimeMs + 50) {
+  if (hasRenderedVideo && videoCurrentTimeMs > playerMetricsState.lastVideoCurrentTimeMs + 50) {
     playerMetricsState.lastVideoCurrentTimeMs = videoCurrentTimeMs;
     playerMetricsState.lastVideoProgressAt = now;
     playerMetricsState.freezeRecoveryTriggered = false;
@@ -1283,9 +1475,11 @@ function reportPlayerMetrics() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       currentTime: reportedCurrentTime,
-      mediaClockTime: state.currentTime,
+      mediaClockTime: reportedCurrentTime,
       duration: state.duration,
       isPlaying: state.isPlaying,
+      playbackIntent: state.playbackIntent,
+      visibilityState: document.visibilityState,
       isMuted: state.isMuted,
       bufferHealthSeconds,
       buffer: collectBufferState(state.player),
@@ -1352,7 +1546,7 @@ async function logDecodePath(player, phase, extra = {}) {
     phase,
     path: "mediabunny-webcodecs",
     playbackState: getPlaybackState(),
-    currentTime: state.currentTime,
+    currentTime: getReportedCurrentTime(player),
     duration: state.duration,
     capabilities: CAPABILITY_PROFILE,
     stats: playerStats,
@@ -1406,10 +1600,11 @@ export function updateMediaSession() {
   navigator.mediaSession.playbackState = state.isPlaying ? "playing" : "paused";
   if (state.duration > 0) {
     try {
+      const currentTime = getReportedCurrentTime();
       navigator.mediaSession.setPositionState({
         duration: state.duration,
         playbackRate: 1,
-        position: Math.min(state.currentTime, state.duration),
+        position: Math.min(currentTime, state.duration),
       });
     } catch {}
   }
@@ -1418,6 +1613,14 @@ export function updateMediaSession() {
 // --- Progress reporting ----------------------------------------------
 
 function getReportedCurrentTime(player = state.player) {
+  const engineTime = Number(player?.getCurrentTime?.());
+  if (Number.isFinite(engineTime)) {
+    return resolvePlaybackPosition({
+      engineTime,
+      fallbackTime: state.currentTime,
+      duration: state.duration,
+    });
+  }
   const stats = summarizePlayerStats(player);
   const videoSeconds = stats?.videoCurrentTimeMs != null ? stats.videoCurrentTimeMs / 1000 : null;
   const audioSeconds = stats?.audioCurrentTimeMs != null ? stats.audioCurrentTimeMs / 1000 : null;
@@ -1429,9 +1632,20 @@ function getReportedCurrentTime(player = state.player) {
     && Number.isFinite(audioSeconds)
     && audioSeconds - videoSeconds > 2
   ) {
-    return Math.max(0, Math.min(state.duration || Infinity, videoSeconds));
+    return resolvePlaybackPosition({
+      engineTime: videoSeconds,
+      fallbackTime: state.currentTime,
+      duration: state.duration,
+    });
   }
-  return state.currentTime;
+  return resolvePlaybackPosition({
+    fallbackTime: state.currentTime,
+    duration: state.duration,
+  });
+}
+
+export function getPlaybackPosition() {
+  return getReportedCurrentTime();
 }
 
 export function reportProgress() {
@@ -1440,6 +1654,7 @@ export function reportProgress() {
     currentTime: reportedCurrentTime,
     duration: state.duration,
     isPlaying: state.isPlaying,
+    playbackIntent: state.playbackIntent,
     isMuted: state.isMuted,
     plexRatingKey: state.plexInfo?.ratingKey || null,
     viewport: describeViewport(),
@@ -1494,16 +1709,18 @@ export function seekToTime(timeSec) {
         requestedTime,
       ),
     );
-    const wasPlaying = state.isPlaying;
+    const wasPlaying = state.playbackIntent === "playing";
     if (lowLatency) {
+      const fromTime = state.currentTime;
       state.currentTime = target;
       state.player.hlsStartSeconds = 2;
       updateTimeDisplay();
       updateProgress(1);
-      void state.player.seek(BigInt(Math.floor(target * 1000)), { preserveHlsBuffer: true }).then(() => {
-        if (wasPlaying) return state.player.resume();
-        return null;
-      }).catch((err) => console.error("[player] Live-edge seek error:", err));
+      runPlayerSeek(state.player, target, wasPlaying, {
+        preserveHlsBuffer: true,
+        fromTime,
+        label: "live-edge",
+      });
       return;
     }
     const mediaSource = request.meta.mediaSource;
@@ -1526,13 +1743,68 @@ export function seekToTime(timeSec) {
     return;
   }
   if (state.duration <= 0) return;
-  state.currentTime = Math.max(0, Math.min(state.duration, timeSec));
+  const requestedTime = Number(timeSec);
+  if (!Number.isFinite(requestedTime)) return;
+  const player = state.player;
+  const fromTime = state.currentTime;
+  const target = Math.max(0, Math.min(state.duration, requestedTime));
+  const wasPlaying = state.playbackIntent === "playing";
+  state.currentTime = target;
   updateTimeDisplay();
   updateProgress(state.currentTime / state.duration);
-  state.player.seek(BigInt(Math.floor(state.currentTime * 1000))).then(() => {
-    if (state.isPlaying) state.player.resume().catch(() => {});
-  }).catch((err) => console.error("[player] Seek error:", err));
+  runPlayerSeek(player, target, wasPlaying, { fromTime, label: "vod" });
   reportProgress();
+}
+
+function runPlayerSeek(player, targetTime, expectedToPlay, {
+  fromTime = state.currentTime,
+  preserveHlsBuffer = false,
+  label = "seek",
+} = {}) {
+  const startedAt = performance.now();
+  const requestId = armSeekWatchdog(player, targetTime, expectedToPlay);
+  postPlayerRuntimeLog("seek_requested", {
+    requestId,
+    label,
+    fromTime,
+    targetTime,
+    expectedToPlay,
+    preserveHlsBuffer,
+    playerStats: summarizePlayerStats(player),
+  });
+
+  void player.seek(BigInt(Math.floor(targetTime * 1000)), { preserveHlsBuffer }).then((applied) => {
+    const current = requestId === seekWatchdogState.requestId && state.player === player;
+    postPlayerRuntimeLog("seek_completed", {
+      requestId,
+      label,
+      targetTime,
+      applied: applied !== false,
+      current,
+      durationMs: Math.round(performance.now() - startedAt),
+      playerStats: summarizePlayerStats(player),
+    });
+    if (!current || applied === false) return;
+    if (expectedToPlay && state.playbackIntent === "playing") player.resume().catch(() => {});
+  }).catch((error) => {
+    const seekError = error instanceof Error ? error : new Error(String(error));
+    const current = requestId === seekWatchdogState.requestId && state.player === player;
+    postPlayerRuntimeLog("seek_failed", {
+      requestId,
+      label,
+      targetTime,
+      current,
+      durationMs: Math.round(performance.now() - startedAt),
+      error: seekError.message,
+      playerStats: summarizePlayerStats(player),
+    });
+    if (!current) return;
+    seekError.code ||= "SEEK_FAILED";
+    clearSeekWatchdog();
+    if (!schedulePlaybackRecovery(player, seekError, { startTime: targetTime })) {
+      console.error("[player] Seek error:", seekError);
+    }
+  });
 }
 
 // --- Toggle play/pause -----------------------------------------------
@@ -1540,14 +1812,13 @@ export function seekToTime(timeSec) {
 export async function togglePlayPause() {
   if (!state.player) return;
   try {
-    const status = state.player.getStatus();
-    const actuallyPlaying = status === "playing" || status === "buffering";
-    if (actuallyPlaying) {
+    if (state.playbackIntent === "playing") {
+      state.playbackIntent = "paused";
       await state.player.pause();
       state.isPlaying = false;
     } else {
+      state.playbackIntent = "playing";
       await state.player.play();
-      state.isPlaying = true;
     }
     updatePlayButton();
   } catch (e) {
@@ -1559,11 +1830,11 @@ export async function togglePlayPause() {
 
 function createMediabunnyPlayer(meta) {
   const updateTime = (seconds) => {
-    if (isDraggingProgress()) return;
     state.currentTime = Math.max(
       0,
       state.isLive ? seconds : Math.min(state.duration || Infinity, seconds),
     );
+    confirmPlaybackRecovery(player, state.currentTime);
     if (state.isLive) {
       const timeline = player.getLiveTimeline();
       if (timeline) {
@@ -1572,6 +1843,7 @@ function createMediabunnyPlayer(meta) {
         state.liveEdgeTime = Math.max(timeline.edgeTime, state.currentTime);
       }
     }
+    if (isDraggingProgress()) return;
     const now = performance.now();
     if (now - lastUiPaintAt >= UI_PAINT_INTERVAL_MS) {
       if (state.isLive && state.liveEdgeTime > state.liveStartTime) {
@@ -1593,11 +1865,14 @@ function createMediabunnyPlayer(meta) {
     faultInjection: getMediabunnyFaultInjection(),
     onStateChange: (nextState, detail) => {
       if (state.player !== player) return;
+      if (["playing", "paused", "stopped", "ended", "error"].includes(nextState)) {
+        clearSeekWatchdog();
+      }
       if (["loading", "seeking", "buffering"].includes(nextState)) {
         if (nextState !== "buffering") stopBandwidthDiagnosis();
         beginStall();
         showBuffering();
-        if (nextState === "buffering") state.isPlaying = true;
+        state.isPlaying = false;
         if (nextState === "buffering") startBandwidthDiagnosis(player, meta.streamProfile);
       } else if (nextState === "playing") {
         stopBandwidthDiagnosis();
@@ -1606,6 +1881,7 @@ function createMediabunnyPlayer(meta) {
         state.isPlaying = true;
         updatePlayButton();
         updateMediaSession();
+        confirmPlaybackRecovery(player, getReportedCurrentTime(player));
       } else if (nextState === "paused") {
         stopBandwidthDiagnosis();
         endStall();
@@ -1621,15 +1897,13 @@ function createMediabunnyPlayer(meta) {
       });
     },
     onTime: updateTime,
-    onFirstVideo: () => {
-      endStall();
-      markPlaybackStable(player);
-    },
+    onFirstVideo: () => {},
     onEnded: () => {
       stopBandwidthDiagnosis();
       endStall();
       hideBuffering();
       state.isPlaying = false;
+      state.playbackIntent = "paused";
       state.currentTime = 0;
       reportProgress();
       if (state.ws?.readyState === WebSocket.OPEN) {
@@ -1647,47 +1921,6 @@ function createMediabunnyPlayer(meta) {
         hideBuffering();
         showStatus(`Error: ${error.message}`);
       }
-    },
-    onAbrSwitch: async ({
-      session,
-      switchUrl,
-      fromBitrate,
-      videoBitrate,
-      currentTime,
-      reason,
-      network,
-    }) => {
-      postPlayerRuntimeLog("abr_switch_start", {
-        session,
-        fromBitrate,
-        toBitrate: videoBitrate,
-        reason,
-        network,
-      });
-      const response = await requestJson(switchUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session,
-          videoBitrate,
-          currentTime,
-          switchOffset: currentTime + Math.max(0, Number(network?.bufferedAheadSeconds) || 0),
-        }),
-      }, { label: "Stream quality switch", timeoutMs: 30_000 });
-      const result = response.data || {};
-      if (!response.ok) throw new Error(result.error || `ABR switch failed with ${response.status}`);
-      if (meta.mediaSource?.abr) {
-        meta.mediaSource.abr.currentBitrate = result.videoBitrate;
-        meta.mediaSource.abr.advertisedBitrate = result.advertisedBitrate || null;
-      }
-      postPlayerRuntimeLog("abr_switch_end", {
-        session,
-        fromBitrate,
-        toBitrate: result.videoBitrate,
-        advertisedBitrate: result.advertisedBitrate || null,
-        reason,
-      });
-      return result;
     },
   });
 
@@ -1733,8 +1966,10 @@ export function showStatus(text) {
 
 export async function play(url, title, meta = {}) {
   const playbackSessionId = playbackGeneration.begin();
+  clearSeekWatchdog();
   const isCurrentPlayback = () => playbackGeneration.isCurrent(playbackSessionId);
   const isRecovery = meta.__recovery === true;
+  state.playbackIntent = meta.autoplay === false ? "paused" : "playing";
   if (!isRecovery) {
     resetPlaybackRecovery();
     const requestMeta = { ...meta };
@@ -1858,13 +2093,12 @@ export async function play(url, title, meta = {}) {
       updateVolumeButton();
     }
 
-    if (meta.autoplay !== false) {
+    if (state.playbackIntent === "playing") {
       await player.play();
       if (!isCurrentPlayback() || state.player !== player) {
         await disposePlayer(player);
         return;
       }
-      state.isPlaying = true;
     } else {
       state.isPlaying = false;
       hideBuffering();
@@ -1887,7 +2121,7 @@ export async function play(url, title, meta = {}) {
     state.isPlaying = false;
     hideBuffering();
     updatePlayButton();
-    if (!isRecovery || !schedulePlaybackRecovery(null, e)) {
+    if (!schedulePlaybackRecovery(null, e)) {
       showStatus(`Error: ${e.message}`);
     }
   }
@@ -1895,6 +2129,7 @@ export async function play(url, title, meta = {}) {
 
 export async function stop() {
   playbackGeneration.cancel();
+  clearSeekWatchdog();
   resetPlaybackRecovery({ clearRequest: true });
   endStall();
   clearScheduledStutterTelemetryFlush();
@@ -1909,6 +2144,7 @@ export async function stop() {
   state.player = null;
   container.innerHTML = "";
   state.isPlaying = false;
+  state.playbackIntent = "paused";
   state.isLive = false;
   state.liveDvrAvailable = false;
   state.liveStartTime = 0;
@@ -1939,15 +2175,16 @@ export async function stop() {
 export function initMediaSession() {
   if (!("mediaSession" in navigator)) return;
   navigator.mediaSession.setActionHandler("play", () => {
-    if (state.player && !state.isPlaying) {
+    if (state.player && state.playbackIntent !== "playing") {
+      state.playbackIntent = "playing";
       state.player.play().catch(() => {});
-      state.isPlaying = true;
       updatePlayButton();
       updateMediaSession();
     }
   });
   navigator.mediaSession.setActionHandler("pause", () => {
-    if (state.player && state.isPlaying) {
+    if (state.player && state.playbackIntent === "playing") {
+      state.playbackIntent = "paused";
       state.player.pause().catch(() => {});
       state.isPlaying = false;
       updatePlayButton();

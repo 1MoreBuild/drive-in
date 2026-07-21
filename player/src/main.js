@@ -1,7 +1,7 @@
 import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
 import { initControls, updatePlayButton, updateVolumeButton } from "./controls.js";
-import { play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
+import { getPlaybackPosition, play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
 import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
@@ -14,8 +14,25 @@ const connectionStatusText = document.getElementById("connection-status-text");
 let reconnectTimer = null;
 let lastWsActivityAt = 0;
 const WS_RECONNECT_DELAY_MS = 3_000;
+const WS_BUSY_RECONNECT_DELAY_MS = 15_000;
 const WS_STALE_AFTER_MS = 70_000;
 const WS_HEALTH_CHECK_INTERVAL_MS = 15_000;
+const PLAYER_CONNECTION_ID = getPlayerConnectionId();
+
+function getPlayerConnectionId() {
+  const storageKey = "drivein-player-connection-id";
+  try {
+    const stored = sessionStorage.getItem(storageKey);
+    if (stored) return stored;
+    const generated = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    sessionStorage.setItem(storageKey, generated);
+    return generated;
+  } catch {
+    return `player-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
 
 // --- Player callbacks (break circular dep player↔browse) -------------
 
@@ -104,15 +121,39 @@ function syncPlayerConnection(ws) {
   if (state.player) reportProgress();
 }
 
-async function restoreConnectedRoute() {
+async function restoreConnectedRoute({
+  forcePlaybackRestore = false,
+  playbackSnapshot = null,
+} = {}) {
   const route = parseRoute();
-  if (state.player || state.isPlaying) return;
+  if (!forcePlaybackRestore && (state.player || state.isPlaying)) return;
 
   // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
   if (route.view === "player" && (route.url || route.plex)) {
-    showStatus("Resuming playback...");
+    const localResumeTime = getPlaybackPosition();
+    const serverResumeTime = Math.max(0, Number(playbackSnapshot?.currentTime) || 0);
+    const resumeTime = !state.isLive
+      ? forcePlaybackRestore ? localResumeTime : serverResumeTime
+      : 0;
+    const autoplay = forcePlaybackRestore
+      ? state.playbackIntent === "playing"
+      : playbackSnapshot ? playbackSnapshot.playbackIntent === "playing" : true;
+    showStatus(forcePlaybackRestore
+      ? "Restoring playback after server restart..."
+      : "Resuming playback...");
     const endpoint = route.plex ? "/api/plex/play" : "/api/play";
-    const body = route.plex ? plexPlaybackRequest(route.plex) : { url: route.url };
+    const body = route.plex
+      ? plexPlaybackRequest(route.plex, {
+          ...(resumeTime > 0 ? { offset: resumeTime * 1000 } : {}),
+          recovery: forcePlaybackRestore,
+          autoplay,
+        })
+      : {
+          url: route.url,
+          ...(resumeTime > 0 ? { startTime: resumeTime } : {}),
+          autoplay,
+          reason: forcePlaybackRestore ? "server-restart" : "resume-route",
+        };
     const playbackRequest = route.plex
       ? requestPlexPlayback(body)
       : requestJson(`${location.origin}${endpoint}`, {
@@ -127,6 +168,7 @@ async function restoreConnectedRoute() {
     playbackRequest.catch((error) => {
       console.error("[playback] Resume failed:", error);
       showStatus(`Playback error: ${error.message}`);
+      if (forcePlaybackRestore) return;
       navigate("/", true);
       loadBrowseScreen();
     });
@@ -154,26 +196,18 @@ function connect() {
   ) return;
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${proto}//${location.host}/ws?role=player`;
+  const wsUrl = `${proto}//${location.host}/ws?role=player&clientId=${encodeURIComponent(PLAYER_CONNECTION_ID)}`;
   const ws = new WebSocket(wsUrl);
+  let accepted = false;
 
   state.ws = ws;
   lastWsActivityAt = Date.now();
 
   ws.onopen = () => {
     if (state.ws !== ws) return;
-    console.log("[ws] Connected");
+    console.log("[ws] Socket opened, waiting for player lease");
     lastWsActivityAt = Date.now();
-    hideConnectionStatus();
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-    syncPlayerConnection(ws);
-    restoreConnectedRoute().catch((error) => {
-      console.error("[ws] Failed to restore route:", error);
-      showStatus(`Connection restored, but the page failed to load: ${error.message}`);
-    });
+    showConnectionStatus("Connecting…");
   };
 
   ws.onmessage = (e) => {
@@ -182,6 +216,31 @@ function connect() {
     try {
       if (typeof e.data !== "string") return;
       const msg = JSON.parse(e.data);
+
+      if (msg.type === "playerAccepted") {
+        if (accepted) return;
+        accepted = true;
+        console.log("[ws] Connected");
+        hideConnectionStatus();
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        syncPlayerConnection(ws);
+        restoreConnectedRoute({
+          forcePlaybackRestore: msg.playbackAvailable === false,
+          playbackSnapshot: msg.playbackSnapshot || null,
+        }).catch((error) => {
+          console.error("[ws] Failed to restore route:", error);
+          showStatus(`Connection restored, but the page failed to load: ${error.message}`);
+        });
+        return;
+      }
+      if (msg.type === "playerRejected") {
+        showConnectionStatus("Another player is active");
+        return;
+      }
+      if (!accepted) return;
 
       if (msg.type === "ping") {
         if (ws.readyState === WebSocket.OPEN) {
@@ -212,6 +271,7 @@ function connect() {
           }).catch((error) => console.error("[playback] Play transition failed:", error));
           break;
         case "pause":
+          state.playbackIntent = "paused";
           if (state.player) {
             state.player.pause().catch(() => {});
           }
@@ -219,10 +279,10 @@ function connect() {
           updatePlayButton();
           break;
         case "resume":
+          state.playbackIntent = "playing";
           if (state.player) {
             state.player.play().catch(() => {});
           }
-          state.isPlaying = true;
           updatePlayButton();
           break;
         case "stop":
@@ -269,13 +329,18 @@ function connect() {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     if (state.ws !== ws) return;
     state.ws = null;
-    console.log("[ws] Disconnected, reconnecting in 3s...");
-    showConnectionStatus("Reconnecting…");
-    if (!state.player && !state.isPlaying) showStatus("Reconnecting…");
-    scheduleReconnect();
+    const busy = event.code === 4009;
+    console.log(busy
+      ? "[ws] Another player is active; retrying later..."
+      : "[ws] Disconnected, reconnecting in 3s...");
+    showConnectionStatus(busy ? "Another player is active" : "Reconnecting…");
+    if (!state.player && !state.isPlaying) {
+      showStatus(busy ? "Another player is active" : "Reconnecting…");
+    }
+    scheduleReconnect(busy ? WS_BUSY_RECONNECT_DELAY_MS : WS_RECONNECT_DELAY_MS);
   };
 
   ws.onerror = () => {

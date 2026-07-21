@@ -2,6 +2,7 @@
   "name": "drive-in",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "license": "MIT",
   "description": "Canvas media player for Tesla, powered by Mediabunny and WebCodecs",
   "author": "1MoreBuild",
@@ -26,9 +27,12 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "test": "npm test -w player && npm test -w server",
-    "test:chaos": "node --test player/test/network-chaos.test.js server/test/upstream-fetch.test.js",
+    "test": "npm run test:unit && npm run test:integration && npm run test:e2e",
+    "test:unit": "npm run test:unit -w player && npm run test:unit -w server",
+    "test:integration": "npm run test:integration -w player && npm run test:integration -w server",
+    "test:e2e": "node --test test/e2e/*.test.js",
     "check": "npm test && npm run build",
+    "check:core": "npm run test:unit && npm run test:integration && npm run build",
     "dev": "concurrently -k -n server,vite -c blue,green \"npm:dev:server\" \"npm:dev:vite\"",
     "dev:server": "npm run dev -w server",
     "dev:vite": "npm run dev -w player",
@@ -45,6 +49,7 @@
   ],
   "devDependencies": {
     "concurrently": "^9.2.4",
+    "playwright": "^1.61.1",
     "wait-on": "^9.0.10"
   }
 }

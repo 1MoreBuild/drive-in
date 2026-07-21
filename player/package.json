@@ -13,7 +13,9 @@
     "directory": "player"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --test test/unit/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"

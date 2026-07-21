@@ -7,7 +7,6 @@ import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "fs";
 import { Readable } from "stream";
-import { pipeline } from "stream/promises";
 import pinoHttp from "pino-http";
 import log from "./logger.js";
 import {
@@ -34,7 +33,14 @@ import {
 import { loadHistoryFile, saveHistoryFile } from "./history-store.js";
 import { PlaybackCoordinator, isPlaybackSuperseded } from "./playback-coordinator.js";
 import { fetchPublicImage, MAX_THUMBNAIL_BYTES, resolveSubtitleFile, SafeFetchError } from "./security.js";
-import { normalizePlayerState, normalizePlayerStatus } from "./ws-protocol.js";
+import {
+  normalizePlayerConnectionId,
+  normalizePlayerState,
+  normalizePlayerStatus,
+  expectedPlayerState,
+  PLAYER_CONNECTION_BUSY_CLOSE_CODE,
+  playerConnectionDecision,
+} from "./ws-protocol.js";
 import {
   PLEX_VIDEO_RESOLUTION,
   createFixedPlexMediaSource,
@@ -57,6 +63,8 @@ import { createSegmentCachePathResolver, snapshotProxyUrl } from "./segment-cach
 import { rewritePlexHlsManifest as rewritePlexHlsManifestBody } from "./plex-hls.js";
 import { registerQueuePlaylistApi } from "./queue-playlist-api.js";
 import { buildDashHlsSession, parseMp4Structure } from "./dash-hls.js";
+import { pipelineToResponse } from "./response-pipeline.js";
+import { runtimePath } from "./runtime-paths.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -72,7 +80,7 @@ const MAX_PLEX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
-const SEGMENT_CACHE_DIR = resolve(__dirname, "../.segment-cache");
+const SEGMENT_CACHE_DIR = runtimePath(".segment-cache");
 const getSegmentCachePaths = createSegmentCachePathResolver(SEGMENT_CACHE_DIR);
 const SEGMENT_CACHE_MAX_BYTES = (() => {
   const parsed = Number(process.env.SEGMENT_CACHE_MAX_BYTES);
@@ -106,7 +114,7 @@ const CJK_FONT_PATH = [
 
 // --- Play history (persisted to disk) --------------------------------
 
-const HISTORY_PATH = resolve(__dirname, "../.play-history.json");
+const HISTORY_PATH = runtimePath(".play-history.json");
 const MAX_HISTORY = 30;
 
 function loadHistory() {
@@ -158,7 +166,9 @@ app.use((req, res, next) => {
     released = true;
     activeConnections = Math.max(0, activeConnections - 1);
   };
-  res.once("finish", release);
+  // ServerResponse emits close after both normal completion and premature
+  // disconnects. One listener is enough and keeps streaming pipelines below
+  // EventEmitter's listener warning threshold.
   res.once("close", release);
   next();
 });
@@ -378,7 +388,6 @@ function finishProxyMetric(metric) {
 }
 
 function trackProxyMetricLifecycle(res, metric) {
-  res.once("finish", () => finishProxyMetric(metric));
   res.once("close", () => finishProxyMetric(metric));
 }
 
@@ -640,7 +649,7 @@ function ytdlp(url, { targetHeight = 720, signal } = {}) {
 
 // --- ffmpeg split-stream transcode fallback --------------------------
 
-const hlsBase = resolve(__dirname, "../.hls-cache");
+const hlsBase = runtimePath(".hls-cache");
 mkdirSync(hlsBase, { recursive: true });
 // Clean leftover HLS sessions from previous runs
 for (const d of readdirSync(hlsBase)) {
@@ -983,7 +992,7 @@ function getTranscodeSession() {
 
 // --- Media cache (thumbnails + subtitles) ----------------------------
 
-const CACHE_DIR = resolve(__dirname, "../.media-cache");
+const CACHE_DIR = runtimePath(".media-cache");
 const SUBS_CACHE_DIR = resolve(CACHE_DIR, "subs");
 const THUMB_CACHE_DIR = resolve(CACHE_DIR, "thumbs");
 mkdirSync(SUBS_CACHE_DIR, { recursive: true });
@@ -1816,7 +1825,7 @@ async function serveSegmentCacheToResponse(cacheEntry, res, onChunk, options = {
   if (onChunk) {
     source.on("data", (chunk) => onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
   }
-  await pipeline(source, res);
+  await pipelineToResponse(source, res);
 }
 
 function expectedRangeBytes(rangeHeader) {
@@ -2024,7 +2033,7 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
   if (!shouldCacheSegmentResponse(upstreamUrl, upstream, rangeHeader)) {
     const source = Readable.fromWeb(upstream.body);
     if (onChunk) source.on("data", (chunk) => onChunk(Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)));
-    await pipeline(source, res);
+    await pipelineToResponse(source, res);
     return;
   }
 
@@ -2065,7 +2074,7 @@ async function maybeCacheSegmentResponse(upstream, upstreamUrl, rangeHeader, req
 
   try {
     await Promise.all([
-      pipeline(source, res),
+      pipelineToResponse(source, res),
       new Promise((resolve, reject) => {
         cacheStream.once("finish", resolve);
         cacheStream.once("error", reject);
@@ -2840,7 +2849,7 @@ app.use("/api/plex/hls/*path", async (req, res) => {
       streamRequest?.touch();
       recordProxyMetricBytes(metric, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
     });
-    await pipeline(source, res);
+    await pipelineToResponse(source, res);
   } catch (error) {
     metric.error = error.message || String(error);
     if (!res.headersSent) res.status(502).json({ error: error.message });
@@ -3006,6 +3015,7 @@ async function playPlexNow({
   preferredAudioLanguage,
   offset,
   recovery = false,
+  autoplay = true,
 } = {}) {
   if (!ratingKey) {
     const err = new Error("ratingKey required");
@@ -3145,7 +3155,7 @@ async function playPlexNow({
   playbackRequest.assertCurrent();
 
   updateState({
-    status: "playing",
+    status: autoplay ? "playing" : "paused",
     title,
     resolvedUrl: `plex://${ratingKey}`,
     streamProfile: null,
@@ -3156,6 +3166,13 @@ async function playPlexNow({
   const audioTracks = partStreams
     .filter((s) => s.streamType === 2)
     .map((s) => ({ id: s.id, codec: s.codec, language: s.language, channels: s.channels, title: s.title || s.displayTitle, displayTitle: s.displayTitle, selected: !!s.selected }));
+
+  const startTime = resumeMs ? resumeMs / 1000 : 0;
+  playerState = expectedPlayerState(playerState, {
+    currentTime: startTime,
+    duration: meta.duration ? Math.round(meta.duration / 1000) : 0,
+    autoplay,
+  });
 
   sendToPlayer({
     type: "play",
@@ -3178,8 +3195,9 @@ async function playPlexNow({
       activeSubtitleID: selectedSubtitleStreamID || null,
       activeAudioID: selectedAudioStreamID || null,
     },
-    startTime: resumeMs ? resumeMs / 1000 : 0,
+    startTime,
     recovery: recovery === true,
+    autoplay: autoplay !== false,
   });
 
   addToHistory({
@@ -3664,6 +3682,12 @@ async function playUrlNow({
     ? numericStartTime
     : savedEntry?.progress || 0;
 
+  playerState = expectedPlayerState(playerState, {
+    currentTime: startTime,
+    duration: resolved.duration,
+    autoplay,
+  });
+
   sendToPlayer({
     type: "play",
     url: playerUrl,
@@ -3878,7 +3902,12 @@ wss.on("connection", (ws, req) => {
   });
 
   let role = null;
-  try { role = new URL(req.url, "http://localhost").searchParams.get("role"); } catch {}
+  let connectionId = null;
+  try {
+    const requestUrl = new URL(req.url, "http://localhost");
+    role = requestUrl.searchParams.get("role");
+    connectionId = normalizePlayerConnectionId(requestUrl.searchParams.get("clientId"));
+  } catch {}
   if (role !== "player" || !isAllowedWebSocketOrigin(req)) {
     log.warn({ role, origin: req.headers.origin || null }, "Rejected WebSocket connection");
     ws.close(1008, "Invalid WebSocket role or origin");
@@ -3886,12 +3915,39 @@ wss.on("connection", (ws, req) => {
   }
 
   const previousPlayer = playerWs;
+  const connectionDecision = playerConnectionDecision({
+    currentOpen: previousPlayer?.readyState === 1,
+    currentAlive: previousPlayer?.isAlive,
+    currentId: previousPlayer?.connectionId,
+    nextId: connectionId,
+  });
+  if (connectionDecision === "reject") {
+    log.info({ connectionId }, "Rejected duplicate player WebSocket");
+    ws.send(JSON.stringify({ type: "playerRejected", reason: "active-player" }));
+    ws.close(PLAYER_CONNECTION_BUSY_CLOSE_CODE, "Another player is active");
+    return;
+  }
+
+  ws.connectionId = connectionId;
   playerWs = ws;
   if (previousPlayer && previousPlayer !== ws && previousPlayer.readyState === 1) {
-    previousPlayer.close(1012, "Player connection replaced");
+    previousPlayer.close(1012, "Player connection resumed");
   }
-  log.info("Player WebSocket connected");
+  log.info({ connectionId, connectionDecision }, "Player WebSocket connected");
 
+  ws.send(JSON.stringify({
+    type: "playerAccepted",
+    playbackAvailable: state.status !== "idle" && Boolean(state.url || state.title),
+    playbackSnapshot: state.status !== "idle" && playerState.updatedAt
+      ? {
+          currentTime: playerState.currentTime,
+          duration: playerState.duration,
+          isPlaying: playerState.isPlaying,
+          playbackIntent: playerState.playbackIntent,
+          updatedAt: playerState.updatedAt,
+        }
+      : null,
+  }));
   ws.send(JSON.stringify({ type: "queueUpdated", queue: listQueue() }));
   ws.send(JSON.stringify({ type: "playlistsUpdated", playlists: listPlaylists() }));
 
@@ -3918,6 +3974,7 @@ wss.on("connection", (ws, req) => {
           currentTime: reportedState.currentTime,
           duration: reportedState.duration,
           isPlaying: reportedState.isPlaying,
+          playbackIntent: reportedState.playbackIntent,
           isMuted: reportedState.isMuted,
           viewport: reportedState.viewport,
           updatedAt: Date.now(),
@@ -3996,7 +4053,7 @@ app.get(/^\/(play|show\/\d+)/, (_req, res) => {
 
 // --- Diagnostics upload ----------------------------------------------
 
-const DIAG_DIR = resolve(__dirname, "../.diag-reports");
+const DIAG_DIR = runtimePath(".diag-reports");
 const MAX_DIAG_REPORTS = 20;
 mkdirSync(DIAG_DIR, { recursive: true });
 
@@ -4065,5 +4122,7 @@ process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
 initializeSegmentCache();
 
 server.listen(PORT, () => {
-  log.info({ port: PORT }, "Drive-In server started");
+  const port = server.address().port;
+  log.info({ port }, "Drive-In server started");
+  process.send?.({ type: "drive-in-listening", port });
 });
