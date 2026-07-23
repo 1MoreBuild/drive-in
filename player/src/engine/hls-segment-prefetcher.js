@@ -80,8 +80,8 @@ function responseFromCache(entry) {
 export class HlsSegmentPrefetcher {
   constructor({
     ahead = 90,
-    targetAheadSeconds = 180,
-    maxBytes = 96 * 1024 * 1024,
+    targetAheadSeconds = 210,
+    maxBytes = 128 * 1024 * 1024,
     maxConcurrent = 1,
     inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
     maxRetries = DEFAULT_MAX_RETRIES,

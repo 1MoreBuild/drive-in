@@ -1,7 +1,7 @@
 import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
 import { initControls, updatePlayButton, updateVolumeButton } from "./controls.js";
-import { getPlaybackPosition, play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
+import { getPlaybackPosition, leavePlayback, play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
 import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
@@ -49,12 +49,55 @@ initControls({
 
 // --- Router ----------------------------------------------------------
 
-initRouter((route) => {
+let routeTransitionGeneration = 0;
+
+initRouter((route, navigation) => {
+  const generation = ++routeTransitionGeneration;
   if (route.view === "browse") {
-    loadBrowseScreen();
+    void enterBrowseRoute(generation).catch((error) => {
+      console.error("[router] Failed to enter browse route:", error);
+      if (generation === routeTransitionGeneration) {
+        showStatus(`Failed to load home screen: ${error.message}`);
+      }
+    });
+    return;
   }
-  // "player" and "show" views are handled by their triggers (play/openEpisodes)
+  if (route.view === "show" && navigation?.source === "popstate") {
+    void enterShowRoute(route, generation).catch((error) => {
+      console.error("[router] Failed to enter show route:", error);
+      if (generation === routeTransitionGeneration) {
+        showStatus(`Failed to load show: ${error.message}`);
+      }
+    });
+  }
+  // Push navigation to player/show is completed by the action that initiated it.
 });
+
+async function enterBrowseRoute(generation) {
+  await leavePlayback();
+  if (generation !== routeTransitionGeneration || parseRoute().view !== "browse") return;
+  await loadBrowseScreen();
+}
+
+async function enterShowRoute(route, generation) {
+  await leavePlayback();
+  const isCurrent = () => {
+    const currentRoute = parseRoute();
+    return generation === routeTransitionGeneration
+      && currentRoute.view === "show"
+      && String(currentRoute.ratingKey) === String(route.ratingKey);
+  };
+  if (!isCurrent()) return;
+  const browseData = await loadBrowseScreen();
+  if (!isCurrent()) return;
+  const show = browseData.shows.find((item) => String(item.ratingKey) === String(route.ratingKey));
+  if (!show) {
+    navigate("/", true);
+    showStatus("Show not found");
+    return;
+  }
+  await openEpisodes(show, { updateRoute: false, isCurrent });
+}
 
 // --- Audio unlock via user gesture -----------------------------------
 
@@ -170,7 +213,6 @@ async function restoreConnectedRoute({
       showStatus(`Playback error: ${error.message}`);
       if (forcePlaybackRestore) return;
       navigate("/", true);
-      loadBrowseScreen();
     });
     return;
   }
@@ -178,7 +220,7 @@ async function restoreConnectedRoute({
   const browseData = await loadBrowseScreen();
   if (route.view === "show") {
     const show = browseData.shows.find((item) => String(item.ratingKey) === String(route.ratingKey));
-    if (show) await openEpisodes(show);
+    if (show) await openEpisodes(show, { updateRoute: false });
     else {
       navigate("/", true);
       showStatus("Show not found");

@@ -2127,7 +2127,7 @@ export async function play(url, title, meta = {}) {
   }
 }
 
-export async function stop() {
+export async function leavePlayback() {
   playbackGeneration.cancel();
   clearSeekWatchdog();
   resetPlaybackRecovery({ clearRequest: true });
@@ -2166,8 +2166,13 @@ export async function stop() {
   overlay.classList.remove("hidden");
   document.getElementById("app").classList.remove("controls-visible");
   hideBuffering();
-  navigate("/");
   await disposePlayer(player);
+}
+
+export async function stop() {
+  const leaving = leavePlayback();
+  navigate("/");
+  await leaving;
 }
 
 // --- MediaSession action handlers ------------------------------------

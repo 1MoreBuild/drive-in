@@ -65,6 +65,11 @@ import { registerQueuePlaylistApi } from "./queue-playlist-api.js";
 import { buildDashHlsSession, parseMp4Structure } from "./dash-hls.js";
 import { pipelineToResponse } from "./response-pipeline.js";
 import { runtimePath } from "./runtime-paths.js";
+import {
+  buildPlexThumbnailUpstreamUrl,
+  parsePlexThumbnailDimensions,
+  plexThumbnailProxyUrl,
+} from "./plex-thumbnails.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -2883,6 +2888,7 @@ app.get("/api/plex/library/:id", async (req, res) => {
       return {
         ratingKey: m.ratingKey, title: m.title, year: m.year,
         type: m.type, thumb: m.thumb,
+        thumbnail: plexThumbnailProxyUrl(m.thumb, "poster"),
         duration: m.duration ? Math.round(m.duration / 60000) : null,
         videoCodec: media?.videoCodec, audioCodec: media?.audioCodec,
         resolution: media ? `${media.width}x${media.height}` : null,
@@ -2908,6 +2914,7 @@ app.get("/api/plex/show/:id/episodes", async (req, res) => {
         season: m.parentIndex, episode: m.index,
         duration: m.duration ? Math.round(m.duration / 60000) : null,
         thumb: m.thumb || null,
+        thumbnail: plexThumbnailProxyUrl(m.thumb, "landscape"),
         videoCodec: media?.videoCodec,
         viewCount: m.viewCount || 0,
         viewOffset: m.viewOffset || 0,
@@ -2929,6 +2936,7 @@ app.get("/api/plex/search", async (req, res) => {
         results.push({
           ratingKey: m.ratingKey, title: m.title, year: m.year,
           type: m.type, thumb: m.thumb,
+          thumbnail: plexThumbnailProxyUrl(m.thumb, "poster"),
         });
       }
     }
@@ -3189,7 +3197,7 @@ async function playPlexNow({
     title,
     isLive: false,
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-    thumbnail: meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
+    thumbnail: plexThumbnailProxyUrl(meta.thumb, "poster"),
     plex: {
       ratingKey, subtitles, audioTracks,
       activeSubtitleID: selectedSubtitleStreamID || null,
@@ -3203,9 +3211,7 @@ async function playPlexNow({
   addToHistory({
     title,
     plex: { ratingKey },
-    thumbnail: meta.art
-      ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
-      : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
+    thumbnail: plexThumbnailProxyUrl(meta.art || meta.thumb, "landscape"),
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
   });
 
@@ -3289,17 +3295,24 @@ function isSupportedImageType(value) {
 app.get("/api/plex/thumb", async (req, res) => {
   const path = typeof req.query.path === "string" ? req.query.path : "";
   if (!path || path.length > 4096 || !PLEX_TOKEN) return res.status(400).end();
+  let dimensions;
   let upstreamUrl;
   try {
-    const plexBase = new URL(PLEX_URL);
-    upstreamUrl = new URL(path, plexBase);
-    if (upstreamUrl.origin !== plexBase.origin) return res.status(400).end();
-    upstreamUrl.searchParams.set("X-Plex-Token", PLEX_TOKEN);
+    dimensions = parsePlexThumbnailDimensions(req.query.width, req.query.height);
+    upstreamUrl = buildPlexThumbnailUpstreamUrl({
+      plexUrl: PLEX_URL,
+      path,
+      token: PLEX_TOKEN,
+      dimensions,
+    });
   } catch {
     return res.status(400).end();
   }
 
-  const cacheKey = createHash("sha256").update(path).digest("hex");
+  const cacheIdentity = dimensions
+    ? `${path}\0${dimensions.width}x${dimensions.height}`
+    : `${path}\0original`;
+  const cacheKey = createHash("sha256").update(cacheIdentity).digest("hex");
   const cacheBase = resolve(THUMB_CACHE_DIR, `plex_${cacheKey}`);
   const metaFile = cacheBase + ".meta";
   const dataFile = cacheBase + ".dat";
@@ -3311,6 +3324,7 @@ app.get("/api/plex/thumb", async (req, res) => {
       if (!isSupportedImageType(mime)) throw new Error("Invalid cached image type");
       res.set("Content-Type", mime);
       res.set("X-Content-Type-Options", "nosniff");
+      res.set("X-Drive-In-Thumbnail-Cache", "hit");
       res.set("Cache-Control", "public, max-age=604800");
       return res.sendFile(dataFile, { dotfiles: "allow" });
     } catch {
@@ -3327,18 +3341,27 @@ app.get("/api/plex/thumb", async (req, res) => {
       maxBytes: MAX_THUMBNAIL_BYTES,
     });
     const upstream = fetched.response;
-    if (!upstream.ok) return res.status(upstream.status).end();
+    if (!upstream.ok) {
+      log.warn({ path, dimensions, status: upstream.status }, "Plex thumbnail upstream rejected request");
+      return res.status(upstream.status).end();
+    }
     const mime = String(upstream.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
-    if (!isSupportedImageType(mime)) return res.status(415).end();
+    if (!isSupportedImageType(mime)) {
+      log.warn({ path, dimensions, mime, status: 415 }, "Plex thumbnail returned an unsupported image type");
+      return res.status(415).end();
+    }
     const buf = fetched.buffer;
     writeCacheFileAtomic(dataFile, buf);
     writeCacheFileAtomic(metaFile, mime);
     res.set("Content-Type", mime);
     res.set("X-Content-Type-Options", "nosniff");
+    res.set("X-Drive-In-Thumbnail-Cache", "miss");
     res.set("Cache-Control", "public, max-age=604800");
     res.send(buf);
   } catch (error) {
-    res.status(error?.status || 502).end();
+    const status = error?.status || 502;
+    log.warn({ path, dimensions, err: error?.message, status }, "Plex thumbnail proxy failed");
+    res.status(status).end();
   }
 });
 
@@ -3359,6 +3382,7 @@ app.get("/api/thumb", async (req, res) => {
       if (!isSupportedImageType(mime)) throw new Error("Invalid cached image type");
       res.set("Content-Type", mime);
       res.set("X-Content-Type-Options", "nosniff");
+      res.set("X-Drive-In-Thumbnail-Cache", "hit");
       res.set("Cache-Control", "public, max-age=604800");
       return res.sendFile(dataFile, { dotfiles: "allow" });
     } catch {
@@ -3373,6 +3397,7 @@ app.get("/api/thumb", async (req, res) => {
     writeCacheFileAtomic(metaFile, image.contentType);
     res.set("Content-Type", image.contentType);
     res.set("X-Content-Type-Options", "nosniff");
+    res.set("X-Drive-In-Thumbnail-Cache", "miss");
     res.set("Cache-Control", "public, max-age=604800");
     res.send(image.buffer);
   } catch (error) {
@@ -3417,9 +3442,7 @@ app.get("/api/history", async (_req, res) => {
     const data = await plexApi(`/library/metadata/${plexKeys.join(",")}`);
     const metaMap = {};
     for (const m of data.MediaContainer?.Metadata || []) {
-      const thumb = m.art
-        ? `/api/plex/thumb?path=${encodeURIComponent(m.art)}`
-        : m.thumb ? `/api/plex/thumb?path=${encodeURIComponent(m.thumb)}` : null;
+      const thumb = plexThumbnailProxyUrl(m.art || m.thumb, "landscape");
       metaMap[m.ratingKey] = { viewOffset: m.viewOffset || 0, viewCount: m.viewCount || 0, thumbnail: thumb };
     }
     const enriched = fixed.map((h) => {

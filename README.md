@@ -83,7 +83,7 @@ It also supports Plex, subtitles, audio tracks, queues, and playlists. Run `npx 
 
 Set `PLEX_URL` and `PLEX_TOKEN` in `.env`. On macOS, Drive-In can auto-detect a local Plex token when `PLEX_TOKEN` is unset.
 
-Plex transcodes video once at 720p and does not change bitrate during playback. This keeps the 180-second prefetch buffer intact. Plex also handles image-subtitle burn-in; Drive-In converts supported text subtitles to WebVTT and renders them in the browser.
+Plex transcodes video once at 720p and does not change bitrate during playback. This keeps the 210-second prefetch buffer intact. Plex also handles image-subtitle burn-in; Drive-In converts supported text subtitles to WebVTT and renders them in the browser.
 
 ## Tesla and remote access
 

@@ -181,11 +181,11 @@ test("a consumed segment remains reusable for backward playback", async () => {
   assert.equal(prefetcher.segmentCache.has(segments[1].url), true);
 });
 
-test("prefetch defaults target a 180-second in-car buffer", () => {
+test("prefetch defaults target a 210-second in-car buffer", () => {
   const prefetcher = createPrefetcher();
-  assert.equal(prefetcher.targetAheadSeconds, 180);
+  assert.equal(prefetcher.targetAheadSeconds, 210);
   assert.equal(prefetcher.ahead, 90);
-  assert.equal(prefetcher.maxBytes, 96 * 1024 * 1024);
+  assert.equal(prefetcher.maxBytes, 128 * 1024 * 1024);
   assert.equal(prefetcher.maxConcurrent, 1);
 });
 

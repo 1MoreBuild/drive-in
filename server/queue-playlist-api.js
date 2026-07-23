@@ -16,6 +16,7 @@ import {
   shiftQueueItem,
   updatePlaylist,
 } from "./queue-store.js";
+import { plexThumbnailProxyUrl } from "./plex-thumbnails.js";
 
 export function playlistItemsFromInfo(info, sourceUrl, entryUrlFor) {
   const entries = Array.isArray(info?.entries) ? info.entries : [];
@@ -67,9 +68,7 @@ export function registerQueuePlaylistApi(app, {
       return {
         ...body,
         title,
-        thumbnail: meta.art
-          ? `/api/plex/thumb?path=${encodeURIComponent(meta.art)}`
-          : meta.thumb ? `/api/plex/thumb?path=${encodeURIComponent(meta.thumb)}` : null,
+        thumbnail: plexThumbnailProxyUrl(meta.art || meta.thumb, "landscape"),
         duration: meta.duration ? Math.round(meta.duration / 1000) : null,
       };
     } catch (error) {

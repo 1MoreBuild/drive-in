@@ -128,3 +128,137 @@ test("the browser decodes media, paints the Canvas, and advances presentation ti
   assert.deepEqual(rendered.canvas, { width: 640, height: 360 });
   assert.deepEqual(pageErrors, []);
 });
+
+test("browser back after playback ends tears down the player and shows the home screen", async (t) => {
+  const { baseUrl, runtimeDir } = await startDriveInServer(t);
+  const mediaUrl = await createMediaOrigin(t, runtimeDir);
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--autoplay-policy=no-user-gesture-required"],
+  });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.playerConnected;
+  }, "browser player connection", 5_000);
+
+  const playResponse = await postJson(baseUrl, "/api/play", {
+    url: mediaUrl,
+    startTime: 0,
+    autoplay: true,
+  });
+  assert.equal(playResponse.response.status, 200);
+  await page.waitForFunction(() => (
+    globalThis.__driveInMediabunny?.player?.getStatus() === "ended"
+  ), null, { timeout: 15_000 });
+  assert.equal(new URL(page.url()).pathname, "/play");
+
+  await page.goBack();
+  await page.waitForFunction(() => (
+    location.pathname === "/"
+    && !globalThis.__driveInMediabunny
+    && !document.querySelector('canvas[data-engine="mediabunny"]')
+    && !document.getElementById("overlay").classList.contains("hidden")
+  ), null, { timeout: 10_000 });
+
+  const home = await page.evaluate(() => ({
+    path: location.pathname,
+    playerPresent: Boolean(globalThis.__driveInMediabunny),
+    canvasPresent: Boolean(document.querySelector('canvas[data-engine="mediabunny"]')),
+    overlayHidden: document.getElementById("overlay").classList.contains("hidden"),
+  }));
+  assert.deepEqual(home, {
+    path: "/",
+    playerPresent: false,
+    canvasPresent: false,
+    overlayHidden: false,
+  });
+});
+
+test("browser back from an episode tears down the player and restores its show", async (t) => {
+  const { baseUrl, runtimeDir } = await startDriveInServer(t);
+  const mediaUrl = await createMediaOrigin(t, runtimeDir);
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--autoplay-policy=no-user-gesture-required"],
+  });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.playerConnected;
+  }, "browser player connection", 5_000);
+
+  await page.evaluate(() => {
+    const realFetch = globalThis.fetch.bind(globalThis);
+    const jsonResponse = (value) => new Response(JSON.stringify(value), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    globalThis.fetch = (input, init) => {
+      const requestUrl = typeof input === "string"
+        ? input
+        : input instanceof URL ? input.href : input.url;
+      const url = new URL(requestUrl, location.origin);
+      if (url.pathname === "/api/queue") return Promise.resolve(jsonResponse([]));
+      if (url.pathname === "/api/playlists") return Promise.resolve(jsonResponse([]));
+      if (url.pathname === "/api/history") return Promise.resolve(jsonResponse([]));
+      if (url.pathname === "/api/plex/libraries") {
+        return Promise.resolve(jsonResponse([{ id: "shows", title: "Shows", type: "show" }]));
+      }
+      if (url.pathname === "/api/plex/library/shows") {
+        return Promise.resolve(jsonResponse({
+          total: 1,
+          items: [{ ratingKey: "42", title: "Test Show", type: "show", leafCount: 1 }],
+        }));
+      }
+      if (url.pathname === "/api/plex/show/42/episodes") {
+        return Promise.resolve(jsonResponse([{
+          ratingKey: "4201",
+          title: "Test Episode",
+          season: 1,
+          episode: 1,
+          duration: 4,
+        }]));
+      }
+      return realFetch(input, init);
+    };
+    history.replaceState(null, "", "/show/42");
+  });
+
+  const playResponse = await postJson(baseUrl, "/api/play", {
+    url: mediaUrl,
+    startTime: 0,
+    autoplay: true,
+  });
+  assert.equal(playResponse.response.status, 200);
+  await page.waitForFunction(() => (
+    globalThis.__driveInMediabunny?.player?.getStats().videoFrameRenderCount > 0
+  ), null, { timeout: 15_000 });
+  assert.equal(new URL(page.url()).pathname, "/play");
+
+  await page.goBack();
+  await page.waitForFunction(() => (
+    location.pathname === "/show/42"
+    && !globalThis.__driveInMediabunny
+    && !document.querySelector('canvas[data-engine="mediabunny"]')
+    && !document.getElementById("overlay").classList.contains("hidden")
+    && !document.getElementById("episodes-section").classList.contains("hidden")
+    && document.getElementById("eps-show-title").textContent === "Test Show"
+  ), null, { timeout: 10_000 });
+
+  const episodeCard = page.locator("#episodes-list .episode-card");
+  assert.equal(await episodeCard.locator(".episode-card-title").innerText(), "Test Episode");
+  assert.equal(await episodeCard.locator(".episode-card-meta").innerText(), "E1 · 4min");
+});

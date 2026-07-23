@@ -496,11 +496,24 @@ function queuePayloadForItem(item, type) {
     return {
       ratingKey: item.ratingKey,
       title: item.title,
-      thumbnail: item.thumb ? `/api/plex/thumb?path=${encodeURIComponent(item.thumb)}` : null,
+      thumbnail: item.thumbnail || plexThumbnailUrl(item.thumb, "poster"),
       duration: item.duration ? item.duration * 60 : null,
     };
   }
   return null;
+}
+
+function plexThumbnailUrl(path, preset = "landscape") {
+  if (!path) return null;
+  const dimensions = preset === "poster"
+    ? { width: 390, height: 585 }
+    : { width: 600, height: 338 };
+  const params = new URLSearchParams({
+    path,
+    width: String(dimensions.width),
+    height: String(dimensions.height),
+  });
+  return `/api/plex/thumb?${params}`;
 }
 
 // --- Card rendering --------------------------------------------------
@@ -514,7 +527,7 @@ function renderCardRow(container, items, { type }) {
 
     let thumbUrl = null;
     if (type === "history") thumbUrl = item.thumbnail;
-    else if (item.thumb) thumbUrl = `/api/plex/thumb?path=${encodeURIComponent(item.thumb)}`;
+    else thumbUrl = item.thumbnail || plexThumbnailUrl(item.thumb, isPoster ? "poster" : "landscape");
 
     const thumbHtml = thumbUrl
       ? `<img src="${thumbUrl}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'browse-card-thumb-empty',innerHTML:'<svg viewBox=\\'0 0 24 24\\' fill=\\'white\\' width=\\'28\\' height=\\'28\\'><path d=\\'M8 5v14l11-7z\\'/></svg>'}))">`
@@ -681,8 +694,12 @@ export function playPlexItem(ratingKey) {
 
 // --- Episodes --------------------------------------------------------
 
-export async function openEpisodes(show) {
-  navigate(`/show/${show.ratingKey}`);
+export async function openEpisodes(show, {
+  updateRoute = true,
+  isCurrent = () => true,
+} = {}) {
+  if (updateRoute) navigate(`/show/${show.ratingKey}`);
+  if (!isCurrent()) return;
   epsShowTitle.textContent = show.title;
   episodesList.innerHTML = "";
   episodesSection.classList.remove("hidden");
@@ -698,6 +715,7 @@ export async function openEpisodes(show) {
       {},
       { label: "Plex episodes" },
     );
+    if (!isCurrent()) return;
 
     const seasons = new Map();
     for (const ep of eps) {
@@ -719,7 +737,7 @@ export async function openEpisodes(show) {
         const el = document.createElement("div");
         el.className = "episode-card";
 
-        const thumbUrl = ep.thumb ? `/api/plex/thumb?path=${encodeURIComponent(ep.thumb)}` : "";
+        const thumbUrl = ep.thumbnail || plexThumbnailUrl(ep.thumb, "landscape") || "";
         const thumbHtml = thumbUrl
           // Tesla Chromium can leave dynamically inserted lazy images dormant
           // when the episodes section was hidden during layout. Episode lists
@@ -765,6 +783,7 @@ export async function openEpisodes(show) {
       episodesList.appendChild(grid);
     }
   } catch (e) {
+    if (!isCurrent()) return;
     console.error("[browse] Failed to load episodes:", e);
   }
 }

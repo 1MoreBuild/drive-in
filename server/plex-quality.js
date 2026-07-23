@@ -1,5 +1,5 @@
 export const PLEX_VIDEO_RESOLUTION = "1280x720";
-export const DEFAULT_PLEX_VIDEO_BITRATE_KBPS = 3000;
+export const DEFAULT_PLEX_VIDEO_BITRATE_KBPS = 4800;
 
 export function normalizePlexVideoBitrate(value) {
   const parsed = Number(value);

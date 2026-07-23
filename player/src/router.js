@@ -5,7 +5,7 @@ let onNavigate = null;
 export function initRouter(handler) {
   onNavigate = handler;
   window.addEventListener("popstate", () => {
-    onNavigate(parseRoute());
+    onNavigate(parseRoute(), { source: "popstate" });
   });
 }
 
@@ -27,5 +27,5 @@ export function navigate(path, replace = false) {
   } else {
     history.pushState(null, "", path);
   }
-  if (onNavigate) onNavigate(parseRoute());
+  if (onNavigate) onNavigate(parseRoute(), { source: replace ? "replace" : "push" });
 }
