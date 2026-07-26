@@ -21,11 +21,12 @@ export function parseRoute() {
 }
 
 export function navigate(path, replace = false) {
-  if (location.pathname + location.search === path) return;
+  if (location.pathname + location.search === path) return false;
   if (replace) {
     history.replaceState(null, "", path);
   } else {
     history.pushState(null, "", path);
   }
   if (onNavigate) onNavigate(parseRoute(), { source: replace ? "replace" : "push" });
+  return true;
 }

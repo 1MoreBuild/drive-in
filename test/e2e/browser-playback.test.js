@@ -13,7 +13,7 @@ import { postJson, startDriveInServer, waitFor } from "./helpers.js";
 const execFileAsync = promisify(execFile);
 const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-async function createMediaOrigin(t, runtimeDir) {
+async function createMediaOrigin(t, runtimeDir, { durationSeconds = 4 } = {}) {
   const mediaPath = `${runtimeDir}/browser-e2e.webm`;
   await execFileAsync("ffmpeg", [
     "-hide_banner",
@@ -22,7 +22,7 @@ async function createMediaOrigin(t, runtimeDir) {
     "-i", "testsrc2=size=640x360:rate=60",
     "-f", "lavfi",
     "-i", "sine=frequency=440:sample_rate=48000",
-    "-t", "4",
+    "-t", String(durationSeconds),
     "-c:v", "libvpx-vp9",
     "-deadline", "realtime",
     "-cpu-used", "8",
@@ -183,7 +183,7 @@ test("browser back after playback ends tears down the player and shows the home 
 
 test("browser back from an episode tears down the player and restores its show", async (t) => {
   const { baseUrl, runtimeDir } = await startDriveInServer(t);
-  const mediaUrl = await createMediaOrigin(t, runtimeDir);
+  const mediaUrl = await createMediaOrigin(t, runtimeDir, { durationSeconds: 12 });
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
     || (existsSync(macChrome) ? macChrome : undefined);
   const browser = await chromium.launch({
@@ -215,7 +215,16 @@ test("browser back from an episode tears down the player and restores its show",
       if (url.pathname === "/api/playlists") return Promise.resolve(jsonResponse([]));
       if (url.pathname === "/api/history") return Promise.resolve(jsonResponse([]));
       if (url.pathname === "/api/plex/libraries") {
-        return Promise.resolve(jsonResponse([{ id: "shows", title: "Shows", type: "show" }]));
+        return Promise.resolve(jsonResponse([
+          { id: "esports", title: "Esports", type: "show" },
+          { id: "shows", title: "Shows", type: "show" },
+        ]));
+      }
+      if (url.pathname === "/api/plex/library/esports") {
+        return Promise.resolve(jsonResponse({
+          total: 1,
+          items: [{ ratingKey: "7", title: "Esports Show", type: "show", leafCount: 1 }],
+        }));
       }
       if (url.pathname === "/api/plex/library/shows") {
         return Promise.resolve(jsonResponse({
@@ -261,4 +270,106 @@ test("browser back from an episode tears down the player and restores its show",
   const episodeCard = page.locator("#episodes-list .episode-card");
   assert.equal(await episodeCard.locator(".episode-card-title").innerText(), "Test Episode");
   assert.equal(await episodeCard.locator(".episode-card-meta").innerText(), "E1 · 4min");
+
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.status === "idle" && status.title === null;
+  }, "server playback cleanup after browser back", 5_000);
+
+  await page.goForward();
+  await page.waitForFunction(() => (
+    location.pathname === "/play"
+    && globalThis.__driveInMediabunny?.player?.getStats().videoFrameRenderCount > 0
+    && document.getElementById("overlay").classList.contains("hidden")
+  ), null, { timeout: 15_000 });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.status === "playing" && status.url === mediaUrl;
+  }, "server playback restored after browser forward", 5_000);
+});
+
+test("the player stop button preserves resume progress and stops the server session", async (t) => {
+  const { baseUrl, runtimeDir } = await startDriveInServer(t);
+  const mediaUrl = await createMediaOrigin(t, runtimeDir, { durationSeconds: 12 });
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--autoplay-policy=no-user-gesture-required"],
+  });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.playerConnected;
+  }, "browser player connection", 5_000);
+
+  const playResponse = await postJson(baseUrl, "/api/play", {
+    url: mediaUrl,
+    startTime: 6,
+    autoplay: true,
+  });
+  assert.equal(playResponse.response.status, 200);
+  await page.waitForFunction(() => (
+    globalThis.__driveInMediabunny?.player?.getCurrentTime() > 6.25
+  ), null, { timeout: 15_000 });
+
+  await page.evaluate(() => document.getElementById("btn-back").click());
+  await page.waitForFunction(() => (
+    location.pathname === "/"
+    && !globalThis.__driveInMediabunny
+    && !document.querySelector('canvas[data-engine="mediabunny"]')
+  ), null, { timeout: 10_000 });
+
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.status === "idle" && status.title === null;
+  }, "server playback cleanup after stop", 5_000);
+
+  const savedProgress = await waitFor(async () => {
+    const history = await fetch(new URL("/api/history", baseUrl)).then((response) => response.json());
+    const entry = history.find((item) => item.url === mediaUrl);
+    return entry?.progress >= 6 ? entry.progress : false;
+  }, "saved playback progress after stop", 5_000);
+  assert.ok(savedProgress >= 6 && savedProgress < 12);
+});
+
+test("a blocked player can explicitly take over the active player lease", async (t) => {
+  const { baseUrl } = await startDriveInServer(t);
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+  });
+  t.after(() => browser.close());
+
+  const activePage = await browser.newPage({ viewport: { width: 1180, height: 919 } });
+  await activePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.playerConnected;
+  }, "first browser player connection", 5_000);
+
+  const takeoverPage = await browser.newPage({ viewport: { width: 1180, height: 919 } });
+  await takeoverPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await takeoverPage.waitForSelector("#status-actions:not(.hidden)", { timeout: 5_000 });
+  assert.equal(
+    await takeoverPage.locator("#status-text").innerText(),
+    "Drive-In is open in another window",
+  );
+
+  await takeoverPage.locator("#btn-take-over").click();
+  await takeoverPage.waitForFunction(() => (
+    document.getElementById("connection-status")?.classList.contains("hidden")
+  ), null, { timeout: 5_000 });
+
+  await activePage.waitForSelector("#status-actions:not(.hidden)", { timeout: 10_000 });
+  assert.equal(
+    await activePage.locator("#status-text").innerText(),
+    "Drive-In is open in another window",
+  );
 });

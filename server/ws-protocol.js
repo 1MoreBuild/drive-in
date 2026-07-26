@@ -18,8 +18,10 @@ export function playerConnectionDecision({
   currentAlive,
   currentId,
   nextId,
+  forceReplace = false,
 } = {}) {
   if (!currentOpen) return "accept";
+  if (forceReplace) return "replace";
   if (currentAlive === false) return "replace";
   if (nextId && currentId === nextId) return "replace";
   return "reject";

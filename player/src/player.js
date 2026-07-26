@@ -1936,9 +1936,19 @@ function createMediabunnyPlayer(meta) {
 
 const container = document.getElementById("player-container");
 const overlay = document.getElementById("overlay");
+const controlsLayer = document.getElementById("controls");
+const centerPlayButton = document.getElementById("btn-center-play");
+const statusScreen = document.getElementById("status-screen");
 const statusText = document.getElementById("status-text");
 const subsPanel = document.getElementById("subs-panel");
 const audioPanel = document.getElementById("audio-panel");
+
+function setPlaybackControlsEnabled(enabled) {
+  controlsLayer.inert = !enabled;
+  controlsLayer.setAttribute("aria-hidden", String(!enabled));
+  centerPlayButton.disabled = !enabled;
+  centerPlayButton.setAttribute("aria-hidden", String(!enabled));
+}
 
 // Resize canvas when fullscreen or window size changes (debounced to avoid perf impact)
 let resizeTimer = null;
@@ -1961,6 +1971,7 @@ document.addEventListener("webkitfullscreenchange", handleResize);
 
 export function showStatus(text) {
   statusText.textContent = text;
+  statusScreen.style.display = "";
   overlay.classList.remove("hidden");
 }
 
@@ -2016,6 +2027,7 @@ export async function play(url, title, meta = {}) {
     audioPanel.classList.add("hidden");
     mediaTitle.textContent = title || "";
 
+    setPlaybackControlsEnabled(true);
     overlay.classList.add("hidden");
     showBuffering();
     // Include source in URL so page refresh can resume playback
@@ -2127,14 +2139,26 @@ export async function play(url, title, meta = {}) {
   }
 }
 
-export async function leavePlayback() {
+let leavePlaybackPromise = null;
+
+async function leavePlaybackNow() {
   playbackGeneration.cancel();
   clearSeekWatchdog();
   resetPlaybackRecovery({ clearRequest: true });
   endStall();
   clearScheduledStutterTelemetryFlush();
   flushStutterTelemetry("stop", { keepalive: true });
-  reportProgress();
+  const hadPlayback = Boolean(
+    state.player
+    || state.plexInfo
+    || state.sourceUrl
+    || state.duration > 0
+    || state.currentTime > 0
+  );
+  if (hadPlayback) reportProgress();
+  if (state.ws?.readyState === 1) {
+    state.ws.send(JSON.stringify({ type: "status", status: "idle" }));
+  }
   stopProgressReporting();
   stopStutterTelemetryReporting();
   stopPlayerHealthHeartbeat();
@@ -2163,16 +2187,23 @@ export async function leavePlayback() {
   updateTimeDisplay();
   updateProgress(0);
   mediaTitle.textContent = "";
+  setPlaybackControlsEnabled(false);
   overlay.classList.remove("hidden");
   document.getElementById("app").classList.remove("controls-visible");
   hideBuffering();
   await disposePlayer(player);
 }
 
+export function leavePlayback() {
+  if (leavePlaybackPromise) return leavePlaybackPromise;
+  leavePlaybackPromise = leavePlaybackNow().finally(() => {
+    leavePlaybackPromise = null;
+  });
+  return leavePlaybackPromise;
+}
+
 export async function stop() {
-  const leaving = leavePlayback();
-  navigate("/");
-  await leaving;
+  if (!navigate("/")) await leavePlayback();
 }
 
 // --- MediaSession action handlers ------------------------------------

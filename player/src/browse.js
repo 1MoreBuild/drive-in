@@ -255,13 +255,22 @@ function selectAudioTrack(audioId) {
 
 // --- Browse screen ---------------------------------------------------
 
-export async function loadBrowseScreen() {
+export async function loadBrowseScreen({
+  isCurrent = () => true,
+  revealBrowse = true,
+} = {}) {
+  if (!revealBrowse && isCurrent()) {
+    browseScreen.classList.add("episodes-open");
+    browseScreen.scrollTop = 0;
+  }
+
   const [queueRes, playlistsRes, historyRes, libsRes] = await Promise.allSettled([
     requestJsonData(`${location.origin}/api/queue`, {}, { label: "Queue" }),
     requestJsonData(`${location.origin}/api/playlists`, {}, { label: "Playlists" }),
     requestJsonData(`${location.origin}/api/history`, {}, { label: "History" }),
     requestJsonData(`${location.origin}/api/plex/libraries`, {}, { label: "Plex libraries" }),
   ]);
+  if (!isCurrent()) return { shows: [] };
 
   const queue = queueRes.status === "fulfilled" ? queueRes.value : [];
   const playlists = playlistsRes.status === "fulfilled" ? playlistsRes.value : [];
@@ -297,12 +306,17 @@ export async function loadBrowseScreen() {
   }
 
   const movieLib = libs.find((l) => l.type === "movie");
-  const showLib = libs.find((l) => l.type === "show");
+  const showLibs = libs.filter((l) => l.type === "show");
 
-  const [moviesRes, showsRes] = await Promise.allSettled([
+  const [moviesRes, ...showLibraryResults] = await Promise.allSettled([
     movieLib ? requestJsonData(`${location.origin}/api/plex/library/${movieLib.id}?size=0`, {}, { label: "Plex movies" }) : Promise.resolve(null),
-    showLib ? requestJsonData(`${location.origin}/api/plex/library/${showLib.id}?size=0`, {}, { label: "Plex shows" }) : Promise.resolve(null),
+    ...showLibs.map((library) => requestJsonData(
+      `${location.origin}/api/plex/library/${library.id}?size=0`,
+      {},
+      { label: `Plex shows (${library.title})` },
+    )),
   ]);
+  if (!isCurrent()) return { shows: [] };
 
   if (moviesRes.status === "fulfilled" && moviesRes.value?.items?.length) {
     renderCardRow(moviesList, moviesRes.value.items, { type: "plex-movie" });
@@ -312,7 +326,17 @@ export async function loadBrowseScreen() {
     moviesSection.classList.add("hidden");
   }
 
-  const shows = showsRes.status === "fulfilled" ? showsRes.value?.items || [] : [];
+  const shows = [];
+  const seenShowKeys = new Set();
+  for (const result of showLibraryResults) {
+    if (result.status !== "fulfilled") continue;
+    for (const show of result.value?.items || []) {
+      const key = String(show.ratingKey);
+      if (seenShowKeys.has(key)) continue;
+      seenShowKeys.add(key);
+      shows.push(show);
+    }
+  }
   if (shows.length) {
     renderCardRow(showsList, shows, { type: "plex-show" });
     showsSection.classList.remove("hidden");
@@ -321,21 +345,41 @@ export async function loadBrowseScreen() {
     showsSection.classList.add("hidden");
   }
 
-  if (hasContent) {
-    browseScreen.classList.remove("hidden");
-    statusScreen.style.display = "none";
-  } else {
-    browseScreen.classList.add("hidden");
-    statusScreen.style.display = "";
-    showStatus("Waiting for content...");
+  if (revealBrowse) {
+    browseScreen.classList.remove("episodes-open");
+    browseScreen.scrollTop = 0;
+    if (hasContent) {
+      browseScreen.classList.remove("hidden");
+      statusScreen.style.display = "none";
+    } else {
+      browseScreen.classList.add("hidden");
+      statusScreen.style.display = "";
+      showStatus("Waiting for content...");
+    }
+
+    // Reset episodes view only when returning to the browse route. A stale
+    // browse request must never hide an already-open show.
+    episodesSection.classList.add("hidden");
   }
 
-  // Reset episodes view
-  episodesSection.classList.add("hidden");
   return { shows };
 }
 
 // --- Playlist rendering ----------------------------------------------
+
+function addPrimaryCardAction(element, {
+  label,
+  onActivate,
+  className = "browse-card-primary",
+} = {}) {
+  const button = document.createElement("button");
+  button.className = className;
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.addEventListener("click", onActivate);
+  element.appendChild(button);
+  return button;
+}
 
 export function renderPlaylists(playlists = []) {
   state.playlists = playlists;
@@ -364,7 +408,10 @@ export function renderPlaylists(playlists = []) {
       <div class="browse-card-title">${escHtml(playlist.name)}</div>
       ${meta ? `<div class="browse-card-meta">${meta}</div>` : ""}
     `;
-    el.addEventListener("click", () => enqueuePlaylist(playlist.id));
+    addPrimaryCardAction(el, {
+      label: `Play playlist ${playlist.name}`,
+      onActivate: () => enqueuePlaylist(playlist.id),
+    });
     playlistsList.appendChild(el);
   });
 }
@@ -407,7 +454,7 @@ export function renderQueue(queue = []) {
       <div class="browse-card-thumb">
         ${thumbHtml}
         <div class="queue-position">${index + 1}</div>
-        <button class="queue-remove" type="button" aria-label="Remove from queue">
+        <button class="queue-remove" type="button" aria-label="Remove ${escAttr(item.title)} from queue">
           <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
         </button>
       </div>
@@ -418,7 +465,10 @@ export function renderQueue(queue = []) {
       e.stopPropagation();
       removeQueueItem(item.id);
     });
-    el.addEventListener("click", () => playQueueItem(item.id));
+    addPrimaryCardAction(el, {
+      label: `Play ${item.title}`,
+      onActivate: () => playQueueItem(item.id),
+    });
     queueList.appendChild(el);
   });
 }
@@ -578,7 +628,7 @@ function renderCardRow(container, items, { type }) {
       const queueBtn = document.createElement("button");
       queueBtn.className = "browse-card-queue";
       queueBtn.type = "button";
-      queueBtn.setAttribute("aria-label", "Add to queue");
+      queueBtn.setAttribute("aria-label", `Add ${item.title} to queue`);
       queueBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M13 5h-2v6H5v2h6v6h2v-6h6v-2h-6V5z"/></svg>`;
       queueBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -591,6 +641,8 @@ function renderCardRow(container, items, { type }) {
       // Delete badge
       const delBtn = document.createElement("button");
       delBtn.className = "browse-card-delete";
+      delBtn.type = "button";
+      delBtn.setAttribute("aria-label", `Remove ${item.title} from history`);
       delBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>`;
       delBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -600,8 +652,10 @@ function renderCardRow(container, items, { type }) {
       el.appendChild(delBtn);
 
       // Undo overlay
-      const undoBtn = document.createElement("div");
+      const undoBtn = document.createElement("button");
       undoBtn.className = "browse-card-undo";
+      undoBtn.type = "button";
+      undoBtn.setAttribute("aria-label", `Undo removing ${item.title}`);
       undoBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="white" width="24" height="24"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>`;
       undoBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -611,22 +665,29 @@ function renderCardRow(container, items, { type }) {
       });
       el.querySelector(".browse-card-thumb").appendChild(undoBtn);
 
+      const primaryButton = addPrimaryCardAction(el, {
+        label: `Resume ${item.title}`,
+        onActivate: () => {
+          if (historySection.classList.contains("edit-mode")) return;
+          playItem(item);
+        },
+      });
+
       // Long-press for edit mode
       let pressTimer = null;
-      el.addEventListener("pointerdown", () => {
+      primaryButton.addEventListener("pointerdown", () => {
         pressTimer = setTimeout(() => enterHistoryEditMode(), 600);
       });
-      el.addEventListener("pointerup", () => clearTimeout(pressTimer));
-      el.addEventListener("pointerleave", () => clearTimeout(pressTimer));
-      el.addEventListener("pointercancel", () => clearTimeout(pressTimer));
-      el.addEventListener("click", () => {
-        if (historySection.classList.contains("edit-mode")) return;
-        playItem(item);
-      });
+      primaryButton.addEventListener("pointerup", () => clearTimeout(pressTimer));
+      primaryButton.addEventListener("pointerleave", () => clearTimeout(pressTimer));
+      primaryButton.addEventListener("pointercancel", () => clearTimeout(pressTimer));
     } else {
-      el.addEventListener("click", () => {
-        if (type === "plex-movie") playPlexItem(item.ratingKey);
-        else if (type === "plex-show") openEpisodes(item);
+      addPrimaryCardAction(el, {
+        label: `${type === "plex-show" ? "Open" : "Play"} ${item.title}`,
+        onActivate: () => {
+          if (type === "plex-movie") playPlexItem(item.ratingKey);
+          else if (type === "plex-show") openEpisodes(item);
+        },
       });
     }
     container.appendChild(el);
@@ -700,6 +761,10 @@ export async function openEpisodes(show, {
 } = {}) {
   if (updateRoute) navigate(`/show/${show.ratingKey}`);
   if (!isCurrent()) return;
+  browseScreen.classList.add("episodes-open");
+  browseScreen.classList.remove("hidden");
+  browseScreen.scrollTop = 0;
+  statusScreen.style.display = "none";
   epsShowTitle.textContent = show.title;
   episodesList.innerHTML = "";
   episodesSection.classList.remove("hidden");
@@ -763,7 +828,7 @@ export async function openEpisodes(show, {
         const queueBtn = document.createElement("button");
         queueBtn.className = "browse-card-queue";
         queueBtn.type = "button";
-        queueBtn.setAttribute("aria-label", "Add to queue");
+        queueBtn.setAttribute("aria-label", `Add ${ep.title} to queue`);
         queueBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" width="15" height="15"><path d="M13 5h-2v6H5v2h6v6h2v-6h6v-2h-6V5z"/></svg>`;
         queueBtn.addEventListener("click", (e) => {
           e.stopPropagation();
@@ -776,7 +841,11 @@ export async function openEpisodes(show, {
         });
         el.querySelector(".episode-card-thumb").appendChild(queueBtn);
 
-        el.addEventListener("click", () => playPlexItem(ep.ratingKey));
+        addPrimaryCardAction(el, {
+          label: `Play ${show.title}, episode ${ep.episode}, ${ep.title}`,
+          onActivate: () => playPlexItem(ep.ratingKey),
+          className: "episode-card-primary",
+        });
         grid.appendChild(el);
       }
 
@@ -789,6 +858,8 @@ export async function openEpisodes(show, {
 }
 
 export function showBrowseFromEpisodes() {
+  browseScreen.classList.remove("episodes-open");
+  browseScreen.scrollTop = 0;
   episodesSection.classList.add("hidden");
   queueSection.classList.toggle("hidden", state.queue.length === 0);
   playlistsSection.classList.toggle("hidden", state.playlists.length === 0);

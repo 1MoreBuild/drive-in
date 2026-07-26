@@ -3024,6 +3024,7 @@ async function playPlexNow({
   offset,
   recovery = false,
   autoplay = true,
+  reason = recovery ? "server-restart" : "play",
 } = {}) {
   if (!ratingKey) {
     const err = new Error("ratingKey required");
@@ -3206,6 +3207,7 @@ async function playPlexNow({
     startTime,
     recovery: recovery === true,
     autoplay: autoplay !== false,
+    reason,
   });
 
   addToHistory({
@@ -3725,6 +3727,7 @@ async function playUrlNow({
     autoplay,
     streamProfile: resolved.streamProfile || null,
     recovery: reason === "recovery",
+    reason,
   });
 
   addToHistory({
@@ -3753,6 +3756,33 @@ app.post("/api/play", async (req, res) => {
   }
 });
 
+async function stopServerPlayback(reason = "stop") {
+  playbackCoordinator.cancel(reason);
+  updateState({
+    status: "idle",
+    url: null,
+    resolvedUrl: null,
+    streamProfile: null,
+    title: null,
+    isLive: false,
+  });
+  resetDashSegmentSession();
+  currentSubtitles = [];
+  currentSubsCacheKey = null;
+  const cleanupResults = await Promise.allSettled([
+    killPipeline(),
+    stopActivePlexTranscode(),
+  ]);
+  for (const result of cleanupResults) {
+    if (result.status === "rejected") {
+      log.warn({
+        reason,
+        err: result.reason?.message || String(result.reason),
+      }, "Playback cleanup failed");
+    }
+  }
+}
+
 // Playback control
 app.post("/api/control", async (req, res) => {
   const { action } = req.body;
@@ -3761,12 +3791,7 @@ app.post("/api/control", async (req, res) => {
   }
 
   if (action === "stop") {
-    playbackCoordinator.cancel();
-    await killPipeline();
-    await stopActivePlexTranscode();
-    resetDashSegmentSession();
-    currentSubtitles = [];
-    updateState({ status: "idle", url: null, resolvedUrl: null, streamProfile: null, title: null });
+    await stopServerPlayback("control-stop");
   }
 
   if (!playerWs || playerWs.readyState !== 1) {
@@ -3926,10 +3951,12 @@ wss.on("connection", (ws, req) => {
 
   let role = null;
   let connectionId = null;
+  let takeoverRequested = false;
   try {
     const requestUrl = new URL(req.url, "http://localhost");
     role = requestUrl.searchParams.get("role");
     connectionId = normalizePlayerConnectionId(requestUrl.searchParams.get("clientId"));
+    takeoverRequested = requestUrl.searchParams.get("takeover") === "1";
   } catch {}
   if (role !== "player" || !isAllowedWebSocketOrigin(req)) {
     log.warn({ role, origin: req.headers.origin || null }, "Rejected WebSocket connection");
@@ -3937,12 +3964,14 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
+  const canTakeOver = takeoverRequested && Boolean(connectionId);
   const previousPlayer = playerWs;
   const connectionDecision = playerConnectionDecision({
     currentOpen: previousPlayer?.readyState === 1,
     currentAlive: previousPlayer?.isAlive,
     currentId: previousPlayer?.connectionId,
     nextId: connectionId,
+    forceReplace: canTakeOver,
   });
   if (connectionDecision === "reject") {
     log.info({ connectionId }, "Rejected duplicate player WebSocket");
@@ -3954,9 +3983,11 @@ wss.on("connection", (ws, req) => {
   ws.connectionId = connectionId;
   playerWs = ws;
   if (previousPlayer && previousPlayer !== ws && previousPlayer.readyState === 1) {
-    previousPlayer.close(1012, "Player connection resumed");
+    previousPlayer.close(1012, canTakeOver
+      ? "Player connection taken over"
+      : "Player connection resumed");
   }
-  log.info({ connectionId, connectionDecision }, "Player WebSocket connected");
+  log.info({ connectionId, connectionDecision, takeoverRequested: canTakeOver }, "Player WebSocket connected");
 
   ws.send(JSON.stringify({
     type: "playerAccepted",
@@ -3988,9 +4019,13 @@ wss.on("connection", (ws, req) => {
       if (msg.type === "status" && msg.status) {
         const status = normalizePlayerStatus(msg.status);
         if (!status) return;
-        updateState(status === "idle"
-          ? { status: "idle", url: null, resolvedUrl: null, streamProfile: null, title: null, isLive: false }
-          : { status });
+        if (status === "idle") {
+          void stopServerPlayback("player-idle").catch((error) => {
+            log.warn({ err: error?.message || String(error) }, "Player idle cleanup failed");
+          });
+        } else {
+          updateState({ status });
+        }
       } else if (msg.type === "playerState") {
         const reportedState = normalizePlayerState(msg);
         playerState = {

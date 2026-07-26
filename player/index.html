@@ -23,7 +23,7 @@
     <div id="subtitle-overlay"></div>
 
     <!-- Center button: play/pause/buffering share one container -->
-    <button id="btn-center-play" type="button" aria-label="Play/Pause">
+    <button id="btn-center-play" type="button" aria-label="Play/Pause" aria-hidden="true" disabled>
       <svg id="center-play" viewBox="0 0 24 24" fill="white" width="36" height="36">
         <path d="M8 5v14l11-7z"/>
       </svg>
@@ -39,7 +39,7 @@
     <div id="seek-indicator-right"></div>
 
     <!-- Playback controls (auto-hide) -->
-    <div id="controls">
+    <div id="controls" aria-hidden="true" inert>
       <div id="controls-top">
         <button id="btn-back" type="button" aria-label="Back">
           <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28">
@@ -104,6 +104,10 @@
       <div id="status-screen">
         <h1>DRIVE-IN</h1>
         <p id="status-text">Connecting...</p>
+        <div id="status-actions" class="hidden">
+          <button id="btn-take-over" type="button">Take over here</button>
+          <button id="btn-retry-connection" type="button">Try again</button>
+        </div>
       </div>
       <header id="home-toolbar">
         <div class="home-identity" aria-label="Drive-In">

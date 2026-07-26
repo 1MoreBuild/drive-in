@@ -6,8 +6,8 @@
   --surface-base: oklch(8% 0.008 250);
   --surface-raised: oklch(14% 0.006 250);
   --text-primary: oklch(93% 0.008 250);
-  --text-secondary: oklch(52% 0.008 250);
-  --text-tertiary: oklch(35% 0.006 250);
+  --text-secondary: oklch(66% 0.008 250);
+  --text-tertiary: oklch(50% 0.006 250);
   --accent: oklch(93% 0.008 250);
   --track: oklch(22% 0.005 250);
 
@@ -50,6 +50,11 @@ html, body {
 
 #app.controls-visible {
   cursor: default;
+}
+
+:where(button, [role="button"], [role="slider"]):focus-visible {
+  outline: 2px solid oklch(93% 0.008 250);
+  outline-offset: 3px;
 }
 
 #connection-status {
@@ -155,6 +160,7 @@ html, body {
 }
 
 #app.controls-visible #btn-center-play,
+#btn-center-play:focus-visible,
 #btn-center-play.buffering {
   opacity: 1;
   pointer-events: auto;
@@ -260,6 +266,11 @@ html, body {
   pointer-events: auto;
 }
 
+#controls:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 /* --- Top bar --------------------------------------------------------- */
 
 #controls-top {
@@ -286,8 +297,8 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-width: 40px;
-  min-height: 40px;
+  min-width: 48px;
+  min-height: 48px;
   transition: background-color 150ms;
   -webkit-tap-highlight-color: transparent;
 }
@@ -396,8 +407,8 @@ html, body {
   align-items: center;
   justify-content: center;
   transition: background-color 150ms;
-  min-width: 40px;
-  min-height: 40px;
+  min-width: 48px;
+  min-height: 48px;
 }
 
 #controls-row button:hover {
@@ -673,6 +684,39 @@ html, body {
   letter-spacing: 0.02em;
 }
 
+#status-actions {
+  margin-top: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+#status-actions button {
+  appearance: none;
+  min-width: 148px;
+  min-height: 52px;
+  padding: 0 20px;
+  border: 1px solid oklch(100% 0 0 / 0.14);
+  border-radius: 999px;
+  background: oklch(100% 0 0 / 0.07);
+  color: var(--text-primary);
+  font: 600 0.9375rem/1 system-ui, sans-serif;
+  cursor: pointer;
+  transition: transform 100ms var(--ease-out-quart), background-color 120ms;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#status-actions #btn-take-over {
+  background: var(--text-primary);
+  color: var(--surface-base);
+  border-color: transparent;
+}
+
+#status-actions button:active {
+  transform: scale(0.97);
+}
+
 /* --- Home toolbar ---------------------------------------------------- */
 
 #home-toolbar {
@@ -737,6 +781,19 @@ html, body {
   display: none;
 }
 
+#browse-screen.episodes-open {
+  padding-top: 88px;
+}
+
+#browse-screen.episodes-open > .browse-section:not(#episodes-section) {
+  display: none;
+}
+
+#overlay:has(#browse-screen.episodes-open) #home-toolbar {
+  min-height: 88px;
+  padding-block: 16px;
+}
+
 .browse-section {
   margin-bottom: 16px;
 }
@@ -763,6 +820,15 @@ html, body {
   #browse-screen {
     padding-top: 88px;
   }
+
+  #browse-screen.episodes-open {
+    padding-top: 80px;
+  }
+
+  #overlay:has(#browse-screen.episodes-open) #home-toolbar {
+    min-height: 80px;
+    padding: 16px 20px;
+  }
 }
 
 .browse-section.hidden {
@@ -770,9 +836,9 @@ html, body {
 }
 
 .browse-header {
-  font-size: 0.9375rem;
-  font-weight: 500;
-  letter-spacing: 0.06em;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--text-secondary);
   margin-bottom: 10px;
@@ -787,7 +853,7 @@ html, body {
   top: 0;
   z-index: 3;
   background: var(--surface-base);
-  padding: 12px 32px 6px;
+  padding: 8px 32px 6px;
   margin-bottom: 0;
 }
 
@@ -894,8 +960,30 @@ html, body {
   scroll-snap-align: start;
 }
 
-.browse-card:active {
+.browse-card:has(.browse-card-primary:active) {
   opacity: 0.7;
+}
+
+.browse-card-primary,
+.episode-card-primary {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  appearance: none;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.browse-card-primary:focus-visible,
+.episode-card-primary:focus-visible {
+  outline: 3px solid var(--text-primary);
+  outline-offset: 4px;
 }
 
 .browse-card-thumb {
@@ -929,16 +1017,18 @@ html, body {
 
 .browse-card-title {
   font-size: 0.875rem;
-  font-weight: 400;
+  font-weight: 500;
   color: var(--text-primary);
-  line-height: 1.35;
-  white-space: nowrap;
+  line-height: 1.4;
+  min-height: 2.8em;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .browse-card-meta {
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
   color: var(--text-tertiary);
   margin-top: 3px;
   letter-spacing: 0.01em;
@@ -951,8 +1041,8 @@ html, body {
   position: absolute;
   top: -7px;
   left: -7px;
-  width: 22px;
-  height: 22px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   background: oklch(0% 0 0 / 0.6);
   color: #fff;
@@ -985,6 +1075,10 @@ html, body {
   display: none;
   position: absolute;
   inset: 0;
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
   align-items: center;
   justify-content: center;
   z-index: 6;
@@ -1018,6 +1112,7 @@ html, body {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  z-index: 4;
   opacity: 0;
   transition: opacity 150ms, background-color 150ms;
   -webkit-tap-highlight-color: transparent;
@@ -1073,8 +1168,8 @@ html, body {
   position: absolute;
   top: 6px;
   right: 6px;
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   border: none;
   background: oklch(0% 0 0 / 0.64);
@@ -1083,6 +1178,7 @@ html, body {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  z-index: 4;
   opacity: 0;
   transition: opacity 150ms;
   -webkit-tap-highlight-color: transparent;
@@ -1145,6 +1241,25 @@ html, body {
     bottom: 8px;
     width: 48px;
     height: 48px;
+  }
+
+  .browse-card-delete,
+  .queue-remove {
+    width: 48px;
+    height: 48px;
+  }
+
+  .browse-card-delete {
+    top: -8px;
+    right: auto;
+    bottom: auto;
+    left: -8px;
+  }
+
+  .queue-remove {
+    top: 8px;
+    right: 8px;
+    bottom: auto;
   }
 
   .browse-card-queue svg {
@@ -1220,12 +1335,13 @@ html, body {
 }
 
 .episode-card {
+  position: relative;
   cursor: pointer;
   transition: opacity 150ms;
   -webkit-tap-highlight-color: transparent;
 }
 
-.episode-card:active {
+.episode-card:has(.episode-card-primary:active) {
   opacity: 0.7;
 }
 
@@ -1261,16 +1377,18 @@ html, body {
 
 .episode-card-title {
   font-size: 0.875rem;
-  font-weight: 400;
+  font-weight: 500;
   color: var(--text-primary);
-  line-height: 1.35;
-  white-space: nowrap;
+  line-height: 1.4;
+  min-height: 2.8em;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .episode-card-meta {
-  font-size: 0.75rem;
+  font-size: 0.8125rem;
   color: var(--text-tertiary);
   margin-top: 3px;
 }
@@ -1296,5 +1414,110 @@ html, body {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 520px) {
+  #status-actions {
+    width: min(280px, calc(100vw - 40px));
+    margin-inline: auto;
+    flex-direction: column;
+  }
+
+  #status-actions button {
+    width: 100%;
+  }
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+  #controls-top {
+    padding: max(10px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) 40px max(20px, env(safe-area-inset-left));
+  }
+
+  #media-title {
+    max-width: 52%;
+    font-size: 0.875rem;
+  }
+
+  #controls-bottom {
+    position: relative;
+    min-height: 72px;
+    padding: 0;
+    background: linear-gradient(
+      to top,
+      oklch(0% 0 0 / 0.82) 0%,
+      oklch(0% 0 0 / 0.5) 70%,
+      transparent 100%
+    );
+  }
+
+  #progress-wrap {
+    position: absolute;
+    right: max(20px, env(safe-area-inset-right));
+    bottom: 0;
+    left: max(20px, env(safe-area-inset-left));
+    height: 22px;
+  }
+
+  #controls-row {
+    position: absolute;
+    right: max(16px, env(safe-area-inset-right));
+    bottom: 18px;
+    left: max(20px, env(safe-area-inset-left));
+    margin: 0;
+  }
+
+  #subtitle-overlay {
+    top: auto;
+    bottom: 92px;
+    left: 8%;
+    right: 8%;
+  }
+
+  #subtitle-overlay span {
+    font-size: clamp(1rem, 4vh, 1.25rem);
+    line-height: 1.55;
+  }
+
+  #playback-notice {
+    inset: auto 20px 86px;
+    max-width: min(620px, calc(100% - 40px));
+  }
+
+  #subs-panel,
+  #audio-panel {
+    bottom: 76px;
+    max-height: calc(100vh - 92px);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  #connection-status,
+  #playback-notice,
+  #subs-panel,
+  #audio-panel,
+  #controls-top,
+  #controls-bottom {
+    backdrop-filter: none;
+  }
+
+  #connection-status,
+  #playback-notice,
+  #subs-panel,
+  #audio-panel {
+    background: var(--surface-raised);
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --text-primary: oklch(98% 0.004 250);
+    --text-secondary: oklch(82% 0.006 250);
+    --text-tertiary: oklch(68% 0.006 250);
+    --track: oklch(40% 0.005 250);
+  }
+
+  :where(button, [role="button"], [role="slider"]):focus-visible {
+    outline-width: 3px;
   }
 }

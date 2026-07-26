@@ -11,27 +11,19 @@ export function formatMbps(kbps) {
   return `${mbps < 1 ? mbps.toFixed(2) : mbps.toFixed(1)} Mbps`;
 }
 
-export function streamQualityLabel(profile = {}) {
-  const height = positiveNumber(profile.height || profile.targetHeight);
-  const fps = positiveNumber(profile.fps || profile.preferredFps);
-  if (!height) return "selected quality";
-  return `${Math.round(height)}p${fps >= 50 ? Math.round(fps) : ""}`;
-}
-
 export function assessBandwidthHealth({ bufferingMs = 0, streamProfile = null, stats = null } = {}) {
   if (bufferingMs < BANDWIDTH_WARNING_AFTER_MS || !streamProfile || !stats) return null;
   const mediaKbps = positiveNumber(streamProfile.videoKbps) + positiveNumber(streamProfile.audioKbps);
   const requiredKbps = mediaKbps * REQUIRED_HEADROOM;
   const availableKbps = positiveNumber(stats.bandwidth) / 1000;
   const sampleCount = positiveNumber(stats.hlsThroughputSampleCount);
-  const label = streamQualityLabel(streamProfile);
 
   if (requiredKbps && availableKbps && sampleCount >= 2 && availableKbps < requiredKbps) {
     return {
       code: "bandwidth_insufficient",
       availableKbps: Math.round(availableKbps),
       requiredKbps: Math.round(requiredKbps),
-      message: `Network too slow for fixed ${label} — ${formatMbps(availableKbps)} available, ${formatMbps(requiredKbps)} needed.`,
+      message: `Connection slowed. Building buffer… ${formatMbps(availableKbps)} available · about ${formatMbps(requiredKbps)} needed.`,
     };
   }
 
@@ -44,7 +36,7 @@ export function assessBandwidthHealth({ bufferingMs = 0, streamProfile = null, s
       code: "network_unstable",
       availableKbps: availableKbps ? Math.round(availableKbps) : null,
       requiredKbps: requiredKbps ? Math.round(requiredKbps) : null,
-      message: `Connection is unstable. Buffering fixed ${label} instead of lowering quality.`,
+      message: "Connection interrupted. Rebuilding buffer…",
     };
   }
   return null;

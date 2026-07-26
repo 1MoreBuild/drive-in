@@ -11,8 +11,12 @@ const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
 const connectionStatus = document.getElementById("connection-status");
 const connectionStatusText = document.getElementById("connection-status-text");
+const statusActions = document.getElementById("status-actions");
+const btnTakeOver = document.getElementById("btn-take-over");
+const btnRetryConnection = document.getElementById("btn-retry-connection");
 let reconnectTimer = null;
 let lastWsActivityAt = 0;
+let takeoverNextConnection = false;
 const WS_RECONNECT_DELAY_MS = 3_000;
 const WS_BUSY_RECONNECT_DELAY_MS = 15_000;
 const WS_STALE_AFTER_MS = 70_000;
@@ -69,14 +73,24 @@ initRouter((route, navigation) => {
         showStatus(`Failed to load show: ${error.message}`);
       }
     });
+    return;
+  }
+  if (route.view === "player" && navigation?.source === "popstate") {
+    void enterPlayerRoute(route, generation).catch((error) => {
+      console.error("[router] Failed to enter player route:", error);
+      if (generation === routeTransitionGeneration) {
+        showStatus(`Failed to resume playback: ${error.message}`);
+      }
+    });
   }
   // Push navigation to player/show is completed by the action that initiated it.
 });
 
 async function enterBrowseRoute(generation) {
   await leavePlayback();
-  if (generation !== routeTransitionGeneration || parseRoute().view !== "browse") return;
-  await loadBrowseScreen();
+  const isCurrent = () => generation === routeTransitionGeneration && parseRoute().view === "browse";
+  if (!isCurrent()) return;
+  await loadBrowseScreen({ isCurrent });
 }
 
 async function enterShowRoute(route, generation) {
@@ -88,7 +102,7 @@ async function enterShowRoute(route, generation) {
       && String(currentRoute.ratingKey) === String(route.ratingKey);
   };
   if (!isCurrent()) return;
-  const browseData = await loadBrowseScreen();
+  const browseData = await loadBrowseScreen({ isCurrent, revealBrowse: false });
   if (!isCurrent()) return;
   const show = browseData.shows.find((item) => String(item.ratingKey) === String(route.ratingKey));
   if (!show) {
@@ -97,6 +111,19 @@ async function enterShowRoute(route, generation) {
     return;
   }
   await openEpisodes(show, { updateRoute: false, isCurrent });
+}
+
+async function enterPlayerRoute(route, generation) {
+  await leavePlayback();
+  const isCurrent = () => {
+    const currentRoute = parseRoute();
+    return generation === routeTransitionGeneration
+      && currentRoute.view === "player"
+      && currentRoute.url === route.url
+      && currentRoute.plex === route.plex;
+  };
+  if (!isCurrent()) return;
+  await restoreConnectedRoute({ isCurrent });
 }
 
 // --- Audio unlock via user gesture -----------------------------------
@@ -147,6 +174,16 @@ function hideConnectionStatus() {
   connectionStatus.classList.add("hidden");
 }
 
+function hideConnectionActions() {
+  statusActions.classList.add("hidden");
+}
+
+function showBusyConnectionState() {
+  showConnectionStatus("Playing in another window");
+  showStatus("Drive-In is open in another window");
+  statusActions.classList.remove("hidden");
+}
+
 function scheduleReconnect(delay = WS_RECONNECT_DELAY_MS) {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
@@ -155,20 +192,55 @@ function scheduleReconnect(delay = WS_RECONNECT_DELAY_MS) {
   }, delay);
 }
 
+function reconnectNow({ takeover = false } = {}) {
+  takeoverNextConnection = takeover;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const ws = state.ws;
+  state.ws = null;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    ws.close(1000, takeover ? "Taking over player" : "Retrying connection");
+  }
+  hideConnectionActions();
+  showConnectionStatus(takeover ? "Taking over…" : "Connecting…");
+  showStatus(takeover ? "Taking over playback…" : "Connecting…");
+  connect();
+}
+
 function syncPlayerConnection(ws) {
   const rawStatus = state.player?.getStatus?.();
   const status = state.player
     ? (["stopped", "ended", "error"].includes(rawStatus) ? "idle" : rawStatus || (state.isPlaying ? "playing" : "paused"))
     : "idle";
-  ws.send(JSON.stringify({ type: "status", status }));
+  // A hard refresh on /play has no local player yet, but the server session may
+  // still be reusable. The route restore below replaces or resumes it.
+  if (state.player || parseRoute().view !== "player") {
+    ws.send(JSON.stringify({ type: "status", status }));
+  }
   if (state.player) reportProgress();
 }
 
 async function restoreConnectedRoute({
   forcePlaybackRestore = false,
   playbackSnapshot = null,
+  isCurrent = () => true,
 } = {}) {
+  if (!isCurrent()) return;
   const route = parseRoute();
+  const routeIsCurrent = () => {
+    if (!isCurrent()) return false;
+    const currentRoute = parseRoute();
+    if (currentRoute.view !== route.view) return false;
+    if (route.view === "show") {
+      return String(currentRoute.ratingKey) === String(route.ratingKey);
+    }
+    if (route.view === "player") {
+      return currentRoute.url === route.url && currentRoute.plex === route.plex;
+    }
+    return true;
+  };
   if (!forcePlaybackRestore && (state.player || state.isPlaying)) return;
 
   // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
@@ -190,6 +262,7 @@ async function restoreConnectedRoute({
           ...(resumeTime > 0 ? { offset: resumeTime * 1000 } : {}),
           recovery: forcePlaybackRestore,
           autoplay,
+          reason: forcePlaybackRestore ? "server-restart" : "resume-route",
         })
       : {
           url: route.url,
@@ -208,19 +281,26 @@ async function restoreConnectedRoute({
         const result = response.data || {};
         throw new Error(result.error || `Playback failed with ${response.status}`);
       });
-    playbackRequest.catch((error) => {
+    try {
+      await playbackRequest;
+    } catch (error) {
+      if (!isCurrent()) return;
       console.error("[playback] Resume failed:", error);
       showStatus(`Playback error: ${error.message}`);
       if (forcePlaybackRestore) return;
       navigate("/", true);
-    });
+    }
     return;
   }
 
-  const browseData = await loadBrowseScreen();
+  const browseData = await loadBrowseScreen({
+    isCurrent: routeIsCurrent,
+    revealBrowse: route.view !== "show",
+  });
+  if (!routeIsCurrent()) return;
   if (route.view === "show") {
     const show = browseData.shows.find((item) => String(item.ratingKey) === String(route.ratingKey));
-    if (show) await openEpisodes(show, { updateRoute: false });
+    if (show) await openEpisodes(show, { updateRoute: false, isCurrent: routeIsCurrent });
     else {
       navigate("/", true);
       showStatus("Show not found");
@@ -238,7 +318,13 @@ function connect() {
   ) return;
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${proto}//${location.host}/ws?role=player&clientId=${encodeURIComponent(PLAYER_CONNECTION_ID)}`;
+  const params = new URLSearchParams({
+    role: "player",
+    clientId: PLAYER_CONNECTION_ID,
+  });
+  if (takeoverNextConnection) params.set("takeover", "1");
+  takeoverNextConnection = false;
+  const wsUrl = `${proto}//${location.host}/ws?${params}`;
   const ws = new WebSocket(wsUrl);
   let accepted = false;
 
@@ -264,6 +350,7 @@ function connect() {
         accepted = true;
         console.log("[ws] Connected");
         hideConnectionStatus();
+        hideConnectionActions();
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
           reconnectTimer = null;
@@ -279,7 +366,7 @@ function connect() {
         return;
       }
       if (msg.type === "playerRejected") {
-        showConnectionStatus("Another player is active");
+        showBusyConnectionState();
         return;
       }
       if (!accepted) return;
@@ -294,6 +381,19 @@ function connect() {
 
       switch (msg.type) {
         case "play":
+          if (msg.reason === "resume-route") {
+            const route = parseRoute();
+            const matchesRoute = route.view === "player"
+              && (msg.plex?.ratingKey
+                ? String(route.plex) === String(msg.plex.ratingKey)
+                : route.url === msg.sourceUrl);
+            if (!matchesRoute) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "status", status: "idle" }));
+              }
+              break;
+            }
+          }
           state.externalSubs = [];
           state.activeExternalSubs.clear();
           btnAudio.classList.add("hidden");
@@ -378,9 +478,13 @@ function connect() {
     console.log(busy
       ? "[ws] Another player is active; retrying later..."
       : "[ws] Disconnected, reconnecting in 3s...");
-    showConnectionStatus(busy ? "Another player is active" : "Reconnecting…");
+    if (busy) showBusyConnectionState();
+    else {
+      hideConnectionActions();
+      showConnectionStatus("Reconnecting…");
+    }
     if (!state.player && !state.isPlaying) {
-      showStatus(busy ? "Another player is active" : "Reconnecting…");
+      if (!busy) showStatus("Reconnecting…");
     }
     scheduleReconnect(busy ? WS_BUSY_RECONNECT_DELAY_MS : WS_RECONNECT_DELAY_MS);
   };
@@ -389,6 +493,9 @@ function connect() {
     ws.close();
   };
 }
+
+btnTakeOver.addEventListener("click", () => reconnectNow({ takeover: true }));
+btnRetryConnection.addEventListener("click", () => reconnectNow());
 
 connect();
 

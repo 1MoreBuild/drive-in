@@ -92,4 +92,11 @@ test("a healthy player keeps its lease while the same tab can reconnect", () => 
     currentId: "tesla-player_123",
     nextId: "other-player_123",
   }), "replace");
+  assert.equal(playerConnectionDecision({
+    currentOpen: true,
+    currentAlive: true,
+    currentId: "tesla-player_123",
+    nextId: "other-player_123",
+    forceReplace: true,
+  }), "replace");
 });
