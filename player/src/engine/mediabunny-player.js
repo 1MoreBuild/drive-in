@@ -728,6 +728,13 @@ export class MediabunnyPlayer {
     };
   }
 
+  getSeekableRange() {
+    return {
+      start: this.firstTimestamp,
+      end: this.duration > 0 ? this.duration : null,
+    };
+  }
+
   getStats() {
     const currentTimeMs = Math.round(this.clock.currentTime * 1000);
     const audioOutputLatencyMs = Math.round(this.getAudioOutputLatencySeconds() * 1000);

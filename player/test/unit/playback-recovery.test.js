@@ -6,6 +6,7 @@ import {
   hasSeekPlaybackProgress,
   playbackRecoveryDelayMs,
   resolvePlaybackPosition,
+  shouldRestartPlexSessionForSeek,
 } from "../../src/playback-recovery.js";
 
 function firstRecoveryAfter(outageMs) {
@@ -67,6 +68,64 @@ test("recovery preserves a paused user intent", () => {
     meta: { sourceUrl: "https://www.youtube.com/watch?v=source-id" },
   }, 12, { autoplay: false });
   assert.equal(request.body.autoplay, false);
+});
+
+test("user-directed Plex seek creates a normal latest-wins playback request", () => {
+  const request = buildFreshPlaybackSessionRequest({
+    meta: {
+      plex: {
+        ratingKey: "99",
+        activeSubtitleID: "12",
+        activeAudioID: "7",
+      },
+    },
+  }, 420, {
+    autoplay: false,
+    recovery: false,
+    reason: "seek",
+  });
+  assert.deepEqual(request, {
+    endpoint: "/api/plex/play",
+    body: {
+      ratingKey: "99",
+      subtitleStreamID: "12",
+      audioStreamID: "7",
+      offset: 420_000,
+      recovery: false,
+      autoplay: false,
+      reason: "seek",
+    },
+  });
+});
+
+test("Plex seek restarts the session before the resumed HLS timeline", () => {
+  assert.equal(shouldRestartPlexSessionForSeek({
+    plexRatingKey: "99",
+    targetTime: 7 * 60,
+    seekableStartTime: 11_622,
+  }), true);
+});
+
+test("Plex seek stays local inside the current HLS timeline", () => {
+  assert.equal(shouldRestartPlexSessionForSeek({
+    plexRatingKey: "99",
+    targetTime: 11_700,
+    seekableStartTime: 11_622,
+  }), false);
+  assert.equal(shouldRestartPlexSessionForSeek({
+    plexRatingKey: null,
+    targetTime: 420,
+    seekableStartTime: 11_622,
+  }), false);
+});
+
+test("a pending Plex session restart keeps later seeks latest-wins", () => {
+  assert.equal(shouldRestartPlexSessionForSeek({
+    plexRatingKey: "99",
+    targetTime: 11_700,
+    seekableStartTime: 11_622,
+    sessionRestartPending: true,
+  }), true);
 });
 
 test("recovery is confirmed only by advancing presentation time", () => {

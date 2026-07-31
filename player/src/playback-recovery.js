@@ -40,7 +40,26 @@ export function resolvePlaybackPosition({ engineTime, fallbackTime, duration }) 
   return Math.max(0, Math.min(maximum, selected));
 }
 
-export function buildFreshPlaybackSessionRequest(request, startTime, { autoplay = true } = {}) {
+export function shouldRestartPlexSessionForSeek({
+  plexRatingKey,
+  targetTime,
+  seekableStartTime,
+  sessionRestartPending = false,
+}) {
+  if (!plexRatingKey) return false;
+  if (sessionRestartPending) return true;
+  const target = Number(targetTime);
+  const seekableStart = Number(seekableStartTime);
+  return Number.isFinite(target)
+    && Number.isFinite(seekableStart)
+    && target < seekableStart;
+}
+
+export function buildFreshPlaybackSessionRequest(request, startTime, {
+  autoplay = true,
+  recovery = true,
+  reason,
+} = {}) {
   const position = Math.max(0, Number(startTime) || 0);
   const plex = request?.meta?.plex;
   if (plex?.ratingKey) {
@@ -51,8 +70,9 @@ export function buildFreshPlaybackSessionRequest(request, startTime, { autoplay 
         subtitleStreamID: plex.activeSubtitleID || null,
         audioStreamID: plex.activeAudioID || null,
         offset: position * 1000,
-        recovery: true,
+        recovery,
         autoplay,
+        ...(reason ? { reason } : {}),
       },
     };
   }
@@ -63,7 +83,7 @@ export function buildFreshPlaybackSessionRequest(request, startTime, { autoplay 
         url: request.meta.sourceUrl,
         startTime: position,
         autoplay,
-        reason: "recovery",
+        reason: reason || "recovery",
       },
     };
   }

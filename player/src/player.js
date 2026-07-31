@@ -17,6 +17,7 @@ import {
   hasSeekPlaybackProgress,
   playbackRecoveryDelayMs,
   resolvePlaybackPosition,
+  shouldRestartPlexSessionForSeek,
 } from "./playback-recovery.js";
 
 // --- Callbacks (set by main.js to avoid circular deps) ---------------
@@ -97,6 +98,10 @@ const seekWatchdogState = {
   targetTime: 0,
   startedAt: 0,
   progressSnapshot: null,
+};
+const plexSeekSessionState = {
+  requestId: 0,
+  pending: false,
 };
 const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
 const pageMemoryMonitor = new PageMemoryMonitor({ intervalMs: PAGE_MEMORY_SAMPLE_INTERVAL_MS });
@@ -356,9 +361,15 @@ function armPlaybackRecoveryConfirmation(attempt, startTime) {
   confirmPlaybackRecovery(state.player, getReportedCurrentTime());
 }
 
-async function requestFreshPlaybackSession(request, startTime) {
+async function requestFreshPlaybackSession(request, startTime, {
+  label = "Playback recovery",
+  recovery = true,
+  reason,
+} = {}) {
   const freshRequest = buildFreshPlaybackSessionRequest(request, startTime, {
     autoplay: state.playbackIntent === "playing",
+    recovery,
+    reason,
   });
   if (!freshRequest) return false;
 
@@ -367,14 +378,14 @@ async function requestFreshPlaybackSession(request, startTime) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(freshRequest.body),
   }, {
-    label: "Playback recovery",
+    label,
     // yt-dlp plus DASH probing can legitimately take tens of seconds. Keep the
     // request bounded below Cloudflare's 100-second request ceiling.
     timeoutMs: 90_000,
   });
   const result = response.data || {};
   if (!response.ok) {
-    throw new Error(`Network recovery could not create a fresh stream: ${result.error || response.status}`);
+    throw new Error(`${label} could not create a fresh stream: ${result.error || response.status}`);
   }
   return true;
 }
@@ -1695,6 +1706,75 @@ function stopProgressReporting() {
 
 // --- Seek ------------------------------------------------------------
 
+function invalidatePlexSeekSession() {
+  plexSeekSessionState.requestId += 1;
+  plexSeekSessionState.pending = false;
+}
+
+function restartPlexSessionForSeek(player, targetTime, expectedToPlay, { fromTime }) {
+  if (!state.plexInfo?.ratingKey) return false;
+
+  const requestId = ++plexSeekSessionState.requestId;
+  plexSeekSessionState.pending = true;
+  clearSeekWatchdog();
+  void player.pause().catch(() => {});
+  state.isPlaying = false;
+  showBuffering();
+  showStatus("Seeking...");
+  postPlayerRuntimeLog("seek_session_restart_requested", {
+    requestId,
+    fromTime,
+    targetTime,
+    seekableRange: player.getSeekableRange?.() || null,
+    plexRatingKey: state.plexInfo.ratingKey,
+  });
+
+  const request = {
+    meta: {
+      plex: { ...state.plexInfo },
+    },
+  };
+  void requestFreshPlaybackSession(request, targetTime, {
+    label: "Plex seek",
+    recovery: false,
+    reason: "seek",
+  }).then((created) => {
+    if (
+      requestId !== plexSeekSessionState.requestId
+      || state.player !== player
+      || created === false
+    ) {
+      return;
+    }
+    postPlayerRuntimeLog("seek_session_restart_created", {
+      requestId,
+      fromTime,
+      targetTime,
+    });
+  }).catch((error) => {
+    if (requestId !== plexSeekSessionState.requestId || state.player !== player) return;
+    plexSeekSessionState.pending = false;
+    const errorMessage = error?.message || String(error);
+    const rollbackTime = getReportedCurrentTime(player);
+    state.currentTime = rollbackTime;
+    updateTimeDisplay();
+    updateProgress(state.duration > 0 ? rollbackTime / state.duration : 0);
+    hideBuffering();
+    if (expectedToPlay && state.playbackIntent === "playing") {
+      void player.resume().catch(() => {});
+    }
+    postPlayerRuntimeLog("seek_session_restart_failed", {
+      requestId,
+      fromTime,
+      targetTime,
+      error: errorMessage,
+    });
+    overlay.classList.add("hidden");
+    showPlaybackNotice(`Seek failed: ${errorMessage}`);
+  });
+  return true;
+}
+
 export function seekToTime(timeSec) {
   if (!state.player) return;
   if (state.isLive) {
@@ -1752,6 +1832,16 @@ export function seekToTime(timeSec) {
   state.currentTime = target;
   updateTimeDisplay();
   updateProgress(state.currentTime / state.duration);
+  const seekableRange = player.getSeekableRange?.() || null;
+  if (shouldRestartPlexSessionForSeek({
+    plexRatingKey: state.plexInfo?.ratingKey,
+    targetTime: target,
+    seekableStartTime: seekableRange?.start,
+    sessionRestartPending: plexSeekSessionState.pending,
+  })) {
+    restartPlexSessionForSeek(player, target, wasPlaying, { fromTime });
+    return;
+  }
   runPlayerSeek(player, target, wasPlaying, { fromTime, label: "vod" });
   reportProgress();
 }
@@ -1976,6 +2066,7 @@ export function showStatus(text) {
 }
 
 export async function play(url, title, meta = {}) {
+  invalidatePlexSeekSession();
   const playbackSessionId = playbackGeneration.begin();
   clearSeekWatchdog();
   const isCurrentPlayback = () => playbackGeneration.isCurrent(playbackSessionId);

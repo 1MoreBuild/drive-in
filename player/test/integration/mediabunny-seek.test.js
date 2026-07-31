@@ -115,3 +115,14 @@ test("live-edge seek preserves the encoded HLS buffer", async () => {
     { resetHlsBuffer: true, hlsSeekTarget: 2 },
   ]);
 });
+
+test("seekable range exposes the resumed media timeline start", () => {
+  const player = Object.create(MediabunnyPlayer.prototype);
+  player.firstTimestamp = 11_622;
+  player.duration = 14_299;
+
+  assert.deepEqual(player.getSeekableRange(), {
+    start: 11_622,
+    end: 14_299,
+  });
+});
