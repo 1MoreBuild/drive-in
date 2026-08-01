@@ -1,6 +1,6 @@
 # Build the browser bundle on glibc. Rolldown's Alpine ARM64 binding can hang
 # during Vite builds, and the player does not need server install scripts.
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS player-build
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS player-build
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ RUN npm run build -w player
 FROM denoland/deno:alpine-2.9.3@sha256:9d590d72116913ec9d73acb25112040fbffa657e33565075e7e71904b09e110e AS deno-runtime
 
 # Compile production-only native dependencies against the final glibc runtime.
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS production-deps
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS production-deps
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
@@ -28,7 +28,7 @@ COPY server/package.json server/
 RUN npm ci --omit=dev --workspace server
 
 # Production stage — only runtime deps + pinned external tools
-FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370
 
 ARG YT_DLP_VERSION=2026.06.09
 ARG YT_DLP_SHA256=e5d57466682cfa9d61e9cf7c8a4f09b00f4a62af37d3bbdc4bcffdf63615feac
