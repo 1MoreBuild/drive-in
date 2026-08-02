@@ -398,7 +398,8 @@ function connect() {
           state.activeExternalSubs.clear();
           btnAudio.classList.add("hidden");
           audioPanel.classList.add("hidden");
-          showStatus(`Loading: ${msg.title || "..."}`);
+          const optimisticSeek = msg.reason === "seek";
+          if (!optimisticSeek) showStatus(`Loading: ${msg.title || "..."}`);
           void play(msg.url, msg.title, {
             isLive: msg.isLive,
             liveDvr: msg.liveDvr || null,
@@ -410,6 +411,7 @@ function connect() {
             streamProfile: msg.streamProfile || null,
             autoplay: msg.autoplay !== false,
             __recovery: msg.recovery === true,
+            __optimisticSeek: optimisticSeek,
           }).catch((error) => console.error("[playback] Play transition failed:", error));
           break;
         case "pause":

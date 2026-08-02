@@ -6,6 +6,7 @@ import {
   hasSeekPlaybackProgress,
   playbackRecoveryDelayMs,
   resolvePlaybackPosition,
+  shouldHoldOptimisticSeekTarget,
   shouldRestartPlexSessionForSeek,
 } from "../../src/playback-recovery.js";
 
@@ -126,6 +127,21 @@ test("a pending Plex session restart keeps later seeks latest-wins", () => {
     seekableStartTime: 11_622,
     sessionRestartPending: true,
   }), true);
+});
+
+test("optimistic seek holds the target only for the current transition player", () => {
+  assert.equal(shouldHoldOptimisticSeekTarget({
+    transitionPending: true,
+    playerIsCurrent: true,
+  }), true);
+  assert.equal(shouldHoldOptimisticSeekTarget({
+    transitionPending: false,
+    playerIsCurrent: true,
+  }), false);
+  assert.equal(shouldHoldOptimisticSeekTarget({
+    transitionPending: true,
+    playerIsCurrent: false,
+  }), false);
 });
 
 test("recovery is confirmed only by advancing presentation time", () => {

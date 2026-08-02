@@ -3,7 +3,7 @@ import { PlaybackGeneration } from "./playback-generation.js";
 import {
   showControls, updateTimeDisplay, updateProgress, updatePlayButton,
   updateVolumeButton, showBuffering, hideBuffering, isDraggingProgress,
-  showPlaybackNotice, hidePlaybackNotice, mediaTitle,
+  setSeekTransitionPending, showPlaybackNotice, hidePlaybackNotice, mediaTitle,
 } from "./controls.js";
 import { renderSubtitle, loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { navigate } from "./router.js";
@@ -17,6 +17,7 @@ import {
   hasSeekPlaybackProgress,
   playbackRecoveryDelayMs,
   resolvePlaybackPosition,
+  shouldHoldOptimisticSeekTarget,
   shouldRestartPlexSessionForSeek,
 } from "./playback-recovery.js";
 
@@ -102,6 +103,7 @@ const seekWatchdogState = {
 const plexSeekSessionState = {
   requestId: 0,
   pending: false,
+  transitionPending: false,
 };
 const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
 const pageMemoryMonitor = new PageMemoryMonitor({ intervalMs: PAGE_MEMORY_SAMPLE_INTERVAL_MS });
@@ -392,6 +394,13 @@ async function requestFreshPlaybackSession(request, startTime, {
 
 function schedulePlaybackRecovery(player, error, { startTime: requestedStartTime } = {}) {
   const playerIsCurrent = player ? state.player === player : !state.player;
+  if (playerIsCurrent && player && plexSeekSessionState.pending) {
+    postPlayerRuntimeLog("playback_recovery_deferred_for_seek", {
+      error: error?.message || String(error),
+      targetTime: state.currentTime,
+    });
+    return true;
+  }
   if (!playerIsCurrent || !playbackRecoveryState.request || !isRecoverablePlaybackError(error)) {
     return false;
   }
@@ -1706,9 +1715,10 @@ function stopProgressReporting() {
 
 // --- Seek ------------------------------------------------------------
 
-function invalidatePlexSeekSession() {
+function invalidatePlexSeekSession({ preserveTransition = false } = {}) {
   plexSeekSessionState.requestId += 1;
   plexSeekSessionState.pending = false;
+  if (!preserveTransition) plexSeekSessionState.transitionPending = false;
 }
 
 function restartPlexSessionForSeek(player, targetTime, expectedToPlay, { fromTime }) {
@@ -1716,11 +1726,11 @@ function restartPlexSessionForSeek(player, targetTime, expectedToPlay, { fromTim
 
   const requestId = ++plexSeekSessionState.requestId;
   plexSeekSessionState.pending = true;
+  plexSeekSessionState.transitionPending = true;
   clearSeekWatchdog();
   void player.pause().catch(() => {});
   state.isPlaying = false;
-  showBuffering();
-  showStatus("Seeking...");
+  setSeekTransitionPending(true);
   postPlayerRuntimeLog("seek_session_restart_requested", {
     requestId,
     fromTime,
@@ -1754,12 +1764,13 @@ function restartPlexSessionForSeek(player, targetTime, expectedToPlay, { fromTim
   }).catch((error) => {
     if (requestId !== plexSeekSessionState.requestId || state.player !== player) return;
     plexSeekSessionState.pending = false;
+    plexSeekSessionState.transitionPending = false;
+    setSeekTransitionPending(false);
     const errorMessage = error?.message || String(error);
     const rollbackTime = getReportedCurrentTime(player);
     state.currentTime = rollbackTime;
     updateTimeDisplay();
     updateProgress(state.duration > 0 ? rollbackTime / state.duration : 0);
-    hideBuffering();
     if (expectedToPlay && state.playbackIntent === "playing") {
       void player.resume().catch(() => {});
     }
@@ -1769,7 +1780,6 @@ function restartPlexSessionForSeek(player, targetTime, expectedToPlay, { fromTim
       targetTime,
       error: errorMessage,
     });
-    overlay.classList.add("hidden");
     showPlaybackNotice(`Seek failed: ${errorMessage}`);
   });
   return true;
@@ -1829,16 +1839,18 @@ export function seekToTime(timeSec) {
   const fromTime = state.currentTime;
   const target = Math.max(0, Math.min(state.duration, requestedTime));
   const wasPlaying = state.playbackIntent === "playing";
-  state.currentTime = target;
-  updateTimeDisplay();
-  updateProgress(state.currentTime / state.duration);
   const seekableRange = player.getSeekableRange?.() || null;
-  if (shouldRestartPlexSessionForSeek({
+  const restartPlexSession = shouldRestartPlexSessionForSeek({
     plexRatingKey: state.plexInfo?.ratingKey,
     targetTime: target,
     seekableStartTime: seekableRange?.start,
-    sessionRestartPending: plexSeekSessionState.pending,
-  })) {
+    sessionRestartPending: plexSeekSessionState.pending || plexSeekSessionState.transitionPending,
+  });
+  if (restartPlexSession) setSeekTransitionPending(true);
+  state.currentTime = target;
+  updateTimeDisplay();
+  updateProgress(state.currentTime / state.duration);
+  if (restartPlexSession) {
     restartPlexSessionForSeek(player, target, wasPlaying, { fromTime });
     return;
   }
@@ -1919,7 +1931,14 @@ export async function togglePlayPause() {
 // --- Player event bindings -------------------------------------------
 
 function createMediabunnyPlayer(meta) {
+  const isOptimisticSeek = meta.__optimisticSeek === true;
   const updateTime = (seconds) => {
+    if (shouldHoldOptimisticSeekTarget({
+      transitionPending: plexSeekSessionState.transitionPending,
+      playerIsCurrent: state.player === player,
+    })) {
+      return;
+    }
     state.currentTime = Math.max(
       0,
       state.isLive ? seconds : Math.min(state.duration || Infinity, seconds),
@@ -1961,7 +1980,8 @@ function createMediabunnyPlayer(meta) {
       if (["loading", "seeking", "buffering"].includes(nextState)) {
         if (nextState !== "buffering") stopBandwidthDiagnosis();
         beginStall();
-        showBuffering();
+        if (isOptimisticSeek) setSeekTransitionPending(true);
+        else showBuffering();
         state.isPlaying = false;
         if (nextState === "buffering") startBandwidthDiagnosis(player, meta.streamProfile);
       } else if (nextState === "playing") {
@@ -1972,6 +1992,7 @@ function createMediabunnyPlayer(meta) {
         updatePlayButton();
         updateMediaSession();
         confirmPlaybackRecovery(player, getReportedCurrentTime(player));
+        if (isOptimisticSeek && !player.videoTrack) completeOptimisticSeekTransition();
       } else if (nextState === "paused") {
         stopBandwidthDiagnosis();
         endStall();
@@ -1987,7 +2008,9 @@ function createMediabunnyPlayer(meta) {
       });
     },
     onTime: updateTime,
-    onFirstVideo: () => {},
+    onFirstVideo: () => {
+      if (isOptimisticSeek) completeOptimisticSeekTransition();
+    },
     onEnded: () => {
       stopBandwidthDiagnosis();
       endStall();
@@ -2008,6 +2031,7 @@ function createMediabunnyPlayer(meta) {
       endStall();
       console.error("[mediabunny] Playback error:", error);
       if (!schedulePlaybackRecovery(player, error)) {
+        if (isOptimisticSeek) completeOptimisticSeekTransition({ immediate: true });
         hideBuffering();
         showStatus(`Error: ${error.message}`);
       }
@@ -2040,6 +2064,41 @@ function setPlaybackControlsEnabled(enabled) {
   centerPlayButton.setAttribute("aria-hidden", String(!enabled));
 }
 
+function capturePlaybackTransitionFrame(player) {
+  const existing = container.querySelector(".playback-transition-frame");
+  if (existing) return existing;
+  const source = player?.canvas;
+  if (!(source instanceof HTMLCanvasElement) || !source.width || !source.height) return null;
+
+  const snapshot = document.createElement("canvas");
+  snapshot.className = "playback-transition-frame";
+  snapshot.width = source.width;
+  snapshot.height = source.height;
+  try {
+    snapshot.getContext("2d", { alpha: false })?.drawImage(source, 0, 0);
+  } catch {
+    return null;
+  }
+  container.appendChild(snapshot);
+  return snapshot;
+}
+
+function completeOptimisticSeekTransition({ immediate = false } = {}) {
+  plexSeekSessionState.pending = false;
+  plexSeekSessionState.transitionPending = false;
+  setSeekTransitionPending(false);
+  const snapshot = container.querySelector(".playback-transition-frame");
+  if (!snapshot) return;
+  if (immediate) {
+    snapshot.remove();
+    return;
+  }
+  snapshot.classList.add("leaving");
+  const remove = () => snapshot.remove();
+  snapshot.addEventListener("transitionend", remove, { once: true });
+  setTimeout(remove, 250);
+}
+
 // Resize canvas when fullscreen or window size changes (debounced to avoid perf impact)
 let resizeTimer = null;
 function handleResize() {
@@ -2066,7 +2125,15 @@ export function showStatus(text) {
 }
 
 export async function play(url, title, meta = {}) {
-  invalidatePlexSeekSession();
+  const isOptimisticSeek = meta.__optimisticSeek === true;
+  invalidatePlexSeekSession({ preserveTransition: isOptimisticSeek });
+  if (isOptimisticSeek) {
+    plexSeekSessionState.transitionPending = true;
+    setSeekTransitionPending(true);
+  } else {
+    setSeekTransitionPending(false);
+    completeOptimisticSeekTransition({ immediate: true });
+  }
   const playbackSessionId = playbackGeneration.begin();
   clearSeekWatchdog();
   const isCurrentPlayback = () => playbackGeneration.isCurrent(playbackSessionId);
@@ -2095,12 +2162,21 @@ export async function play(url, title, meta = {}) {
     stopDecodeHealthMonitoring();
     stopBandwidthDiagnosis();
     const previousPlayer = state.player;
+    const transitionFrame = isOptimisticSeek
+      ? capturePlaybackTransitionFrame(previousPlayer)
+      : null;
     state.player = null;
     state.isPlaying = false;
     await disposePlayer(previousPlayer);
     if (!isCurrentPlayback()) return;
 
-    container.innerHTML = "";
+    if (transitionFrame) {
+      for (const child of [...container.children]) {
+        if (child !== transitionFrame) child.remove();
+      }
+    } else {
+      container.innerHTML = "";
+    }
     disableExternalSubtitle();
     state.currentTime = meta.startTime || 0;
     state.isLive = Boolean(meta.isLive);
@@ -2120,7 +2196,8 @@ export async function play(url, title, meta = {}) {
 
     setPlaybackControlsEnabled(true);
     overlay.classList.add("hidden");
-    showBuffering();
+    if (isOptimisticSeek) setSeekTransitionPending(true);
+    else showBuffering();
     // Include source in URL so page refresh can resume playback
     const playPath = meta.plex?.ratingKey
       ? `/play?plex=${encodeURIComponent(meta.plex.ratingKey)}`
@@ -2235,6 +2312,8 @@ let leavePlaybackPromise = null;
 async function leavePlaybackNow() {
   playbackGeneration.cancel();
   clearSeekWatchdog();
+  invalidatePlexSeekSession();
+  completeOptimisticSeekTransition({ immediate: true });
   resetPlaybackRecovery({ clearRequest: true });
   endStall();
   clearScheduledStutterTelemetryFlush();

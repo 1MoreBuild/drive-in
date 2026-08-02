@@ -129,6 +129,71 @@ test("the browser decodes media, paints the Canvas, and advances presentation ti
   assert.deepEqual(pageErrors, []);
 });
 
+test("optimistic seek keeps the current frame visible while the new stream loads", async (t) => {
+  const { baseUrl, runtimeDir } = await startDriveInServer(t);
+  const mediaUrl = await createMediaOrigin(t, runtimeDir, { durationSeconds: 8 });
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath,
+    args: ["--autoplay-policy=no-user-gesture-required"],
+  });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await waitFor(async () => {
+    const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
+    return status.playerConnected;
+  }, "browser player connection", 5_000);
+
+  const initialPlay = await postJson(baseUrl, "/api/play", {
+    url: mediaUrl,
+    startTime: 0,
+    autoplay: true,
+  });
+  assert.equal(initialPlay.response.status, 200);
+  await page.waitForFunction(() => (
+    globalThis.__driveInMediabunny?.player?.getStats().videoFrameRenderCount > 0
+  ), null, { timeout: 15_000 });
+
+  await page.route("**/api/proxy?*", async (route) => {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 400));
+    await route.continue();
+  });
+  const seekPlay = postJson(baseUrl, "/api/play", {
+    url: mediaUrl,
+    startTime: 2,
+    autoplay: true,
+    reason: "seek",
+  });
+
+  await page.waitForFunction(() => (
+    document.querySelector(".playback-transition-frame")
+    && document.getElementById("progress-wrap").classList.contains("seeking")
+  ), null, { timeout: 5_000 });
+  const transition = await page.evaluate(() => ({
+    overlayHidden: document.getElementById("overlay").classList.contains("hidden"),
+    snapshotPresent: Boolean(document.querySelector(".playback-transition-frame")),
+    progressBusy: document.getElementById("progress-wrap").getAttribute("aria-busy"),
+    centerSpinnerVisible: document.getElementById("btn-center-play").classList.contains("buffering"),
+  }));
+  assert.deepEqual(transition, {
+    overlayHidden: true,
+    snapshotPresent: true,
+    progressBusy: "true",
+    centerSpinnerVisible: false,
+  });
+  assert.equal((await seekPlay).response.status, 200);
+
+  await page.waitForFunction(() => (
+    globalThis.__driveInMediabunny?.player?.getCurrentTime() > 2.25
+    && !document.querySelector(".playback-transition-frame")
+    && !document.getElementById("progress-wrap").classList.contains("seeking")
+  ), null, { timeout: 15_000 });
+});
+
 test("browser back after playback ends tears down the player and shows the home screen", async (t) => {
   const { baseUrl, runtimeDir } = await startDriveInServer(t);
   const mediaUrl = await createMediaOrigin(t, runtimeDir);

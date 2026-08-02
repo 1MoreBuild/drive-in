@@ -34,6 +34,7 @@ export function showControls() {
 
 function hideControls() {
   if (progressWrap.classList.contains("dragging")) return;
+  if (progressWrap.classList.contains("seeking")) return;
   if (!subsPanel.classList.contains("hidden")) return;
   if (!audioPanel.classList.contains("hidden")) return;
   app.classList.remove("controls-visible");
@@ -91,6 +92,15 @@ export function updateProgress(fraction) {
   lastProgressPct = pct;
   progressPlayed.style.width = pct;
   progressScrubber.style.left = pct;
+}
+
+export function setSeekTransitionPending(pending) {
+  const isPending = pending === true;
+  const wasPending = progressWrap.classList.contains("seeking");
+  progressWrap.classList.toggle("seeking", isPending);
+  if (isPending) progressWrap.setAttribute("aria-busy", "true");
+  else progressWrap.removeAttribute("aria-busy");
+  if (isPending || wasPending) showControls();
 }
 
 // --- Play button state -----------------------------------------------

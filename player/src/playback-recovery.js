@@ -55,6 +55,10 @@ export function shouldRestartPlexSessionForSeek({
     && target < seekableStart;
 }
 
+export function shouldHoldOptimisticSeekTarget({ transitionPending, playerIsCurrent }) {
+  return transitionPending === true && playerIsCurrent === true;
+}
+
 export function buildFreshPlaybackSessionRequest(request, startTime, {
   autoplay = true,
   recovery = true,

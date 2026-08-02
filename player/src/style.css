@@ -95,9 +95,25 @@ html, body {
 #player-container canvas,
 #player-container video,
 #player-container audio {
+  position: absolute;
+  inset: 0;
   width: 100% !important;
   height: 100% !important;
   object-fit: contain;
+}
+
+#player-container canvas[data-engine="mediabunny"] {
+  z-index: 1;
+}
+
+#player-container .playback-transition-frame {
+  z-index: 2;
+  pointer-events: none;
+  transition: opacity 180ms var(--ease-out-quart);
+}
+
+#player-container .playback-transition-frame.leaving {
+  opacity: 0;
 }
 
 /* --- Subtitle overlay ------------------------------------------------ */
@@ -382,8 +398,37 @@ html, body {
 }
 
 #progress-wrap:hover #progress-scrubber,
-#progress-wrap.dragging #progress-scrubber {
+#progress-wrap.dragging #progress-scrubber,
+#progress-wrap.seeking #progress-scrubber {
   transform: translate(-50%, -50%) scale(1);
+}
+
+#progress-wrap.seeking #progress-played {
+  transition: width 180ms var(--ease-out-quart);
+}
+
+#progress-wrap.seeking #progress-scrubber {
+  transition: left 180ms var(--ease-out-quart), transform 120ms var(--ease-out-quart);
+}
+
+#progress-wrap.seeking #progress-scrubber::after {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border: 2px solid oklch(93% 0.008 250 / 0.55);
+  border-radius: 50%;
+  animation: seek-pending-pulse 900ms var(--ease-out-quart) infinite;
+}
+
+@keyframes seek-pending-pulse {
+  from {
+    opacity: 0.8;
+    transform: scale(0.72);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.35);
+  }
 }
 
 /* --- Controls row ---------------------------------------------------- */
