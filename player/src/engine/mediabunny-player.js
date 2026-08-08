@@ -25,7 +25,7 @@ const VIDEO_START_SECONDS = 0.1;
 const VIDEO_REBUFFER_SECONDS = 0.08;
 const TIME_EVENT_INTERVAL_MS = 250;
 // In-car connections often disappear for tens of seconds at a time. Keep the
-// encoded HLS buffer large while the fixed 720p60 profile stays predictable.
+// encoded HLS buffer large while the 720p60/1080p30 profile stays predictable.
 const HLS_BUFFER_TARGET_SECONDS = 210;
 const HLS_START_SECONDS = 15;
 const HLS_BUFFER_MAX_SEGMENTS = 90;

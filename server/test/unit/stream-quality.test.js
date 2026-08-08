@@ -22,11 +22,17 @@ test("fullscreen viewport stays at fixed 720p", () => {
   }), 720);
 });
 
-test("format selector prefers 60fps before same-height fallback", () => {
+test("format selector prefers 720p60 before 1080p30 and 720p30 fallbacks", () => {
   const selector = buildFormatSelector({ targetHeight: 720, maxVideoKbps: 4800 });
-  const sixtyFps = selector.indexOf("[height<=720][tbr<=4800][fps>=50]");
-  const fallback = selector.indexOf("[height<=720][tbr<=4800]+ba");
+  const choices = selector.split("/");
+  const sixtyFps = choices.findIndex((choice) => (
+    choice.includes("[height<=720]") && choice.includes("[fps>=50]")
+  ));
+  const fullHdThirtyFps = choices.findIndex((choice) => (
+    choice.includes("[height<=1080]") && choice.includes("[fps<50]")
+  ));
+  const fallback720 = choices.findIndex((choice) => choice === "b*[height<=720]");
   assert.ok(sixtyFps >= 0);
-  assert.ok(fallback > sixtyFps);
-  assert.equal(selector.includes("height<=1080"), false);
+  assert.ok(fullHdThirtyFps > sixtyFps);
+  assert.ok(fallback720 > fullHdThirtyFps);
 });
