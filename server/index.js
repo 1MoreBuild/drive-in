@@ -70,6 +70,12 @@ import {
   parsePlexThumbnailDimensions,
   plexThumbnailProxyUrl,
 } from "./plex-thumbnails.js";
+import {
+  extractSubtitles,
+  hasEnglishAndChineseSubtitles,
+  isYouTubeUrl,
+  mergeSubtitles,
+} from "./ytdlp-subtitles.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "9090", 10);
@@ -487,7 +493,6 @@ function ytdlpJson(url, { targetHeight = 720, signal } = {}) {
       [
         ...YTDLP_COMMON,
         "--no-warnings", "-j", "--no-playlist",
-        "--write-sub", "--sub-lang", "all",
         "-f", buildFormatSelector({
           targetHeight,
           maxVideoKbps: STREAM_MAX_VIDEO_BITRATE_KBPS,
@@ -502,6 +507,27 @@ function ytdlpJson(url, { targetHeight = 720, signal } = {}) {
         }
         try { resolve(JSON.parse(stdout)); }
         catch { reject(new Error("Failed to parse yt-dlp output")); }
+      }
+    );
+  });
+}
+
+// YouTube may withhold subtitle URLs from authenticated web clients unless a
+// subtitles PO token is supplied. Public metadata currently exposes the same
+// captions without affecting the authenticated format selection above.
+function ytdlpPublicSubtitleJson(url, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "yt-dlp",
+      ["--no-warnings", "-j", "--no-playlist", "--skip-download", url],
+      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024, signal },
+      (err, stdout, stderr) => {
+        if (err) {
+          if (signal?.aborted) return reject(signal.reason instanceof Error ? signal.reason : err);
+          return reject(new Error(stderr || err.message));
+        }
+        try { resolve(JSON.parse(stdout)); }
+        catch { reject(new Error("Failed to parse public yt-dlp subtitle output")); }
       }
     );
   });
@@ -535,50 +561,20 @@ function playlistEntryUrl(entry) {
   return null;
 }
 
-function srtToVtt(srt) {
-  return "WEBVTT\n\n" + srt.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
-}
-
-function extractSubtitles(info) {
-  const subs = [];
-  const manualLangs = new Set();
-  // Manual subtitles first (higher quality)
-  for (const [lang, formats] of Object.entries(info.subtitles || {})) {
-    if (lang === "danmaku") continue;
-    // Prefer VTT with URL, then SRT with URL, then any with inline data
-    const vtt = formats.find((f) => f.ext === "vtt" && f.url);
-    const srt = formats.find((f) => f.ext === "srt" && (f.url || f.data));
-    const pick = vtt || srt || formats.find((f) => f.data);
-    if (!pick) continue;
-    manualLangs.add(lang);
-    subs.push({
-      lang, name: pick.name || lang, auto: false,
-      url: pick.url || null,
-      data: pick.data ? (pick.ext === "srt" ? srtToVtt(pick.data) : pick.data) : null,
-      ext: pick.ext,
-    });
-  }
-  // Auto-generated — use different key if manual exists for same lang
-  for (const [lang, formats] of Object.entries(info.automatic_captions || {})) {
-    if (lang.includes("-")) continue;
-    const vtt = formats.find((f) => f.ext === "vtt" && f.url);
-    const srt = formats.find((f) => f.ext === "srt" && (f.url || f.data));
-    const pick = vtt || srt || formats.find((f) => f.data);
-    if (!pick) continue;
-    const key = manualLangs.has(lang) ? `${lang}-auto` : lang;
-    subs.push({
-      lang: key, name: `${pick.name || lang} (auto)`, auto: true,
-      url: pick.url || null,
-      data: pick.data ? (pick.ext === "srt" ? srtToVtt(pick.data) : pick.data) : null,
-      ext: pick.ext,
-    });
-  }
-  return subs;
-}
-
 function ytdlp(url, { targetHeight = 720, signal } = {}) {
   const selectedTargetHeight = normalizeTargetHeight(targetHeight);
-  return ytdlpJson(url, { targetHeight: selectedTargetHeight, signal }).then((info) => {
+  return ytdlpJson(url, { targetHeight: selectedTargetHeight, signal }).then(async (info) => {
+    let subtitles = extractSubtitles(info);
+    if (isYouTubeUrl(url) && !hasEnglishAndChineseSubtitles(subtitles)) {
+      try {
+        const publicInfo = await ytdlpPublicSubtitleJson(url, { signal });
+        subtitles = mergeSubtitles(subtitles, extractSubtitles(publicInfo));
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        log.warn({ err: error.message, url }, "Public YouTube subtitle metadata unavailable");
+      }
+    }
+
     const isLive = !!info.is_live;
     const selectedFormats = info.requested_formats?.length ? info.requested_formats : [info];
     const selectedVideo = selectedFormats.find((format) => format.vcodec && format.vcodec !== "none");
@@ -602,7 +598,7 @@ function ytdlp(url, { targetHeight = 720, signal } = {}) {
       thumbnail: info.thumbnail || null,
       duration: info.duration || null,
       uploader: info.uploader || null,
-      subtitles: extractSubtitles(info),
+      subtitles,
       streamProfile,
     };
 
