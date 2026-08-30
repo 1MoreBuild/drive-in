@@ -13,6 +13,16 @@ import { postJson, startDriveInServer, waitFor } from "./helpers.js";
 const execFileAsync = promisify(execFile);
 const macChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
+async function createDriveInPage(browser, viewport) {
+  const page = await browser.newPage({ viewport });
+  await page.route("https://fonts.googleapis.com/**", (route) => route.fulfill({
+    status: 200,
+    contentType: "text/css",
+    body: "",
+  }));
+  return page;
+}
+
 async function createMediaOrigin(t, runtimeDir, { durationSeconds = 4 } = {}) {
   const mediaPath = `${runtimeDir}/browser-e2e.webm`;
   await execFileAsync("ffmpeg", [
@@ -75,7 +85,7 @@ test("the browser decodes media, paints the Canvas, and advances presentation ti
     args: ["--autoplay-policy=no-user-gesture-required"],
   });
   t.after(() => browser.close());
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
@@ -129,6 +139,108 @@ test("the browser decodes media, paints the Canvas, and advances presentation ti
   assert.deepEqual(pageErrors, []);
 });
 
+test("subtitle languages stack upward as compact background groups", async (t) => {
+  const { baseUrl } = await startDriveInServer(t);
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+    || (existsSync(macChrome) ? macChrome : undefined);
+  const browser = await chromium.launch({ headless: true, executablePath });
+  t.after(() => browser.close());
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const layout = await page.evaluate(async () => {
+    const realFetch = globalThis.fetch.bind(globalThis);
+    const captions = new Map([
+      ["/test/en.vtt", "WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nFirst line\nSecond line\n"],
+      ["/test/zh.vtt", "WEBVTT\n\n00:00:00.000 --> 00:00:04.000\n中文翻译\n"],
+    ]);
+    globalThis.fetch = (input, init) => {
+      const requestUrl = typeof input === "string"
+        ? input
+        : input instanceof URL ? input.href : input.url;
+      const url = new URL(requestUrl, location.origin);
+      if (captions.has(url.pathname)) {
+        return Promise.resolve(new Response(captions.get(url.pathname), {
+          status: 200,
+          headers: { "Content-Type": "text/vtt" },
+        }));
+      }
+      return realFetch(input, init);
+    };
+
+    const subtitles = await import("/src/subtitles.js");
+    await subtitles.loadSubtitleTrack("en", "/test/en.vtt");
+    await subtitles.loadSubtitleTrack("zh-Hans", "/test/zh.vtt");
+    subtitles.renderSubtitle(1);
+
+    const app = document.getElementById("app");
+    const overlay = document.getElementById("subtitle-overlay");
+    const tracks = [...overlay.querySelectorAll(":scope > .subtitle-track")];
+    const englishLines = [...tracks[0].querySelectorAll(".subtitle-line")];
+    const appBox = app.getBoundingClientRect();
+    const overlayBox = overlay.getBoundingClientRect();
+    const englishBox = tracks[0].getBoundingClientRect();
+    const chineseBox = tracks[1].getBoundingClientRect();
+    const firstLineBox = englishLines[0].getBoundingClientRect();
+    const secondLineBox = englishLines[1].getBoundingClientRect();
+    const overlayStyle = getComputedStyle(overlay);
+    const trackStyle = getComputedStyle(tracks[0]);
+    const chineseTrackStyle = getComputedStyle(tracks[1]);
+    const lineStyle = getComputedStyle(englishLines[0]);
+    const languageFontFamily = (lang) => {
+      const track = document.createElement("div");
+      track.className = "subtitle-track";
+      track.lang = lang;
+      track.style.position = "fixed";
+      track.style.visibility = "hidden";
+      document.body.append(track);
+      const family = getComputedStyle(track).fontFamily;
+      track.remove();
+      return family;
+    };
+
+    return {
+      groupCount: tracks.length,
+      groups: tracks.map((track) => ({
+        lang: track.lang,
+        lines: [...track.querySelectorAll(".subtitle-line")].map((line) => line.textContent),
+      })),
+      overlay: {
+        display: overlayStyle.display,
+        direction: overlayStyle.flexDirection,
+        gap: overlayStyle.gap,
+        bottomInset: appBox.bottom - overlayBox.bottom,
+      },
+      firstLanguageIsLower: englishBox.bottom > chineseBox.bottom,
+      sameLanguageLineGap: secondLineBox.top - firstLineBox.bottom,
+      trackBackground: trackStyle.backgroundColor,
+      lineBackground: lineStyle.backgroundColor,
+      englishFontFamily: trackStyle.fontFamily,
+      chineseFontFamily: chineseTrackStyle.fontFamily,
+      japaneseFontFamily: languageFontFamily("ja"),
+      koreanFontFamily: languageFontFamily("ko"),
+    };
+  });
+
+  assert.deepEqual(layout.groups, [
+    { lang: "en", lines: ["First line", "Second line"] },
+    { lang: "zh-Hans", lines: ["中文翻译"] },
+  ]);
+  assert.equal(layout.groupCount, 2);
+  assert.equal(layout.overlay.display, "flex");
+  assert.equal(layout.overlay.direction, "column-reverse");
+  assert.equal(layout.overlay.gap, "4px");
+  assert.ok(Math.abs(layout.overlay.bottomInset - 104) < 0.5);
+  assert.equal(layout.firstLanguageIsLower, true);
+  assert.ok(Math.abs(layout.sameLanguageLineGap) < 0.5);
+  assert.equal(layout.trackBackground, "rgba(0, 0, 0, 0.78)");
+  assert.equal(layout.lineBackground, "rgba(0, 0, 0, 0)");
+  assert.match(layout.englishFontFamily, /^"Noto Sans"/);
+  assert.match(layout.chineseFontFamily, /^"Noto Sans SC"/);
+  assert.match(layout.japaneseFontFamily, /^"Noto Sans JP"/);
+  assert.match(layout.koreanFontFamily, /^"Noto Sans KR"/);
+});
+
 test("optimistic seek keeps the current frame visible while the new stream loads", async (t) => {
   const { baseUrl, runtimeDir } = await startDriveInServer(t);
   const mediaUrl = await createMediaOrigin(t, runtimeDir, { durationSeconds: 8 });
@@ -140,7 +252,7 @@ test("optimistic seek keeps the current frame visible while the new stream loads
     args: ["--autoplay-policy=no-user-gesture-required"],
   });
   t.after(() => browser.close());
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitFor(async () => {
@@ -205,7 +317,7 @@ test("browser back after playback ends tears down the player and shows the home 
     args: ["--autoplay-policy=no-user-gesture-required"],
   });
   t.after(() => browser.close());
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitFor(async () => {
@@ -257,7 +369,7 @@ test("browser back from an episode tears down the player and restores its show",
     args: ["--autoplay-policy=no-user-gesture-required"],
   });
   t.after(() => browser.close());
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitFor(async () => {
@@ -364,7 +476,7 @@ test("the player stop button preserves resume progress and stops the server sess
     args: ["--autoplay-policy=no-user-gesture-required"],
   });
   t.after(() => browser.close());
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await createDriveInPage(browser, { width: 1280, height: 720 });
 
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitFor(async () => {
@@ -412,14 +524,14 @@ test("a blocked player can explicitly take over the active player lease", async 
   });
   t.after(() => browser.close());
 
-  const activePage = await browser.newPage({ viewport: { width: 1180, height: 919 } });
+  const activePage = await createDriveInPage(browser, { width: 1180, height: 919 });
   await activePage.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await waitFor(async () => {
     const status = await fetch(new URL("/api/status", baseUrl)).then((response) => response.json());
     return status.playerConnected;
   }, "first browser player connection", 5_000);
 
-  const takeoverPage = await browser.newPage({ viewport: { width: 1180, height: 919 } });
+  const takeoverPage = await createDriveInPage(browser, { width: 1180, height: 919 });
   await takeoverPage.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await takeoverPage.waitForSelector("#status-actions:not(.hidden)", { timeout: 5_000 });
   assert.equal(

@@ -115,14 +115,6 @@ const PLEX_TOKEN = process.env.PLEX_TOKEN || (() => {
   try { return execSync("defaults read com.plexapp.plexmediaserver PlexOnlineToken 2>/dev/null").toString().trim(); }
   catch { return ""; }
 })();
-const CJK_FONT_PATH = [
-  process.env.CJK_FONT_PATH,
-  "/Applications/Plex Media Server.app/Contents/Resources/Fonts/NotoSansCJK-Medium.ttc",
-  "/System/Library/Fonts/Hiragino Sans GB.ttc",
-  "/System/Library/Fonts/PingFang.ttc",
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-].find((path) => path && existsSync(path));
-
 // --- Play history (persisted to disk) --------------------------------
 
 const HISTORY_PATH = runtimePath(".play-history.json");
@@ -190,13 +182,6 @@ app.use((req, res, next) => {
   res.set("Cross-Origin-Opener-Policy", "same-origin");
   res.set("Cross-Origin-Embedder-Policy", "credentialless");
   next();
-});
-
-app.get("/api/fonts/cjk", (_req, res) => {
-  if (!CJK_FONT_PATH) return res.status(404).json({ error: "CJK font not installed on server" });
-  res.set("Content-Type", "font/collection");
-  res.set("Cache-Control", "public, max-age=31536000, immutable");
-  return res.sendFile(CJK_FONT_PATH);
 });
 
 // Structured request logging

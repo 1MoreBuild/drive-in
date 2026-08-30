@@ -118,19 +118,17 @@ html, body {
 
 /* --- Subtitle overlay ------------------------------------------------ */
 
-@font-face {
-  font-family: "Drive-In CJK";
-  src: url("/api/fonts/cjk") format("collection");
-  font-display: swap;
-}
-
 #subtitle-overlay {
   position: absolute;
-  top: calc(100% - 80px - 6rem);
+  top: auto;
+  bottom: calc(80px + 1.5rem);
   left: 10%;
   right: 10%;
   z-index: 12;
-  text-align: center;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 4px;
   pointer-events: none;
 }
 
@@ -138,18 +136,36 @@ html, body {
   display: none !important;
 }
 
-#subtitle-overlay span {
-  display: inline;
-  background: rgba(0, 0, 0, 0.7);
+.subtitle-track {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px 12px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.78);
   color: #fff;
-  font-family: "Drive-In CJK", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: "Noto Sans", sans-serif;
   font-size: 1.6rem;
   font-weight: 500;
-  line-height: 2;
-  padding: 4px 10px;
-  border-radius: 4px;
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
+  line-height: 1.25;
+  text-align: center;
+  text-wrap: pretty;
+}
+
+.subtitle-track:lang(zh) {
+  font-family: "Noto Sans SC", "Noto Sans", sans-serif;
+}
+
+.subtitle-track:lang(ja) {
+  font-family: "Noto Sans JP", "Noto Sans", sans-serif;
+}
+
+.subtitle-track:lang(ko) {
+  font-family: "Noto Sans KR", "Noto Sans", sans-serif;
+}
+
+.subtitle-line {
+  display: block;
 }
 
 /* --- Center play/pause button ---------------------------------------- */
@@ -1519,9 +1535,9 @@ html, body {
     right: 8%;
   }
 
-  #subtitle-overlay span {
+  .subtitle-track {
     font-size: clamp(1rem, 4vh, 1.25rem);
-    line-height: 1.55;
+    line-height: 1.25;
   }
 
   #playback-notice {

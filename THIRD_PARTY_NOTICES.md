@@ -12,6 +12,15 @@ Drive-In depends on the following third-party software. Their licenses are liste
 
 Mediabunny is bundled with the player for production and loaded as an ES module in source-mode development. Modified MPL-covered files must remain available under MPL-2.0.
 
+### Noto Sans, Noto Sans SC, Noto Sans JP, and Noto Sans KR
+
+- **License**: OFL-1.1
+- **Source**: https://github.com/notofonts
+- **Distribution**: https://fonts.google.com
+- **Usage**: CDN-hosted fonts for Latin, Simplified Chinese, Japanese, and Korean subtitles
+
+The player requests weight 500 through the Google Fonts CSS API. Browsers load the Unicode-ranged font files needed for the active subtitle text instead of relying on a system or Plex-provided font collection.
+
 ### yt-dlp
 
 - **License**: Unlicense

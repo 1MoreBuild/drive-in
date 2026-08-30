@@ -1,6 +1,7 @@
 // --- VTT subtitle renderer -------------------------------------------
 
-import { buildCueEndPrefix, findActiveCues, parseVTT } from "./subtitle-cues.js";
+import { buildCueEndPrefix, parseVTT } from "./subtitle-cues.js";
+import { activeSubtitleGroups } from "./subtitle-layout.js";
 import { requestText } from "./network.js";
 
 export { parseVTT } from "./subtitle-cues.js";
@@ -15,25 +16,30 @@ function clearSubtitleOverlay() {
   lastRenderedSubtitle = "";
 }
 
-function renderSubtitleLines(lines) {
-  const nextRenderedSubtitle = lines.join("\n");
+function renderSubtitleGroups(groups) {
+  const nextRenderedSubtitle = JSON.stringify(groups);
   if (nextRenderedSubtitle === lastRenderedSubtitle) return;
 
   lastRenderedSubtitle = nextRenderedSubtitle;
-  if (!lines.length) {
+  if (!groups.length) {
     subtitleOverlay.replaceChildren();
     return;
   }
 
   const fragment = document.createDocumentFragment();
-  lines.forEach((line, index) => {
-    const span = document.createElement("span");
-    span.textContent = line;
-    fragment.append(span);
-    if (index < lines.length - 1) {
-      fragment.append(document.createElement("br"));
+  for (const group of groups) {
+    const track = document.createElement("div");
+    track.className = "subtitle-track";
+    track.lang = group.lang;
+    track.dataset.lang = group.lang;
+    for (const line of group.lines) {
+      const lineElement = document.createElement("span");
+      lineElement.className = "subtitle-line";
+      lineElement.textContent = line;
+      track.append(lineElement);
     }
-  });
+    fragment.append(track);
+  }
   subtitleOverlay.replaceChildren(fragment);
 }
 
@@ -43,12 +49,7 @@ export function renderSubtitle(time) {
     return;
   }
 
-  const lines = [];
-  for (const track of subtitleTracks) {
-    const activeCues = findActiveCues(track, time);
-    for (const cue of activeCues) lines.push(...cue.text.split("\n").filter(Boolean));
-  }
-  renderSubtitleLines(lines);
+  renderSubtitleGroups(activeSubtitleGroups(subtitleTracks, time));
 }
 
 export async function loadSubtitleTrack(lang, url) {

@@ -107,7 +107,7 @@ docker compose up
 
 ## Configuration
 
-Copy [`.env.example`](.env.example) and edit the values you need. It documents Plex, bitrate, cache, port, logging, database, font, and fallback-transcode settings.
+Copy [`.env.example`](.env.example) and edit the values you need. It documents Plex, bitrate, cache, port, logging, database, and fallback-transcode settings.
 
 CLI server selection follows this order: `--server`, `DRIVEIN_SERVER`, the CLI config file, then `http://localhost:9090`.
 
