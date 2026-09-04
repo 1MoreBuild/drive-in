@@ -30,7 +30,13 @@ import {
   normalizeTargetHeight,
   targetHeightForViewport,
 } from "./stream-quality.js";
-import { loadHistoryFile, saveHistoryFile } from "./history-store.js";
+import {
+  isEphemeralMediaUrl,
+  loadHistoryFile,
+  sanitizeHistoryEntries,
+  saveHistoryFile,
+} from "./history-store.js";
+import { metadataArgs } from "./url-metadata.js";
 import { PlaybackCoordinator, isPlaybackSuperseded } from "./playback-coordinator.js";
 import { fetchPublicImage, MAX_THUMBNAIL_BYTES, resolveSubtitleFile, SafeFetchError } from "./security.js";
 import {
@@ -88,6 +94,9 @@ const STREAM_MAX_VIDEO_BITRATE_KBPS = (() => {
 const PLEX_URL = process.env.PLEX_URL || "http://localhost:32400";
 const PLEX_VIDEO_BITRATE_KBPS = normalizePlexVideoBitrate(process.env.PLEX_VIDEO_BITRATE_KBPS);
 const MAX_PLEX_SUBTITLE_BYTES = 20 * 1024 * 1024;
+// Long YouTube VOD manifests repeat signed URLs for every segment. Keep a
+// route-specific safety bound without applying the generic 4 MiB text limit.
+const MAX_HLS_PLAYLIST_BYTES = 16 * 1024 * 1024;
 const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
@@ -137,6 +146,10 @@ function saveHistory(history) {
 }
 
 function addToHistory(entry) {
+  if (isEphemeralMediaUrl(entry?.url)) {
+    log.warn({ url: truncateUrl(entry.url, 160) }, "Skipped ephemeral media URL in play history");
+    return;
+  }
   const history = loadHistory();
   // Remove duplicate (same ratingKey or url)
   const key = entry.plex?.ratingKey || entry.url;
@@ -533,6 +546,21 @@ function ytdlpFlatPlaylist(url) {
         try { resolve(JSON.parse(stdout)); }
         catch { reject(new Error("Failed to parse yt-dlp playlist output")); }
       }
+    );
+  });
+}
+
+function ytdlpMetadata(url) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "yt-dlp",
+      metadataArgs(url, YTDLP_COMMON),
+      { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        try { resolve(JSON.parse(stdout)); }
+        catch { reject(new Error("Failed to parse yt-dlp metadata output")); }
+      },
     );
   });
 }
@@ -2364,7 +2392,7 @@ app.get("/api/proxy/hls", async (req, res) => {
       const fetched = await fetchTextWithRetry(
         entry.url,
         { headers: proxyHeaders(entry), redirect: "follow" },
-        { retries: 2, label: "hls-playlist" },
+        { retries: 2, label: "hls-playlist", maxBytes: MAX_HLS_PLAYLIST_BYTES },
       );
       upstream = fetched.response;
       body = fetched.body;
@@ -3405,7 +3433,7 @@ app.delete("/api/history", (req, res) => {
 });
 
 app.get("/api/history", async (_req, res) => {
-  const history = loadHistory();
+  const history = sanitizeHistoryEntries(loadHistory());
 
   // Fix non-proxied external thumbnail URLs in history
   const fixed = history.map((h) => {
@@ -3443,6 +3471,7 @@ app.get("/api/history", async (_req, res) => {
 
 const { playNextFromQueue } = registerQueuePlaylistApi(app, {
   ytdlpFlatPlaylist,
+  resolveUrlMetadata: ytdlpMetadata,
   playlistEntryUrl,
   plexApi,
   hasPlex: !!PLEX_TOKEN,

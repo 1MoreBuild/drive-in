@@ -1,6 +1,22 @@
 import { dirname } from "path";
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 
+const EPHEMERAL_MEDIA_HOSTS = ["googlevideo.com"];
+
+export function isEphemeralMediaUrl(value) {
+  if (!value) return false;
+  try {
+    const { hostname } = new URL(String(value));
+    return EPHEMERAL_MEDIA_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeHistoryEntries(history = []) {
+  return history.filter((entry) => !isEphemeralMediaUrl(entry?.url));
+}
+
 export function loadHistoryFile(path, { onCorrupt } = {}) {
   try {
     const value = JSON.parse(readFileSync(path, "utf8"));

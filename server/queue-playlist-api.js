@@ -15,8 +15,78 @@ import {
   reorderQueue,
   shiftQueueItem,
   updatePlaylist,
+  updatePlaylistItemMetadata,
+  updateQueueItemMetadata,
 } from "./queue-store.js";
 import { plexThumbnailProxyUrl } from "./plex-thumbnails.js";
+import { validateMetadataUrl } from "./url-metadata.js";
+
+function externalThumbnailProxyUrl(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  return `/api/thumb?url=${encodeURIComponent(url)}`;
+}
+
+export function queueMetadataFromInfo(info = {}) {
+  const thumbnails = Array.isArray(info.thumbnails) ? info.thumbnails : [];
+  const thumbnail = thumbnails.length
+    ? thumbnails[thumbnails.length - 1]?.url
+    : info.thumbnail || null;
+  return {
+    title: info.title || info.fulltitle || null,
+    thumbnail: externalThumbnailProxyUrl(thumbnail),
+    duration: info.duration != null && Number.isFinite(Number(info.duration)) && Number(info.duration) > 0
+      ? Math.floor(Number(info.duration)) : null,
+  };
+}
+
+export async function enrichQueueItemInput(body = {}, {
+  hasPlex,
+  plexApi,
+  resolveUrlMetadata,
+  log,
+} = {}) {
+  const ratingKey = body.ratingKey ? String(body.ratingKey) : null;
+  if (!ratingKey && body.url) validateMetadataUrl(body.url);
+  const needsTitle = !body.title || body.title === body.url || body.title === `Plex ${ratingKey}`;
+  const needsThumbnail = !body.thumbnail;
+  const needsDuration = !(Number(body.duration) > 0);
+  if (!needsTitle && !needsThumbnail && !needsDuration) return body;
+  const fillMissing = (metadata) => ({
+    ...body,
+    ...(needsTitle && metadata.title ? { title: metadata.title } : {}),
+    ...(needsThumbnail && metadata.thumbnail ? { thumbnail: metadata.thumbnail } : {}),
+    ...(needsDuration && metadata.duration != null ? { duration: metadata.duration } : {}),
+  });
+  if (ratingKey && hasPlex) {
+    try {
+      const data = await plexApi(`/library/metadata/${ratingKey}`);
+      const meta = data.MediaContainer.Metadata[0];
+      const title = meta.grandparentTitle
+        ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
+        : meta.title;
+      return fillMissing({
+        title,
+        thumbnail: plexThumbnailProxyUrl(meta.art || meta.thumb, "landscape"),
+        duration: meta.duration ? Math.round(meta.duration / 1000) : null,
+      });
+    } catch (error) {
+      log?.warn?.({ err: error?.message, ratingKey }, "Failed to enrich queued Plex item");
+      return body;
+    }
+  }
+
+  if (!ratingKey && body.url && resolveUrlMetadata) {
+    try {
+      const info = await resolveUrlMetadata(String(body.url));
+      const metadata = queueMetadataFromInfo(info);
+      return fillMissing(metadata);
+    } catch (error) {
+      log?.warn?.({ err: error?.message, url: body.url }, "Failed to enrich queued URL item");
+    }
+  }
+
+  return body;
+}
 
 export function playlistItemsFromInfo(info, sourceUrl, entryUrlFor) {
   const entries = Array.isArray(info?.entries) ? info.entries : [];
@@ -46,6 +116,7 @@ export function playlistItemsFromInfo(info, sourceUrl, entryUrlFor) {
 
 export function registerQueuePlaylistApi(app, {
   ytdlpFlatPlaylist,
+  resolveUrlMetadata,
   playlistEntryUrl,
   plexApi,
   hasPlex,
@@ -56,25 +127,25 @@ export function registerQueuePlaylistApi(app, {
   onPlaybackError,
   log,
 }) {
-  async function buildQueueItemInput(body = {}) {
-    const ratingKey = body.ratingKey ? String(body.ratingKey) : null;
-    if (!ratingKey || body.title || !hasPlex) return body;
-    try {
-      const data = await plexApi(`/library/metadata/${ratingKey}`);
-      const meta = data.MediaContainer.Metadata[0];
-      const title = meta.grandparentTitle
-        ? `${meta.grandparentTitle} S${meta.parentIndex}E${meta.index} — ${meta.title}`
-        : meta.title;
-      return {
-        ...body,
-        title,
-        thumbnail: plexThumbnailProxyUrl(meta.art || meta.thumb, "landscape"),
-        duration: meta.duration ? Math.round(meta.duration / 1000) : null,
-      };
-    } catch (error) {
-      log.warn({ err: error?.message, ratingKey }, "Failed to enrich queued Plex item");
-      return body;
-    }
+  const buildQueueItemInput = (body = {}) => enrichQueueItemInput(body, {
+    hasPlex,
+    plexApi,
+    resolveUrlMetadata,
+    log,
+  });
+
+  function completeMetadata(item, update, broadcast) {
+    void buildQueueItemInput(item).then((enriched) => {
+      if (enriched === item) return;
+      if (update(enriched)) broadcast();
+    }).catch((error) => {
+      log?.warn?.({ err: error?.message, itemId: item.id }, "Failed to complete item metadata");
+    });
+  }
+
+  function validateItem(body = {}) {
+    if (!body.ratingKey) validateMetadataUrl(body.url);
+    return body;
   }
 
   async function playlistItemsFromUrl(url) {
@@ -151,8 +222,9 @@ export function registerQueuePlaylistApi(app, {
   app.post("/api/playlists/:id/items", async (req, res) => {
     if (!getPlaylist(req.params.id)) return res.status(404).json({ error: "playlist not found" });
     try {
-      const item = addPlaylistItem(req.params.id, await buildQueueItemInput(req.body || {}));
+      const item = addPlaylistItem(req.params.id, validateItem(req.body || {}));
       broadcastPlaylists();
+      completeMetadata(item, (enriched) => updatePlaylistItemMetadata(req.params.id, item.id, enriched), broadcastPlaylists);
       return res.status(201).json({ ok: true, item, playlist: getPlaylist(req.params.id) });
     } catch (error) {
       return res.status(400).json({ error: error.message });
@@ -182,8 +254,9 @@ export function registerQueuePlaylistApi(app, {
   app.get("/api/queue", (_req, res) => res.json(listQueue()));
   app.post("/api/queue", async (req, res) => {
     try {
-      const item = addQueueItem(await buildQueueItemInput(req.body), { playNext: !!req.body?.playNext });
+      const item = addQueueItem(validateItem(req.body), { playNext: !!req.body?.playNext });
       broadcastQueue();
+      completeMetadata(item, (enriched) => updateQueueItemMetadata(item.id, enriched), broadcastQueue);
       return res.status(201).json({ ok: true, item, queue: listQueue() });
     } catch (error) {
       return res.status(400).json({ error: error.message });

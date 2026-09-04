@@ -137,6 +137,15 @@ export function getQueueItem(id) {
   return sourceRowToItem(db.prepare("SELECT * FROM queue_items WHERE id = ?").get(id));
 }
 
+// Metadata completion must never insert a removed item or change its position.
+export function updateQueueItemMetadata(id, input) {
+  const item = normalizeQueueInput(input);
+  const result = db.prepare(`
+    UPDATE queue_items SET title = ?, thumbnail = ?, duration = ?, updated_at = ? WHERE id = ?
+  `).run(item.title, item.thumbnail, item.duration, Date.now(), id);
+  return result.changes ? getQueueItem(id) : null;
+}
+
 export function removeQueueItem(id) {
   const item = getQueueItem(id);
   if (!item) return null;
@@ -312,6 +321,17 @@ export function removePlaylistItem(playlistId, itemId) {
   normalizePlaylistItemPositions(playlistId);
   touchPlaylist(playlistId);
   return item;
+}
+
+export function updatePlaylistItemMetadata(playlistId, id, input) {
+  const item = normalizeQueueInput(input);
+  const result = db.prepare(`
+    UPDATE playlist_items SET title = ?, thumbnail = ?, duration = ?, updated_at = ?
+    WHERE playlist_id = ? AND id = ?
+  `).run(item.title, item.thumbnail, item.duration, Date.now(), playlistId, id);
+  if (!result.changes) return null;
+  touchPlaylist(playlistId);
+  return listPlaylistItems(playlistId).find((row) => row.id === id);
 }
 
 export function reorderPlaylistItems(playlistId, ids = []) {
