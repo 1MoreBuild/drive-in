@@ -5,6 +5,7 @@ const RUNNING = 3;
 const CONSUMED_FRAMES = 4;
 const UNDERRUN_COUNT = 5;
 const NEEDS_BUFFERING = 6;
+const ENDED = 7;
 const HEADER_LENGTH = 8;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -51,6 +52,10 @@ export class AudioRingBuffer {
     if (running) Atomics.store(this.header, NEEDS_BUFFERING, 0);
   }
 
+  markEnded() {
+    Atomics.store(this.header, ENDED, 1);
+  }
+
   reset() {
     this.setRunning(false);
     Atomics.store(this.header, READ_INDEX, 0);
@@ -58,6 +63,7 @@ export class AudioRingBuffer {
     Atomics.store(this.header, AVAILABLE_FRAMES, 0);
     Atomics.store(this.header, CONSUMED_FRAMES, 0);
     Atomics.store(this.header, NEEDS_BUFFERING, 0);
+    Atomics.store(this.header, ENDED, 0);
   }
 
   async writeAudioBuffer(buffer, { startFrame = 0, shouldContinue = () => true } = {}) {
@@ -101,4 +107,3 @@ export class AudioRingBuffer {
     Atomics.add(this.header, AVAILABLE_FRAMES, frameCount);
   }
 }
-

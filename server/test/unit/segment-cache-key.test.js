@@ -34,3 +34,17 @@ test("cache paths remain inside the configured root", () => {
   assert.match(paths.dataPath, /^\/tmp\/drive-in-segment-test\/[a-f0-9]{64}\.dat$/);
   assert.match(paths.metaPath, /^\/tmp\/drive-in-segment-test\/[a-f0-9]{64}\.meta$/);
 });
+
+test("generic HLS cache identities include origin, query, and exact byte range", () => {
+  const variants = [
+    ["https://a.test/seg0.ts?video=a", ""],
+    ["https://b.test/seg0.ts?video=a", ""],
+    ["https://a.test/seg0.ts?video=b", ""],
+    ["https://a.test/seg0.ts?video=a", "bytes=0-99"],
+    ["https://a.test/seg0.ts?video=a", "bytes=100-199"],
+    ["https://a.test/seg0.ts?video=a", "bytes=-100"],
+  ];
+  const keys = variants.map((args) => computeSegmentCacheKey(...args).filenameKey);
+  assert.equal(new Set(keys).size, variants.length);
+  assert.equal(computeSegmentCacheKey(...variants[0]).filenameKey, keys[0]);
+});

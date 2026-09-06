@@ -100,6 +100,9 @@ export function setSeekTransitionPending(pending) {
   progressWrap.classList.toggle("seeking", isPending);
   if (isPending) progressWrap.setAttribute("aria-busy", "true");
   else progressWrap.removeAttribute("aria-busy");
+  // A seek transition owns the progress indicator; clear any spinner left by
+  // the previous player's startup or underrun before it is disposed.
+  if (isPending) hideBuffering();
   if (isPending || wasPending) showControls();
 }
 

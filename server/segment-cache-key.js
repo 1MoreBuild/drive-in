@@ -63,17 +63,8 @@ export function computeSegmentCacheKey(upstreamUrl, rangeHeader = "", cacheConte
     };
   }
 
-  const hlsPath = urlInfo.pathname || cacheContext?.registeredUrlPathname || cacheContext?.originalUrlPathname || "";
-  if (hlsPath.toLowerCase().endsWith(".ts")) {
-    const logicalKey = `hls:${sha256Hex(hlsPath)}`;
-    return {
-      kind: "logical",
-      sourceType: "hls",
-      logicalKey,
-      filenameKey: sha256Hex(logicalKey),
-    };
-  }
-
+  // Generic HLS paths are not content identities: origin, query and Range
+  // must stay distinct. This also avoids reusing the old pathname-only keys.
   const fallbackHash = sha256Hex(`${upstreamUrl}\n${rangeHeader || ""}`);
   return {
     kind: "hash",

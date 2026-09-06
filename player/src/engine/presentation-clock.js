@@ -50,6 +50,14 @@ export class PresentationClock {
     this.sampleRate = sampleRate;
   }
 
+  useWallClock() {
+    if (!this.audioRing) return;
+    const mediaTime = this.currentTime;
+    this.audioRing = null;
+    this.sampleRate = 0;
+    this.reset(mediaTime);
+  }
+
   reset(mediaTime) {
     this.baseMediaTime = mediaTime;
     this.wallElapsed = 0;

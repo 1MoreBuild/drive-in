@@ -9,6 +9,12 @@ export { parseVTT } from "./subtitle-cues.js";
 const subtitleOverlay = document.getElementById("subtitle-overlay");
 let subtitleTracks = []; // [{ lang, cues }]
 let lastRenderedSubtitle = "";
+const pendingTracks = new Map();
+
+function cancelPendingTrack(lang) {
+  pendingTracks.get(lang)?.abort();
+  pendingTracks.delete(lang);
+}
 
 function clearSubtitleOverlay() {
   if (!lastRenderedSubtitle && !subtitleOverlay.hasChildNodes()) return;
@@ -53,15 +59,19 @@ export function renderSubtitle(time) {
 }
 
 export async function loadSubtitleTrack(lang, url) {
+  cancelPendingTrack(lang);
+  const controller = new AbortController();
+  pendingTracks.set(lang, controller);
   try {
     const absUrl = url.startsWith("/") ? `${location.origin}${url}` : url;
     const existingTrack = subtitleTracks.find((track) => track.lang === lang && track.url === absUrl);
-    if (existingTrack) return;
-    const resp = await requestText(absUrl, {}, {
+    if (existingTrack) return true;
+    const resp = await requestText(absUrl, { signal: controller.signal }, {
       label: "Subtitle",
       timeoutMs: 20_000,
       maxBytes: 20 * 1024 * 1024,
     });
+    if (pendingTracks.get(lang) !== controller) return null;
     if (!resp.ok) throw new Error(`Subtitle fetch failed with ${resp.status}`);
     const cues = parseVTT(resp.text);
     subtitleTracks = subtitleTracks.filter((t) => t.lang !== lang);
@@ -71,17 +81,22 @@ export async function loadSubtitleTrack(lang, url) {
     console.log(`[subs] Loaded ${cues.length} cues for ${lang}`);
     return true;
   } catch (e) {
+    if (controller.signal.aborted) return null;
     console.error("[subs] Failed to load subtitle:", e);
     return false;
+  } finally {
+    if (pendingTracks.get(lang) === controller) pendingTracks.delete(lang);
   }
 }
 
 export function disableExternalSubtitle() {
+  for (const lang of pendingTracks.keys()) cancelPendingTrack(lang);
   subtitleTracks = [];
   clearSubtitleOverlay();
 }
 
 export function removeSubtitleTrack(lang) {
+  cancelPendingTrack(lang);
   subtitleTracks = subtitleTracks.filter((t) => t.lang !== lang);
   if (!subtitleTracks.length) {
     clearSubtitleOverlay();

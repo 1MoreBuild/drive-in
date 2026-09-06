@@ -58,6 +58,25 @@ test("PGS remains a Plex burn-in subtitle", () => {
   assert.equal(subtitle.url, undefined);
 });
 
+test("remote embedded subtitle paths are mutable and fall back to burn-in", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "drive-in-remote-subtitle-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const [stream] = plexSubtitleStreamsForPart({
+    file: join(dir, "not-mounted", "movie.mkv"),
+    Stream: [{ id: 10, index: 2, codec: "ass", streamType: 3 }],
+  });
+  const first = await plexSubtitleVersionInfo(stream, { now: 0 });
+  const later = await plexSubtitleVersionInfo(stream, { now: 3_600_000 });
+  assert.equal(first.immutable, false);
+  assert.equal(first.sourceAvailable, false);
+  assert.notEqual(first.token, later.token);
+  const descriptor = describePlexSubtitle("remote", stream, null, {
+    versionToken: first.token, externalAvailable: first.sourceAvailable,
+  });
+  assert.equal(descriptor.delivery, "burn");
+  assert.equal(descriptor.url, undefined);
+});
+
 test("UTF-8 BOM is removed before subtitle conversion", () => {
   const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("中文", "utf8")]);
   assert.equal(decodeSubtitleBuffer(bytes), "中文");

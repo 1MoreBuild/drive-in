@@ -35,7 +35,7 @@ async function localSubtitleStats(stream) {
     const stats = await stat(path, { bigint: true });
     return stats.isFile() ? stats : null;
   } catch (error) {
-    if (error.code === "ENOENT") return null;
+    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) return null;
     throw error;
   }
 }
@@ -49,11 +49,18 @@ export async function plexSubtitleVersionInfo(stream, { now = Date.now() } = {})
     stream?.updatedAt,
   ];
   const stats = await localSubtitleStats(stream);
+  let sourceStats = null;
+  if (!stats && isEmbeddedPlexTextSubtitle(stream)) {
+    try {
+      const candidate = await stat(stream.sourceFile, { bigint: true });
+      if (candidate.isFile()) sourceStats = candidate;
+    } catch (error) {
+      if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) throw error;
+    }
+  }
   if (stats) {
     parts.push(stream.file, stats.size, stats.mtimeNs);
-  } else if (isEmbeddedPlexTextSubtitle(stream)) {
-    const sourceStats = await stat(stream.sourceFile, { bigint: true });
-    if (!sourceStats.isFile()) throw new Error("Embedded subtitle source is not a file");
+  } else if (sourceStats) {
     parts.push("embedded", stream.sourceFile, stream.sourceStreamIndex, sourceStats.size, sourceStats.mtimeNs);
   } else {
     // Plex does not reliably expose validators for every remote/embedded text
@@ -62,7 +69,8 @@ export async function plexSubtitleVersionInfo(stream, { now = Date.now() } = {})
   }
   return {
     token: createHash("sha256").update(parts.map(String).join("\0")).digest("hex").slice(0, 16),
-    immutable: !!stats || isEmbeddedPlexTextSubtitle(stream),
+    immutable: !!stats || !!sourceStats,
+    sourceAvailable: !!sourceStats,
   };
 }
 
@@ -542,6 +550,7 @@ function inferTextLanguage(text) {
 export function describePlexSubtitle(ratingKey, stream, buffer = null, {
   versionToken = null,
   inferredLanguage = null,
+  externalAvailable = true,
 } = {}) {
   const codec = String(stream?.codec || stream?.format || "").toLowerCase();
   const textSubtitle = isPlexTextSubtitle(stream);
@@ -574,8 +583,8 @@ export function describePlexSubtitle(ratingKey, stream, buffer = null, {
     languageCode,
     title: isUnknownLabel(originalTitle) ? displayTitle : originalTitle,
     displayTitle,
-    delivery: textSubtitle ? "external" : "burn",
-    ...(textSubtitle && versionToken ? { url: `/api/plex/subtitle/${ratingKey}/${stream.id}?v=${versionToken}` } : {}),
+    delivery: textSubtitle && externalAvailable ? "external" : "burn",
+    ...(textSubtitle && externalAvailable && versionToken ? { url: `/api/plex/subtitle/${ratingKey}/${stream.id}?v=${versionToken}` } : {}),
   };
 }
 

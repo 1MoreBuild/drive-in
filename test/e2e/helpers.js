@@ -18,17 +18,24 @@ function withTimeout(promise, label, timeoutMs = 5_000) {
   ]).finally(() => clearTimeout(timer));
 }
 
-export async function startDriveInServer(t) {
+export async function startDriveInServer(t, env = {}) {
   const runtimeDir = await mkdtemp(resolve(tmpdir(), "drive-in-e2e-"));
   const child = fork(resolve(projectRoot, "server/index.js"), [], {
     cwd: projectRoot,
     env: {
       ...process.env,
+      DRIVEIN_ENV_FILE: "",
       DRIVEIN_RUNTIME_DIR: runtimeDir,
+      DRIVEIN_DB: resolve(runtimeDir, ".drive-in.sqlite"),
+      PLEX_URL: "http://127.0.0.1:1",
+      PLEX_TOKEN: "e2e-fixture-token",
+      YTDLP_COOKIES_FILE: "",
+      YTDLP_COOKIES_FROM_BROWSER: "",
       LOG_LEVEL: "silent",
       NODE_ENV: "test",
       PORT: "0",
       SERVE_SOURCE: "1",
+      ...env,
     },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });

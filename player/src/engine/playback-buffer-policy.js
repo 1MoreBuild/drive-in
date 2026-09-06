@@ -7,6 +7,7 @@ export function hasHlsStartupBuffer({
 }) {
   if (!decodedReady) return false;
   if (!network) return true;
+  if (network.allRemainingSegmentsCached === true) return true;
   if (!network.activePlaylistCount) {
     return ![
       network.pendingSegments,

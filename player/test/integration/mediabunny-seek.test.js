@@ -25,7 +25,10 @@ function createRestartHarness(oldIterator) {
     firstVideoRendered: true,
     iteratorCloseTimeoutCount: 0,
     hlsSegmentPrefetcher: null,
-    clock: { reset: (time) => { player.resetTime = time; } },
+    clock: {
+      useAudioRing: (ring, sampleRate) => { player.clockSource = { ring, sampleRate }; },
+      reset: (time) => { player.resetTime = time; },
+    },
   });
   player.createdTargets = [];
   player.startedProducers = [];
@@ -63,6 +66,7 @@ test("rapid producer restarts publish only the latest seek", async () => {
   assert.equal(closeCount, 1);
   assert.deepEqual(player.createdTargets, [20]);
   assert.equal(player.resetTime, 20);
+  assert.deepEqual(player.clockSource, { ring: null, sampleRate: 0 });
   assert.equal(player.startedProducers.length, 1);
 });
 

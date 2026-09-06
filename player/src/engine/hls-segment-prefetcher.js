@@ -239,6 +239,7 @@ export class HlsSegmentPrefetcher {
 
   updatePlaylist(body, playlistUrl) {
     const segments = [];
+    const ended = /^#EXT-X-ENDLIST\s*$/m.test(body);
     let pendingDuration = null;
     let liveDvrStartTime = null;
     let liveEdgeTime = null;
@@ -284,6 +285,7 @@ export class HlsSegmentPrefetcher {
         && segment.duration === previous.segments[index]?.duration
       ));
     if (unchanged) {
+      previous.ended = ended;
       previous.liveDvrStartTime = liveDvrStartTime;
       previous.liveEdgeTime = liveEdgeTime;
       previous.livePlayStartTime = livePlayStartTime;
@@ -312,6 +314,7 @@ export class HlsSegmentPrefetcher {
     const playlist = {
       url: playlistUrl,
       segments,
+      ended,
       currentUrl: previous?.currentUrl || null,
       currentIndex: previous?.currentUrl ? nextIndexes.get(previous.currentUrl) ?? -1 : -1,
       liveDvrStartTime,
@@ -594,6 +597,11 @@ export class HlsSegmentPrefetcher {
       return {
         playlistUrl: playlist.url,
         currentIndex: playlist.currentIndex,
+        // Count the current segment here, not in the forward-buffer metric.
+        // An ENDLIST tail needs no more network runway once all bytes exist.
+        remainingCached: playlist.ended && playlist.segments
+          .slice(playlist.currentIndex)
+          .every((segment) => this.segmentCache.has(segment.url)),
         bufferedAheadSeconds,
         readySegments,
         pendingSegments,
@@ -639,6 +647,8 @@ export class HlsSegmentPrefetcher {
       throughputKbps: throughputBps ? Math.round(throughputBps / 1000) : 0,
       sampleCount: this.throughputSamples.length,
       bufferedAheadSeconds,
+      allRemainingSegmentsCached: playlistStats.length > 0
+        && playlistStats.every((stats) => stats.remainingCached),
       readySegments,
       pendingSegments,
       activeDownloads,

@@ -1,3 +1,4 @@
+import "./environment.js";
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
@@ -37,6 +38,9 @@ import {
   saveHistoryFile,
 } from "./history-store.js";
 import { metadataArgs } from "./url-metadata.js";
+import { ytdlpCookieArgs } from "./ytdlp-options.js";
+import { downloadSubtitlesDirect } from "./url-subtitles.js";
+import { rewriteHlsUris, rewriteTranscodePlaylist } from "./hls-manifest.js";
 import { PlaybackCoordinator, isPlaybackSuperseded } from "./playback-coordinator.js";
 import { fetchPublicImage, MAX_THUMBNAIL_BYTES, resolveSubtitleFile, SafeFetchError } from "./security.js";
 import {
@@ -481,8 +485,8 @@ function updateState(patch) {
 
 // --- yt-dlp resolver -------------------------------------------------
 
-// Common yt-dlp flags — use browser cookies to avoid 429 rate limiting
-const YTDLP_COMMON = ["--cookies-from-browser", "chrome"];
+// Public sources work without a desktop browser. Authentication is opt-in.
+const YTDLP_COMMON = ytdlpCookieArgs();
 
 function ytdlpJson(url, { targetHeight = 720, signal } = {}) {
   return new Promise((resolve, reject) => {
@@ -769,7 +773,15 @@ function isTranscodeStartupReady(dir) {
   const playlistPath = resolve(dir, "playlist.m3u8");
   const initPath = resolve(dir, "init.mp4");
   if (!existsSync(playlistPath) || !existsSync(initPath)) return false;
-  return countTranscodeSegments(dir) >= 2;
+  const count = countTranscodeSegments(dir);
+  if (count >= 2) return true;
+  // A fully generated short VOD may contain only one segment. Waiting for a
+  // second segment can never succeed once FFmpeg has written ENDLIST.
+  if (count === 1) {
+    try { return /^#EXT-X-ENDLIST\s*$/m.test(readFileSync(playlistPath, "utf8")); }
+    catch { return false; }
+  }
+  return false;
 }
 
 async function waitForTranscodePlaylist(playlistPath, { timeoutMs = DASH_TRANSCODE_STARTUP_TIMEOUT_MS, pollMs = 120 } = {}) {
@@ -1035,94 +1047,6 @@ function getCachedSubs(url) {
 
 // --- Subtitle download (direct fetch from URLs in yt-dlp JSON) ------
 
-async function downloadSubtitlesDirect(subtitleList, destDir) {
-  mkdirSync(destDir, { recursive: true });
-  const results = [];
-  for (const sub of subtitleList) {
-    try {
-      let content;
-
-      if (sub.data) {
-        // Inline data (Bilibili etc) — already converted to VTT
-        content = sub.data;
-      } else if (sub.url) {
-        const fetchedSubtitle = await fetchTextWithRetry(sub.url, {}, {
-          retries: 2,
-          label: `subtitle-${sub.lang}`,
-          timeoutMs: 30_000,
-          maxBytes: MAX_PLEX_SUBTITLE_BYTES,
-        });
-        const resp = fetchedSubtitle.response;
-        if (!resp.ok) {
-          log.warn({ lang: sub.lang, status: resp.status }, "Subtitle fetch failed");
-          continue;
-        }
-        content = fetchedSubtitle.body;
-
-        // YouTube returns HLS playlist for long videos — fetch all segments
-        if (content.startsWith("#EXTM3U")) {
-          const segUrls = content.split("\n").filter((l) => l.startsWith("http"));
-          const parts = [];
-          let combinedBytes = 0;
-          for (const segUrl of segUrls) {
-            const fetchedSegment = await fetchTextWithRetry(segUrl, {}, {
-              retries: 2,
-              label: `subtitle-segment-${sub.lang}`,
-              timeoutMs: 30_000,
-              maxBytes: MAX_PLEX_SUBTITLE_BYTES,
-            });
-            if (fetchedSegment.response.ok) {
-              combinedBytes += Buffer.byteLength(fetchedSegment.body);
-              if (combinedBytes > MAX_PLEX_SUBTITLE_BYTES) {
-                throw new Error("Combined subtitle segments are larger than 20 MiB");
-              }
-              parts.push(fetchedSegment.body);
-            }
-          }
-          content = parts.map((p, i) => {
-            if (i === 0) return p;
-            return p.replace(/^WEBVTT[\s\S]*?\n\n/, "");
-          }).join("\n");
-        }
-
-        // SRT → VTT conversion
-        if (sub.ext === "srt" && !content.startsWith("WEBVTT")) {
-          content = srtToVtt(content);
-        }
-      } else {
-        continue;
-      }
-
-      if (!content.includes("-->")) {
-        log.warn({ lang: sub.lang }, "No valid subtitle cues");
-        continue;
-      }
-
-      // Clean VTT: strip cue tags (<c>, timestamp tags) and decode HTML entities
-      content = content
-        .replace(/<\/?c[^>]*>/g, "")
-        .replace(/<[\d:.]+>/g, "")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
-
-      const safeLanguage = String(sub.lang || "unknown")
-        .normalize("NFKC")
-        .replace(/[^A-Za-z0-9._-]+/g, "_")
-        .replace(/^[_\-.]+|[_\-.]+$/g, "")
-        .slice(0, 120) || "unknown";
-      const filename = `sub_${safeLanguage}.vtt`;
-      writeFileSync(resolve(destDir, filename), content);
-      results.push({ lang: sub.lang, name: sub.name, auto: sub.auto, filename });
-    } catch (e) {
-      log.error({ lang: sub.lang, err: e.message }, "Subtitle fetch error");
-    }
-  }
-  return results;
-}
 
 // Serve subtitle VTT files from cache or session dir
 app.get("/api/subs/:key/:filename", (req, res) => {
@@ -1163,21 +1087,6 @@ app.post("/api/subtitles/select", (req, res) => {
   sendToPlayer({ type: "subtitleSelect", url, lang: sub.lang, name: sub.name });
   res.json({ ok: true, lang: sub.lang, name: sub.name, url });
 });
-
-function rewriteTranscodePlaylist(body) {
-  const manifestBasePath = "/api/transcode";
-  return body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return match;
-    if (/^https?:\/\//i.test(trimmed)) {
-      return trimmed;
-    }
-    const segmentName = trimmed.split("?")[0];
-    if (!segmentName) return match;
-    const safeSegmentName = segmentName.replace(/[\\/]+/g, "").replace(/^\.+/g, "");
-    return `${manifestBasePath}/segment?name=${encodeURIComponent(safeSegmentName)}`;
-  });
-}
 
 app.get("/api/transcode/playlist.m3u8", async (req, res) => {
   const session = getTranscodeSession();
@@ -1224,7 +1133,7 @@ const dashHlsSessions = new Map();
 // Probe MP4 structure: find init segment end, parse sidx for segment byte ranges
 async function probeMP4Structure(proxyId) {
   const response = await fetchWithRetry(
-    `http://localhost:${PORT}/api/proxy?id=${proxyId}`,
+    `http://localhost:${server.address().port}/api/proxy?id=${proxyId}`,
     { headers: { Range: "bytes=0-131071" } },
     { retries: 3, label: "dash-probe" },
   );
@@ -2452,16 +2361,9 @@ app.get("/api/proxy/hls", async (req, res) => {
       // URI attributes live inside tags such as EXT-X-MAP, EXT-X-KEY, and
       // EXT-X-MEDIA. Leaving them untouched makes the browser resolve them
       // relative to /api/proxy/hls instead of the upstream playlist.
-      body = body.replace(/URI="([^"]+)"/g, (match, resourceUrl) => {
-        return `URI="${proxyHlsResourceUrl(resourceUrl, baseUrl, entry.headers, childMeta)}"`;
-      });
-
-      // Rewrite each non-comment, non-empty line.
-      body = body.replace(/^(?!#)(\S+.*)$/gm, (match, line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return match;
-        return proxyHlsResourceUrl(trimmed, baseUrl, entry.headers, childMeta);
-      });
+      body = rewriteHlsUris(body, (uri) => (
+        proxyHlsResourceUrl(uri, baseUrl, entry.headers, childMeta)
+      ));
     }
 
     recordProxyMetricBytes(metric, Buffer.byteLength(body));
@@ -2531,6 +2433,7 @@ async function listPlexSubtitles(ratingKey, streams) {
       const descriptor = describePlexSubtitle(ratingKey, stream, null, {
         versionToken: versionInfo.token,
         inferredLanguage,
+        externalAvailable: !isEmbeddedPlexTextSubtitle(stream) || versionInfo.sourceAvailable,
       });
       rememberPlexSubtitleDescriptor(descriptorKey, descriptor);
       return descriptor;
@@ -3040,6 +2943,11 @@ async function playPlexNow({
     err.status = 400;
     throw err;
   }
+  if (offset != null && (typeof offset !== "number" || !Number.isFinite(offset) || offset < 0)) {
+    const err = new Error("offset must be a finite non-negative number in milliseconds");
+    err.status = 400;
+    throw err;
+  }
   if (!PLEX_TOKEN) {
     const err = new Error("Plex token not configured");
     err.status = 503;
@@ -3162,7 +3070,7 @@ async function playPlexNow({
   playbackRequest.assertCurrent();
 
   // Resume position: offset (from client, in ms) or viewOffset (from Plex, in ms)
-  const resumeMs = offset || meta.viewOffset || 0;
+  const resumeMs = offset ?? meta.viewOffset ?? 0;
   const resumeSec = resumeMs ? Math.floor(resumeMs / 1000) : 0;
   const playerUrl = await plexTranscodeUrl(ratingKey, {
     subtitleStreamID: burnSubtitleStreamID,
@@ -3688,7 +3596,7 @@ async function playUrlNow({
         return wantedPrefixes.includes(base);
       });
       // Direct fetch from URLs already in yt-dlp JSON — no second yt-dlp call
-      downloadSubtitlesDirect(selected, subsDir).then((downloaded) => {
+      downloadSubtitlesDirect(selected, subsDir, { log }).then((downloaded) => {
         try { playbackRequest.assertCurrent(); } catch { return; }
         log.info({ cacheKey, count: downloaded.length }, "Subtitles cached");
         broadcastSubs(downloaded, cacheKey);
@@ -3801,7 +3709,12 @@ app.post("/api/control", async (req, res) => {
   }
 
   if (action === "stop") {
-    await stopServerPlayback("control-stop");
+    const cleanup = stopServerPlayback("control-stop");
+    // Broadcast the stop intent before awaiting cleanup. A later play must
+    // never receive this older stop when a slow Plex shutdown completes.
+    sendToPlayer({ type: "stop" });
+    await cleanup;
+    return res.json({ ok: true, status: state.status });
   }
 
   if (!playerWs || playerWs.readyState !== 1) {

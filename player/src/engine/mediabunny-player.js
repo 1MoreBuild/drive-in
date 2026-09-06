@@ -336,6 +336,8 @@ export class MediabunnyPlayer {
       this.videoEnded = !this.videoTrack;
       this.audioEnded = !this.audioTrack;
       this.audioRing?.reset();
+      // Seeking may return from a silent video tail to an active audio track.
+      this.clock.useAudioRing(this.audioRing, this.audioContext?.sampleRate || 0);
       this.clock.reset(mediaTime);
       this.lastRenderedTimestamp = mediaTime;
       this.firstVideoRendered = false;
@@ -394,6 +396,7 @@ export class MediabunnyPlayer {
         if (generation !== this.generation || this.destroyed) return;
         if (result.done) {
           this.audioEnded = true;
+          this.audioRing.markEnded();
           return;
         }
 
@@ -500,6 +503,11 @@ export class MediabunnyPlayer {
     if (this.destroyed) return;
     this.animationFrame = requestAnimationFrame(this.renderFrame);
 
+    // EOF is distinct from a temporary underrun: after the last audio frame
+    // drains, video must keep advancing until its own end (also while muted).
+    if (this.audioEnded && this.audioRing?.availableFrames === 0) {
+      this.clock.useWallClock();
+    }
     const mediaTime = this.clock.currentTime;
     const videoPresentationTime = this.getVideoPresentationTime(mediaTime);
     this.maybeTriggerScheduledFault(mediaTime);
@@ -582,13 +590,13 @@ export class MediabunnyPlayer {
     const videoPresentationTime = this.getVideoPresentationTime(mediaTime);
     const audioReady = !this.audioTrack
       || this.audioSeconds >= AUDIO_START_SECONDS
-      || (this.audioEnded && this.audioRing.availableFrames > 0);
+      || this.audioEnded;
     const videoReady = !this.videoTrack
       || this.videoSecondsAhead(videoPresentationTime) >= VIDEO_START_SECONDS
       // A high-frame-rate stream can hit the strict memory cap before reaching
       // the time target. A full queue is still enough decoded work to start.
       || this.videoQueue.length >= this.videoQueueCapacity
-      || (this.videoEnded && this.videoQueue.length > 0);
+      || this.videoEnded;
     return audioReady && videoReady;
   }
 

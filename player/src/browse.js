@@ -144,8 +144,10 @@ function selectSubtitle(id) {
       state.plexInfo.activeSubtitleID = sub?.id || null;
       updateSubsUI();
       if (sub?.url) {
+        const plexInfo = state.plexInfo;
         loadSubtitleTrack(`plex:${sub.id}`, sub.url).then((loaded) => {
-          if (loaded) return;
+          if (loaded !== false || state.plexInfo !== plexInfo
+            || String(plexInfo.activeSubtitleID) !== String(sub.id)) return;
           showStatus("Text subtitle failed. Falling back to Plex burn-in...");
           requestPlexPlayback({
             ratingKey: state.plexInfo.ratingKey,

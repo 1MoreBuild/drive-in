@@ -42,6 +42,8 @@ brew install yt-dlp ffmpeg deno
 
 ## Run locally
 
+Drive-In runs directly on Node.js. Install the media tools listed above on the same host.
+
 ```bash
 git clone https://github.com/1MoreBuild/drive-in.git
 cd drive-in
@@ -91,23 +93,13 @@ The server sets the cross-origin isolation headers required by its SharedArrayBu
 
 Drive-In does not authenticate HTTP, WebSocket, or proxy requests. Never expose it directly to the public internet. Put tunnels behind Cloudflare Access, a VPN, or another trusted access layer.
 
-## Docker
-
-```bash
-docker build -t drive-in .
-docker run -p 9090:9090 --env-file .env drive-in
-```
-
-Or:
-
-```bash
-cp .env.example .env
-docker compose up
-```
-
 ## Configuration
 
 Copy [`.env.example`](.env.example) and edit the values you need. It documents Plex, bitrate, cache, port, logging, database, and fallback-transcode settings.
+
+The server loads the repository's `.env` before initializing logging and storage, regardless of its working directory. Exported environment variables take precedence. Set `DRIVEIN_ENV_FILE` to use another file, or to an empty value to disable file loading.
+
+yt-dlp runs anonymously by default. If a source needs login or browser cookies, set `YTDLP_COOKIES_FROM_BROWSER=chrome` (or another yt-dlp browser/profile specification), or set `YTDLP_COOKIES_FILE` to a Netscape-format cookies file. The file option takes precedence. Keep cookies outside Git and protect them like passwords.
 
 CLI server selection follows this order: `--server`, `DRIVEIN_SERVER`, the CLI config file, then `http://localhost:9090`.
 

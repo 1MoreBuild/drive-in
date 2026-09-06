@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { hasHlsStartupBuffer } from "../../src/engine/playback-buffer-policy.js";
+import { HlsSegmentPrefetcher } from "../../src/engine/hls-segment-prefetcher.js";
 
 const registeredPlaylist = (bufferedAheadSeconds, pendingSegments = 1) => ({
   activePlaylistCount: 2,
@@ -66,4 +67,21 @@ test("low-latency live playback honors its explicit two-second target", () => {
     network: registeredPlaylist(2),
     requiredStartSeconds: 2,
   }), true);
+});
+
+test("a fully downloaded ENDLIST tail can start without a future segment", async (t) => {
+  const prefetcher = new HlsSegmentPrefetcher({ fetchImpl: async () => new Response("media") });
+  t.after(() => prefetcher.destroy());
+  const manifest = '#EXTM3U\n#EXTINF:4,\nseg0.m4s\n';
+  prefetcher.updatePlaylist(manifest, "https://fixture.test/short.m3u8");
+  await prefetcher.fetch("https://fixture.test/seg0.m4s");
+  assert.equal(prefetcher.getStats().allRemainingSegmentsCached, false);
+  assert.equal(hasHlsStartupBuffer({ decodedReady: true, network: prefetcher.getStats(), duration: 4 }), false);
+  // An unchanged segment list can become finite on the final playlist update.
+  prefetcher.updatePlaylist(`${manifest}#EXT-X-ENDLIST\n`, "https://fixture.test/short.m3u8");
+  const network = prefetcher.getStats();
+  assert.equal(network.bufferedAheadSeconds, 0);
+  assert.equal(network.allRemainingSegmentsCached, true);
+  assert.equal(hasHlsStartupBuffer({ decodedReady: true, network, duration: 4 }), true);
+  assert.equal(hasHlsStartupBuffer({ decodedReady: false, network, duration: 4 }), false);
 });

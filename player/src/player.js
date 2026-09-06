@@ -299,20 +299,21 @@ function markPlaybackStable(player) {
 
 function confirmPlaybackRecovery(player, currentTime) {
   const pending = playbackRecoveryState.pendingConfirmation;
-  if (!pending || state.player !== player) return false;
+  if (!pending || state.player !== player || player === pending.previousPlayer) return false;
   const status = player.getStatus?.();
-  if (status !== "playing") return false;
+  const pausedReady = state.playbackIntent === "paused" && status === "paused";
+  if (!pausedReady && status !== "playing") return false;
   const stats = summarizePlayerStats(player);
   const hasVideo = Boolean(stats?.videoCodec);
   const presentationTime = hasVideo
     ? Number(stats?.videoCurrentTimeMs) / 1000
     : currentTime;
   if (!Number.isFinite(presentationTime)) return false;
-  if (!Number.isFinite(pending.baselineTime)) {
+  if (!pausedReady && !Number.isFinite(pending.baselineTime)) {
     pending.baselineTime = presentationTime;
     return false;
   }
-  if (!hasRecoveryPlaybackProgress({
+  if (!pausedReady && !hasRecoveryPlaybackProgress({
     status,
     baselineTime: pending.baselineTime,
     currentTime: presentationTime,
@@ -332,11 +333,12 @@ function confirmPlaybackRecovery(player, currentTime) {
     currentTime,
     presentationTime,
   });
-  markPlaybackStable(player);
+  if (pausedReady) playbackRecoveryState.attempts = 0;
+  else markPlaybackStable(player);
   return true;
 }
 
-function armPlaybackRecoveryConfirmation(attempt, startTime) {
+function armPlaybackRecoveryConfirmation(attempt, startTime, previousPlayer) {
   if (playbackRecoveryState.confirmationTimer) {
     clearTimeout(playbackRecoveryState.confirmationTimer);
   }
@@ -344,6 +346,7 @@ function armPlaybackRecoveryConfirmation(attempt, startTime) {
     attempt,
     startTime,
     baselineTime: null,
+    previousPlayer,
   };
   playbackRecoveryState.confirmationTimer = setTimeout(() => {
     playbackRecoveryState.confirmationTimer = null;
@@ -441,7 +444,7 @@ function schedulePlaybackRecovery(player, error, { startTime: requestedStartTime
     if (!request) return;
     try {
       if (await requestFreshPlaybackSession(request, startTime)) {
-        armPlaybackRecoveryConfirmation(attempt, startTime);
+        armPlaybackRecoveryConfirmation(attempt, startTime, player);
         return;
       }
       await play(request.url, request.title, {
@@ -2000,6 +2003,7 @@ function createMediabunnyPlayer(meta) {
         state.isPlaying = false;
         updatePlayButton();
         updateMediaSession();
+        confirmPlaybackRecovery(player, getReportedCurrentTime(player));
       }
       postPlayerRuntimeLog("mediabunny_state", {
         state: nextState,
@@ -2135,6 +2139,7 @@ export async function play(url, title, meta = {}) {
     completeOptimisticSeekTransition({ immediate: true });
   }
   const playbackSessionId = playbackGeneration.begin();
+  disableExternalSubtitle();
   clearSeekWatchdog();
   const isCurrentPlayback = () => playbackGeneration.isCurrent(playbackSessionId);
   const isRecovery = meta.__recovery === true;
@@ -2177,7 +2182,6 @@ export async function play(url, title, meta = {}) {
     } else {
       container.innerHTML = "";
     }
-    disableExternalSubtitle();
     state.currentTime = meta.startTime || 0;
     state.isLive = Boolean(meta.isLive);
     state.liveDvrAvailable = Boolean(meta.liveDvr?.available);
@@ -2267,11 +2271,9 @@ export async function play(url, title, meta = {}) {
       }
     }
 
-    if (!state.audioUnlocked) {
-      player.setVolume(0);
-      state.isMuted = true;
-      updateVolumeButton();
-    }
+    if (!state.audioUnlocked) state.isMuted = true;
+    player.setVolume(state.isMuted ? 0 : 1);
+    updateVolumeButton();
 
     if (state.playbackIntent === "playing") {
       await player.play();
