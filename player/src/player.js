@@ -272,7 +272,9 @@ function startBandwidthDiagnosis(player, streamProfile) {
 }
 
 function isRecoverablePlaybackError(error) {
+  if (error?.code === "UPSTREAM_ACCESS_DENIED") return false;
   if ([
+    "PLEX_SESSION_EXPIRED",
     "HLS_SEGMENT_FETCH_FAILED",
     "HLS_SEGMENT_INACTIVITY",
     "SEEK_FAILED",

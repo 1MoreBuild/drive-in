@@ -9,7 +9,9 @@ function abortReason(signal, fallback) {
 }
 
 function isRetryableStatus(status) {
-  return status === 403 || status === 408 || status === 425 || status === 429 || status >= 500;
+  // Repeating a denied request with the same credentials/URL cannot repair it.
+  // Media proxies own the one-shot source refresh for 403 responses.
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 function wait(delayMs, signal) {

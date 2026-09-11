@@ -71,6 +71,7 @@ import {
 } from "./upstream-fetch.js";
 import { createSegmentCachePathResolver, snapshotProxyUrl } from "./segment-cache-key.js";
 import { rewritePlexHlsManifest as rewritePlexHlsManifestBody } from "./plex-hls.js";
+import { createPlexSessionProbe, expiredSessionResponse, openPlexSegment, plexSessionId } from "./plex-session-health.js";
 import { registerQueuePlaylistApi } from "./queue-playlist-api.js";
 import { buildDashHlsSession, parseMp4Structure } from "./dash-hls.js";
 import { pipelineToResponse } from "./response-pipeline.js";
@@ -101,7 +102,6 @@ const MAX_PLEX_SUBTITLE_BYTES = 20 * 1024 * 1024;
 // Long YouTube VOD manifests repeat signed URLs for every segment. Keep a
 // route-specific safety bound without applying the generic 4 MiB text limit.
 const MAX_HLS_PLAYLIST_BYTES = 16 * 1024 * 1024;
-const PLEX_SEGMENT_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000, 3000, 4000, 5000];
 const PROXY_TTL_MS = 3600_000;
 const PROXY_REFRESH_SKEW_MS = 5 * 60_000;
 const SEGMENT_CACHE_DIR = runtimePath(".segment-cache");
@@ -1286,7 +1286,7 @@ app.get("/api/dash/:mapId/:segment", async (req, res) => {
   } catch (e) {
     if (metric) metric.error = e.message || String(e);
     if (!res.headersSent && !(isAbortLikeError(e) && (req.destroyed || res.destroyed))) {
-      res.status(502).json({ error: e.message });
+      res.status(e.code === "UPSTREAM_ACCESS_DENIED" ? 403 : 502).json({ error: e.message, code: e.code });
     }
   }
 });
@@ -1396,10 +1396,21 @@ async function reResolveProxy(proxyId) {
   const entry = proxyMap.get(proxyId);
   if (!entry?.originalUrl) return false;
 
-  // Deduplicate concurrent re-resolves for same URL
-  if (reResolveInProgress.has(entry.originalUrl)) {
-    await reResolveInProgress.get(entry.originalUrl);
+  // Audio/video in one session share refresh work. Different sessions can
+  // select different formats and must not reuse each other's refresh result.
+  const refreshKey = entry.pairId || proxyId;
+  if (reResolveInProgress.has(refreshKey)) {
+    await reResolveInProgress.get(refreshKey);
     return true;
+  }
+
+  // A newly issued URL can still be denied (for example an obsolete YouTube
+  // client). Do not run yt-dlp once per segment while that condition persists.
+  const now = Date.now();
+  if (now - (entry.lastResolveAttemptAt || 0) < 30_000) return false;
+  entry.lastResolveAttemptAt = now;
+  for (const e of proxyMap.values()) {
+    if (entry.pairId && e.pairId === entry.pairId) e.lastResolveAttemptAt = now;
   }
 
   const promise = (async () => {
@@ -1422,8 +1433,8 @@ async function reResolveProxy(proxyId) {
     log.info("CDN URLs refreshed");
   })();
 
-  reResolveInProgress.set(entry.originalUrl, promise);
-  try { await promise; } finally { reResolveInProgress.delete(entry.originalUrl); }
+  reResolveInProgress.set(refreshKey, promise);
+  try { await promise; } finally { reResolveInProgress.delete(refreshKey); }
   return true;
 }
 
@@ -1827,7 +1838,9 @@ async function fetchDashSegmentBuffer(proxyId, rangeHeader, { label }) {
       });
       if (!proxied) throw new Error("Proxy expired");
       if (proxied.upstream.status !== 200 && proxied.upstream.status !== 206) {
-        throw new Error(`Unexpected DASH segment status ${proxied.upstream.status}`);
+        const error = new Error(`Unexpected DASH segment status ${proxied.upstream.status}`);
+        if (proxied.upstream.status === 403) error.code = "UPSTREAM_ACCESS_DENIED";
+        throw error;
       }
       const buffer = await readDashSegmentBody(proxied.upstream, expectedBytes);
       return { buffer, upstream: proxied.upstream, entry: proxied.entry };
@@ -1835,6 +1848,9 @@ async function fetchDashSegmentBuffer(proxyId, rangeHeader, { label }) {
       lastError = error;
       controller.abort(error);
       try { await proxied?.upstream?.body?.cancel?.(error); } catch {}
+      // fetchProxyUpstream already attempted a fresh source. Do not multiply
+      // its denied response through the outer integrity-retry loop.
+      if (error.code === "UPSTREAM_ACCESS_DENIED") break;
       if (error.code === "DASH_SEGMENT_INTEGRITY" || error.code === "DASH_SEGMENT_TIMEOUT") {
         segmentCacheState.integrityFailures += 1;
       }
@@ -2612,6 +2628,7 @@ async function plexTranscodeUrl(ratingKey, opts = {}) {
         advertisedBitrate,
         offsetSec: Number(opts.offsetSec) || 0,
       };
+      probePlexSession.invalidate();
       log.info({ session, videoBitrate: PLEX_VIDEO_BITRATE_KBPS, advertisedBitrate, bodyLength: body.length }, "[plex] start.m3u8 cached, transcode ready");
     } else {
       throw new Error(`Plex start.m3u8 failed with ${manifestRes.status}`);
@@ -2658,6 +2675,16 @@ function rewritePlexHlsManifest(body) {
   });
 }
 
+const probePlexSession = createPlexSessionProbe({ baseUrl: PLEX_URL, token: PLEX_TOKEN });
+
+app.get("/api/plex/session", async (_req, res) => {
+  const active = activePlexTranscode;
+  const health = active ? await probePlexSession(active.session) : "expired";
+  res.set("Cache-Control", "no-store");
+  res.json({ session: active?.session || null, ratingKey: active?.ratingKey || null,
+    health: active === activePlexTranscode ? health : "unknown" });
+});
+
 app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
   if (!plexHlsManifestUrl) return res.status(404).json({ error: "No active Plex transcode" });
   if (plexHlsManifestCache) {
@@ -2686,6 +2713,9 @@ app.get("/api/plex/hls/master.m3u8", async (_req, res) => {
 });
 
 app.use("/api/plex/hls/*path", async (req, res) => {
+  const disconnected = new AbortController();
+  const onClose = () => disconnected.abort(new Error("Plex client disconnected"));
+  res.once("close", onClose);
   const fullPath = req.originalUrl || (req.baseUrl + req.url) || req.url;
   const plexPath = fullPath.replace("/api/plex/hls/", "/video/:/transcode/universal/");
   const tokenizedPath = `${plexPath}${plexPath.includes("?") ? "&" : "?"}X-Plex-Token=${PLEX_TOKEN}`;
@@ -2698,11 +2728,16 @@ app.use("/api/plex/hls/*path", async (req, res) => {
       const startedAt = Date.now();
       const fetched = await fetchTextWithRetry(
         `${PLEX_URL}${tokenizedPath}`,
-        {},
-        { retries: 1, label: "plex-media-playlist" },
+        { signal: disconnected.signal },
+        { retries: 0, timeoutMs: 8000, responseTimeoutMs: 6000, label: "plex-media-playlist" },
       );
       const upstream = fetched.response;
       setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
+      if (upstream.status === 404 && await probePlexSession(plexSessionId(plexPath)) === "expired") {
+        const expired = expiredSessionResponse();
+        res.set(Object.fromEntries(expired.headers));
+        return res.status(expired.status).send(await expired.text());
+      }
       if (!upstream.ok) return res.status(upstream.status).json({ error: `Plex HLS ${upstream.status}` });
       const body = rewritePlexHlsManifest(fetched.body);
       recordProxyMetricBytes(metric, Buffer.byteLength(body));
@@ -2726,23 +2761,13 @@ app.use("/api/plex/hls/*path", async (req, res) => {
 
   let streamRequest = null;
   try {
-    let upstream;
-    for (let attempt = 0; attempt < PLEX_SEGMENT_RETRY_DELAYS_MS.length; attempt += 1) {
-      const delayMs = PLEX_SEGMENT_RETRY_DELAYS_MS[attempt];
-      if (delayMs) await sleep(delayMs);
-      streamRequest = await openUpstreamStream(upstreamUrl, {
-        headers: req.headers.range ? { Range: req.headers.range } : {},
-      }, {
-        label: "plex-hls-segment",
-        responseTimeoutMs: UPSTREAM_RESPONSE_TIMEOUT_MS,
-        inactivityTimeoutMs: DASH_SEGMENT_INACTIVITY_TIMEOUT_MS,
-      });
-      upstream = streamRequest.response;
-      if (upstream.status !== 404 || attempt === PLEX_SEGMENT_RETRY_DELAYS_MS.length - 1) break;
-      await upstream.body?.cancel?.().catch(() => {});
-      streamRequest.cleanup();
-      streamRequest = null;
-    }
+    streamRequest = await openPlexSegment(upstreamUrl, {
+      headers: req.headers.range ? { Range: req.headers.range } : {},
+      signal: disconnected.signal,
+      session: plexSessionId(plexPath),
+      probe: probePlexSession,
+    });
+    const upstream = streamRequest.response;
 
     setProxyMetricUpstream(metric, upstream, Date.now() - startedAt);
     const headersToCopy = [
@@ -2752,6 +2777,7 @@ app.use("/api/plex/hls/*path", async (req, res) => {
       "content-range",
       "content-type",
       "x-plex-protocol",
+      "x-drive-in-error-code",
     ];
     for (const header of headersToCopy) {
       const value = upstream.headers.get(header);

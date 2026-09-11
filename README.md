@@ -40,6 +40,12 @@ On macOS:
 brew install yt-dlp ffmpeg deno
 ```
 
+Keep yt-dlp current. For YouTube, use **2026.08.19 or newer**: older
+`ANDROID_VR` URLs can read the beginning of a video but return 403 when seeking
+further in. Refreshing those URLs does not repair the obsolete client.
+On Homebrew installations, run `brew upgrade yt-dlp` and resolve the video again.
+See the [upstream fix](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19).
+
 ## Run locally
 
 Drive-In runs directly on Node.js. Install the media tools listed above on the same host.
@@ -86,6 +92,10 @@ It also supports Plex, subtitles, audio tracks, queues, and playlists. Run `npx 
 Set `PLEX_URL` and `PLEX_TOKEN` in `.env`. On macOS, Drive-In can auto-detect a local Plex token when `PLEX_TOKEN` is unset.
 
 Plex transcodes video once at 720p and does not change bitrate during playback. This keeps the 210-second prefetch buffer intact. Plex also handles image-subtitle burn-in; Drive-In converts supported text subtitles to WebVTT and renders them in the browser.
+
+Expired Plex sessions are detected through Plex's transcode inventory and rebuilt
+at the current position, preserving track choices and playback intent. See
+[Plex session recovery](docs/plex-session-recovery.md) for ownership and retry budgets.
 
 ## Tesla and remote access
 

@@ -19,6 +19,13 @@ function segmentDownloadFailure() {
   return error;
 }
 
+function sessionExpiredError(response) {
+  if (response.status !== 410 || response.headers.get("X-Drive-In-Error-Code") !== "PLEX_SESSION_EXPIRED") return null;
+  const error = new Error("Plex playback session expired");
+  error.code = "PLEX_SESSION_EXPIRED";
+  return error;
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -90,6 +97,7 @@ export class HlsSegmentPrefetcher {
     fetchImpl = globalThis.fetch,
     baseUrl = globalThis.location?.href || "http://localhost/",
     logger = console,
+    onSessionExpired = () => {},
   } = {}) {
     this.ahead = ahead;
     this.targetAheadSeconds = targetAheadSeconds;
@@ -102,6 +110,7 @@ export class HlsSegmentPrefetcher {
     this.fetchImpl = fetchImpl;
     this.baseUrl = baseUrl;
     this.logger = logger;
+    this.onSessionExpired = onSessionExpired;
     this.playlists = new Map();
     this.segmentIndexes = new Map();
     // Completed media and in-flight work have different lifecycles. A seek
@@ -161,6 +170,8 @@ export class HlsSegmentPrefetcher {
           const body = new TextDecoder().decode(bytes);
           this.updatePlaylist(body, response.url || url);
         }
+        const expired = sessionExpiredError(response);
+        if (expired) throw expired;
         return bufferedResponse;
       } catch (error) {
         const reason = controller.signal.reason;
@@ -200,6 +211,8 @@ export class HlsSegmentPrefetcher {
       return responseFromCache(cached);
     }
 
+    if (playlist?.terminalError) throw playlist.terminalError;
+
     if (!job && segmentRef) {
       job = {
         url,
@@ -221,7 +234,7 @@ export class HlsSegmentPrefetcher {
       const downloaded = await job.promise;
       const completed = this.segmentCache.get(url) || downloaded;
       if (completed) return responseFromCache(completed);
-      throw segmentDownloadFailure();
+      throw job.terminalError || segmentDownloadFailure();
     }
   }
 
@@ -367,6 +380,7 @@ export class HlsSegmentPrefetcher {
     if (active >= this.maxConcurrent) return;
     const now = performance.now();
     const queued = [...this.jobs.values()]
+      .filter((entry) => !this.playlists.get(entry.playlistUrl)?.terminalError)
       .filter((entry) => entry.state === "queued" || (
         entry.state === "retry_wait" && (entry.retryAt || 0) <= now
       ))
@@ -417,6 +431,9 @@ export class HlsSegmentPrefetcher {
           lastAccessedAt: performance.now(),
         });
         this.jobs.delete(entry.url);
+      } else if (stillCurrent && entry.terminalError) {
+        entry.state = "failed";
+        this.failureCount += 1;
       } else if (stillCurrent) {
         entry.state = "retry_wait";
         entry.failureCycles = (entry.failureCycles || 0) + 1;
@@ -474,6 +491,21 @@ export class HlsSegmentPrefetcher {
         ]).finally(() => clearTimeout(headerTimer));
         if (generation !== this.generation || this.destroyed) return null;
         if (!response.ok) {
+          const expired = sessionExpiredError(response);
+          if (expired) {
+            entry.terminalError = expired;
+            const playlist = this.playlists.get(playlistUrl);
+            const alreadyReported = Boolean(playlist?.terminalError);
+            if (playlist) playlist.terminalError = expired;
+            if (!alreadyReported) this.onSessionExpired(expired);
+          }
+          if (response.status === 401 || response.status === 403) {
+            const error = new Error(`Video source denied access (HTTP ${response.status}). Reload after the source is repaired.`);
+            error.code = "UPSTREAM_ACCESS_DENIED";
+            entry.terminalError = error;
+            const playlist = this.playlists.get(playlistUrl);
+            if (playlist) playlist.terminalError = error;
+          }
           const retryable = response.status === 408
             || response.status === 425
             || response.status === 429
@@ -532,6 +564,7 @@ export class HlsSegmentPrefetcher {
     if (this.destroyed) return;
     const now = performance.now();
     const retryAt = [...this.jobs.values()]
+      .filter((entry) => !this.playlists.get(entry.playlistUrl)?.terminalError)
       .filter((entry) => entry.state === "retry_wait")
       .reduce((earliest, entry) => Math.min(earliest, entry.retryAt || now), Infinity);
     if (!Number.isFinite(retryAt)) {

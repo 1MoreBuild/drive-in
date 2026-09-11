@@ -6,6 +6,7 @@ import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSub
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
 import { requestJson } from "./network.js";
+import { buildFreshPlaybackSessionRequest } from "./playback-recovery.js";
 
 const btnAudio = document.getElementById("btn-audio");
 const audioPanel = document.getElementById("audio-panel");
@@ -241,7 +242,17 @@ async function restoreConnectedRoute({
     }
     return true;
   };
-  if (!forcePlaybackRestore && (state.player || state.isPlaying)) return;
+  if (!forcePlaybackRestore && (state.player || state.isPlaying)) {
+    if (route.view !== "player" || !route.plex) return;
+    const previousPlayer = state.player;
+    try {
+      const response = await requestJson("/api/plex/session", {}, { label: "Plex session health", timeoutMs: 4000 });
+      if (!routeIsCurrent() || state.player !== previousPlayer) return;
+      if (!response.ok || response.data?.health !== "expired") return;
+      if (response.data.ratingKey && String(response.data.ratingKey) !== String(route.plex)) return;
+      forcePlaybackRestore = true;
+    } catch { return; }
+  }
 
   // Page refresh on /play?url=... or /play?plex=... — re-trigger playback
   if (route.view === "player" && (route.url || route.plex)) {
@@ -254,10 +265,16 @@ async function restoreConnectedRoute({
       ? state.playbackIntent === "playing"
       : playbackSnapshot ? playbackSnapshot.playbackIntent === "playing" : true;
     showStatus(forcePlaybackRestore
-      ? "Restoring playback after server restart..."
+      ? "Restoring playback session..."
       : "Resuming playback...");
     const endpoint = route.plex ? "/api/plex/play" : "/api/play";
-    const body = route.plex
+    const localPlex = forcePlaybackRestore && route.plex
+      && String(state.plexInfo?.ratingKey) === String(route.plex);
+    const body = localPlex
+      ? buildFreshPlaybackSessionRequest({ meta: { plex: state.plexInfo } }, resumeTime, {
+          autoplay, recovery: true, reason: "session-restore",
+        }).body
+      : route.plex
       ? plexPlaybackRequest(route.plex, {
           ...(resumeTime > 0 ? { offset: resumeTime * 1000 } : {}),
           recovery: forcePlaybackRestore,

@@ -9,6 +9,65 @@ import {
   TEST_ORIGIN,
 } from "../helpers/hls-fixture.js";
 
+test("expired Plex prefetch reports once and stops the old playlist", async (t) => {
+  let requests = 0;
+  const reported = [];
+  const prefetcher = createPrefetcher({ maxConcurrent: 0,
+    onSessionExpired: (error) => reported.push(error.code),
+    fetchImpl: async () => { requests++; return new Response("expired", {
+      status: 410, headers: { "X-Drive-In-Error-Code": "PLEX_SESSION_EXPIRED" },
+    }); },
+  });
+  t.after(() => prefetcher.destroy());
+  const playlist = `${TEST_ORIGIN}old.m3u8`;
+  prefetcher.updatePlaylist(playlistBody([segment(0), segment(1)]), playlist);
+  const expired = (error) => error.code === "PLEX_SESSION_EXPIRED";
+  await assert.rejects(prefetcher.fetch(segment(0).url), expired);
+  await assert.rejects(prefetcher.fetch(segment(1).url), expired);
+  assert.equal(requests, 1);
+  assert.deepEqual(reported, ["PLEX_SESSION_EXPIRED"]);
+  assert.equal(prefetcher.retryTimer, null);
+});
+
+test("expired Plex manifest preserves the typed recovery error", async (t) => {
+  const prefetcher = createPrefetcher({ fetchImpl: async () => new Response("expired", {
+    status: 410, headers: { "X-Drive-In-Error-Code": "PLEX_SESSION_EXPIRED" },
+  }) });
+  t.after(() => prefetcher.destroy());
+  await assert.rejects(prefetcher.fetch(`${TEST_ORIGIN}old.m3u8`), (error) => error.code === "PLEX_SESSION_EXPIRED");
+});
+
+test("a denied segment stops retry cycles and further prefetch for that playlist", async (t) => {
+  let requests = 0;
+  const prefetcher = createPrefetcher({
+    maxConcurrent: 0,
+    retryBaseDelayMs: 1,
+    fetchImpl: async () => { requests += 1; return new Response("denied", { status: 403 }); },
+  });
+  t.after(() => prefetcher.destroy());
+  const playlistUrl = `${TEST_ORIGIN}video.m3u8`;
+  prefetcher.updatePlaylist(playlistBody([segment(0), segment(1)]), playlistUrl);
+  const denied = (error) => error.code === "UPSTREAM_ACCESS_DENIED";
+  await assert.rejects(prefetcher.fetch(segment(0).url), denied);
+  assert.equal(prefetcher.jobs.get(segment(0).url).state, "failed");
+  prefetcher.maxConcurrent = 1;
+  prefetcher.scheduleAhead(playlistUrl, 1);
+  prefetcher.pumpPrefetches();
+  await assert.rejects(prefetcher.fetch(segment(0).url), denied);
+  await assert.rejects(prefetcher.fetch(segment(1).url), denied);
+  assert.equal(requests, 1);
+  assert.equal(prefetcher.networkRetryCount, 0);
+  assert.equal(prefetcher.retryTimer, null);
+
+  // A repaired source uses a new playlist URL, which is not poisoned by the
+  // failure of the previous session.
+  prefetcher.maxConcurrent = 0;
+  prefetcher.fetchImpl = async () => new Response("repaired");
+  const fresh = { url: `${TEST_ORIGIN}fresh/0.m4s`, duration: 5 };
+  prefetcher.updatePlaylist(playlistBody([fresh]), `${TEST_ORIGIN}fresh/video.m3u8`);
+  assert.equal(await (await prefetcher.fetch(fresh.url)).text(), "repaired");
+});
+
 test("buffer health stops at the first missing segment", () => {
   const prefetcher = createPrefetcher();
   const segments = [segment(0), segment(1), segment(2), segment(3)];
