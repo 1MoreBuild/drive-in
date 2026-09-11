@@ -242,6 +242,13 @@ export class MediabunnyPlayer {
         targetAheadSeconds: HLS_BUFFER_TARGET_SECONDS,
         maxBytes: HLS_BUFFER_MAX_BYTES,
         maxConcurrent: HLS_PREFETCH_CONCURRENCY,
+        onSessionExpired: (error) => {
+          if (this.destroyed) return;
+          this.hlsSessionError = error;
+          // Paused players can keep their cached frame. Rebuild on resume,
+          // rather than keeping idle Plex transcoders alive indefinitely.
+          if (this.wantsPlayback) this.fail(error);
+        },
       });
     }
     return new Input({
@@ -419,6 +426,7 @@ export class MediabunnyPlayer {
   }
 
   async play() {
+    if (this.hlsSessionError) { this.fail(this.hlsSessionError); return; }
     this.wantsPlayback = true;
     if (this.audioContext && this.audioContext.state !== "running" && this.audioContext.state !== "closed") {
       await this.audioContext.resume();

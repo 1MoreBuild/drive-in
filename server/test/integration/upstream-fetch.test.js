@@ -17,6 +17,22 @@ async function withServer(handler, run) {
 
 const quietLogger = { warn() {} };
 
+test("returns 403 immediately so the proxy can refresh instead of retrying a denied URL", async () => {
+  let requests = 0;
+  await withServer((_req, res) => {
+    requests += 1;
+    res.writeHead(403);
+    res.end("denied");
+  }, async (url) => {
+    const response = await fetchWithRetry(url, {}, {
+      retries: 3, retryDelaysMs: [0], logger: quietLogger,
+    });
+    assert.equal(response.status, 403);
+    assert.equal(await response.text(), "denied");
+  });
+  assert.equal(requests, 1);
+});
+
 test("retries a transient upstream response", async () => {
   let requests = 0;
   await withServer((_req, res) => {

@@ -210,6 +210,7 @@ test("DASH split and ffmpeg fallback both play real media, including initializat
   await chmod(tool, 0o755);
   await exec("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=4", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-movflags", "+dash+global_sidx", resolve(dir, "video.mp4")]);
   await exec("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4", "-vn", "-c:a", "aac", "-movflags", "+dash+global_sidx", resolve(dir, "audio.mp4")]);
+  let deniedRequests = 0;
   const media = await origin(t, async (req, res) => {
     const name = new URL(req.url, "http://fixture").pathname.split("/").at(-1);
     const body = await readFile(resolve(dir, name));
@@ -219,6 +220,10 @@ test("DASH split and ffmpeg fallback both play real media, including initializat
     const start = range ? Number(range[1]) : 0;
     const end = Math.min(range?.[2] ? Number(range[2]) : body.length - 1, body.length - 1);
     if (start > end) { res.writeHead(416); res.end(); return; }
+    if (req.url.includes("?denied") && start > 0) {
+      deniedRequests += 1;
+      res.writeHead(403); res.end(); return;
+    }
     if (range) res.writeHead(206, { "Content-Range": `bytes ${start}-${end}/${body.length}` });
     res.end(body.subarray(start, end + 1));
   });
@@ -244,6 +249,30 @@ test("DASH split and ffmpeg fallback both play real media, including initializat
     assert.ok(requests.some((url) => url.includes(playlistPath)), JSON.stringify(requests));
     await page.waitForFunction(() => globalThis.__driveInMediabunny?.player?.getStatus() === "ended", null, { timeout: 15000 });
   }
+
+  await t.test("DASH preserves persistent 403 and bounds source refresh across segment requests", async () => {
+    await page.close();
+    const controller = await connectPlayer(baseUrl);
+    t.after(() => controller.close());
+    const info = JSON.parse(await readFile(infoPath, "utf8"));
+    for (const format of info.requested_formats) format.url += "?denied";
+    await writeFile(infoPath, JSON.stringify(info));
+    const result = await postJson(baseUrl, "/api/play", { url: "https://fixture.test/watch/denied", transcode: false });
+    assert.equal(result.response.status, 200);
+    const play = await controller.next("play");
+    const master = await fetch(new URL(play.url, baseUrl)).then((r) => r.text());
+    const videoPath = master.split("\n").find((line) => line && !line.startsWith("#"));
+    const mediaPlaylist = await fetch(new URL(videoPath, baseUrl)).then((r) => r.text());
+    const segmentPath = mediaPlaylist.split("\n").find((line) => line && !line.startsWith("#"));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(new URL(segmentPath, baseUrl));
+      assert.equal(response.status, 403);
+      assert.equal((await response.json()).code, "UPSTREAM_ACCESS_DENIED");
+    }
+    // First request: original + refreshed URL. Second: original only during
+    // cooldown. No lower-level or outer DASH integrity retries for denial.
+    assert.equal(deniedRequests, 3);
+  });
 });
 
 test("Plex HLS proxy plays a remote fixture with inaccessible embedded subtitles", async (t) => {
@@ -268,6 +297,108 @@ test("Plex HLS proxy plays a remote fixture with inaccessible embedded subtitles
   assert.equal(result.response.status, 200, JSON.stringify(result.body));
   await page.waitForFunction(() => globalThis.__driveInMediabunny?.player?.getCurrentTime() > 0.5, null, { timeout: 15000 });
   await page.waitForFunction(() => globalThis.__driveInMediabunny?.player?.getStatus() === "ended", null, { timeout: 15000 });
+});
+
+test("expired Plex session rebuilds at the current position and defers paused background recovery", { timeout: 60000 }, async (t) => {
+  const dir = await mkdtemp(resolve(tmpdir(), "drive-in-plex-expiry-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mediaUrl = await mediaOrigin(t, dir, { hls: true, videoSeconds: 20, audioSeconds: 20 });
+  let activeSession = null;
+  const starts = [];
+  const plex = await origin(t, async (req, res) => {
+    const url = new URL(req.url, "http://fixture");
+    if (url.pathname === "/transcode/sessions") {
+      res.end(JSON.stringify({ MediaContainer: activeSession
+        ? { TranscodeSession: [{ key: activeSession }] } : { size: 0 } }));
+    } else if (url.pathname.startsWith("/library/metadata/")) {
+      res.end(JSON.stringify({ MediaContainer: { Metadata: [{ title: "Expiry fixture", duration: 20000,
+        Media: [{ Part: [{ id: "1", Stream: [{ id: 11, streamType: 2, codec: "aac" }] }] }],
+      }] } }));
+    } else if (url.pathname.endsWith("/start.m3u8")) {
+      activeSession = url.searchParams.get("session");
+      starts.push({ session: activeSession, offset: Number(url.searchParams.get("offset")) });
+      res.end(`#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n/video/:/transcode/universal/session/${activeSession}/base/index.m3u8\n`);
+    } else if (url.pathname.includes("/session/")) {
+      const session = /\/session\/([^/]+)/.exec(url.pathname)[1];
+      if (session !== activeSession) { res.writeHead(404); res.end(); return; }
+      const name = url.pathname.split("/").at(-1);
+      const response = await fetch(name === "index.m3u8" ? mediaUrl : new URL(name, mediaUrl));
+      res.setHeader("Content-Type", response.headers.get("Content-Type"));
+      res.end(Buffer.from(await response.arrayBuffer()));
+    } else res.end("{}");
+  });
+  const { baseUrl } = await startDriveInServer(t, { PLEX_URL: plex });
+  const page = await pageFor(t, baseUrl);
+  const recoveries = [];
+  page.on("request", (req) => {
+    if (req.method() === "POST" && req.url().endsWith("/api/plex/play")) recoveries.push(req.postDataJSON());
+  });
+  await postJson(baseUrl, "/api/plex/play", { ratingKey: "expiry", offset: 0, audioStreamID: 11 });
+  await page.waitForFunction(() => globalThis.__driveInMediabunny?.player?.getCurrentTime() > 1);
+  const expire = async () => {
+    activeSession = null;
+    await page.evaluate(async () => {
+      const player = globalThis.__driveInMediabunny.player;
+      player.canvas.dataset.oldPlayer = "true";
+      const prefetcher = player.hlsSegmentPrefetcher;
+      const playlist = [...prefetcher.playlists.values()][0];
+      const url = playlist.segments[0].url;
+      prefetcher.segmentCache.delete(url);
+      try { await prefetcher.fetch(url); } catch (error) {
+        if (error.code !== "PLEX_SESSION_EXPIRED") throw error;
+      }
+    });
+  };
+  await expire();
+  await page.waitForFunction(() => {
+    const p = globalThis.__driveInMediabunny?.player;
+    return p && !p.canvas.dataset.oldPlayer && p.getCurrentTime() > 2;
+  }, null, { timeout: 20000 });
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0].recovery, true);
+  assert.equal(recoveries[0].autoplay, true);
+  assert.equal(String(recoveries[0].audioStreamID), "11");
+  assert.ok(recoveries[0].offset >= 1000);
+  assert.notEqual(starts[0].session, starts[1].session);
+
+  await page.evaluate(async () => {
+    const { state } = await import("/src/state.js");
+    state.playbackIntent = "paused";
+    state.isPlaying = false;
+    await state.player.pause();
+  });
+  // Expiration itself must not resume a paused video or create idle sessions.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await expire();
+  await delay(1500);
+  assert.equal(recoveries.length, 1);
+  await page.evaluate(async () => {
+    const { state } = await import("/src/state.js");
+    state.playbackIntent = "playing";
+    await state.player.play();
+  });
+  await page.waitForFunction(() => {
+    const p = globalThis.__driveInMediabunny?.player;
+    return p && !p.canvas.dataset.oldPlayer && p.getStatus() === "playing";
+  }, null, { timeout: 20000 });
+  assert.equal(recoveries.length, 2);
+  await page.evaluate(async () => {
+    const { state } = await import("/src/state.js");
+    state.playbackIntent = "paused";
+    state.isPlaying = false;
+    await state.player.pause();
+    state.player.canvas.dataset.oldPlayer = "true";
+  });
+  activeSession = null;
+  await delay(300);
+  await page.evaluate(async () => (await import("/src/state.js")).state.ws.close());
+  await page.waitForFunction(() => {
+    const p = globalThis.__driveInMediabunny?.player;
+    return p && !p.canvas.dataset.oldPlayer && p.getStatus() === "paused";
+  }, null, { timeout: 20000 });
+  assert.equal(recoveries.length, 3);
+  assert.equal(recoveries[2].autoplay, false, "WebSocket reconnect must preserve paused intent");
+  assert.equal(String(recoveries[2].audioStreamID), "11");
 });
 
 test("a silent video tail advances, supports seeking back, and preserves mute on replacement", async (t) => {
