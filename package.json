@@ -48,8 +48,8 @@
     "cli"
   ],
   "devDependencies": {
-    "concurrently": "^9.2.4",
-    "playwright": "^1.61.1",
-    "wait-on": "^9.0.10"
+    "concurrently": "^10.0.5",
+    "playwright": "^1.63.0",
+    "wait-on": "^9.1.0"
   }
 }
