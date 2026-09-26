@@ -3,7 +3,7 @@ import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js"
 import { fmt, timeAgo, escHtml } from "./utils.js";
 import { navigate } from "./router.js";
 import { showStatus } from "./player.js";
-import { loadSubtitleTrack, disableExternalSubtitle, removeSubtitleTrack } from "./subtitles.js";
+import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { requestJson, requestJsonData, requestOk } from "./network.js";
 
 function escAttr(value) {
@@ -122,17 +122,26 @@ export function updateSubsUI() {
   }
 }
 
-function selectSubtitle(id) {
+let subtitleSelectionGeneration = 0;
+
+async function selectSubtitle(id) {
   subsPanel.classList.add("hidden");
 
   if (state.plexInfo?.subtitles?.length) {
     const sub = state.plexInfo.subtitles.find((s) => String(s.id) === String(id));
-    if (sub) {
-      const preference = sub.language || sub.languageCode || sub.displayTitle;
-      localStorage.setItem("preferred-sub-langs", JSON.stringify([preference]));
-    } else {
-      localStorage.removeItem("preferred-sub-langs");
+    const plexInfo = state.plexInfo;
+    const generation = ++subtitleSelectionGeneration;
+    try {
+      await requestJsonData(`/api/plex/subtitles/${encodeURIComponent(plexInfo.ratingKey)}/selection`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subtitleStreamID: sub?.id || null }),
+      }, { label: "Save subtitle choice" });
+    } catch (error) {
+      if (state.plexInfo !== plexInfo || generation !== subtitleSelectionGeneration) return;
+      showStatus(`Could not save subtitle choice: ${error.message}`);
+      return;
     }
+    if (state.plexInfo !== plexInfo || generation !== subtitleSelectionGeneration) return;
 
     const activeSub = state.plexInfo.subtitles.find((candidate) => (
       String(candidate.id) === String(state.plexInfo.activeSubtitleID)
@@ -152,6 +161,8 @@ function selectSubtitle(id) {
           requestPlexPlayback({
             ratingKey: state.plexInfo.ratingKey,
             subtitleStreamID: sub.id,
+            audioStreamID: state.plexInfo.activeAudioID,
+            autoplay: state.playbackIntent === "playing",
             offset: Math.floor(state.currentTime * 1000),
           }).catch((err) => {
             console.error("[subs] Fallback error:", err);
@@ -166,39 +177,32 @@ function selectSubtitle(id) {
     requestPlexPlayback({
       ratingKey: state.plexInfo.ratingKey,
       subtitleStreamID: id,
+      audioStreamID: state.plexInfo.activeAudioID,
+      autoplay: state.playbackIntent === "playing",
       offset: offsetMs,
     }).catch((err) => {
       console.error("[subs] Error:", err);
       showStatus(`Plex error: ${err.message}`);
     });
   } else {
-    state.activeExternalSubs.clear();
-    disableExternalSubtitle();
-    localStorage.removeItem("preferred-sub-langs");
-    updateSubsUI();
+    saveUrlSubtitleSelection([]);
   }
 }
 
 export function toggleSubtitle(lang) {
-  if (state.activeExternalSubs.has(lang)) {
-    state.activeExternalSubs.delete(lang);
-    // Remove track handled by subtitles module
-    removeSubtitleTrack(lang);
-  } else {
-    state.activeExternalSubs.add(lang);
-    const sub = state.externalSubs.find((s) => s.lang === lang);
-    if (sub) {
-      requestJsonData(`${location.origin}/api/subtitles/select`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lang }),
-      }, { label: "Subtitle selection" }).then((data) => {
-        if (data.url) loadSubtitleTrack(lang, data.url);
-      }).catch((err) => console.error("[subs] Error:", err));
-    }
-  }
-  localStorage.setItem("preferred-sub-langs", JSON.stringify([...state.activeExternalSubs]));
-  updateSubsUI();
+  const selection = new Set(state.activeExternalSubs);
+  if (selection.has(lang)) selection.delete(lang);
+  else selection.add(lang);
+  saveUrlSubtitleSelection([...selection]);
+}
+
+function saveUrlSubtitleSelection(langs) {
+  requestJsonData(`${location.origin}/api/subtitles/select`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ langs, sourceUrl: state.sourceUrl }),
+  }, { label: "Save subtitle choice" }).catch((error) => {
+    showStatus(`Could not save subtitle choice: ${error.message}`);
+  });
 }
 
 // --- Audio track selection -------------------------------------------

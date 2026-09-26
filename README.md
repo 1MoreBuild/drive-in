@@ -93,6 +93,8 @@ Set `PLEX_URL` and `PLEX_TOKEN` in `.env`. On macOS, Drive-In can auto-detect a 
 
 Plex transcodes video once at 720p and does not change bitrate during playback. This keeps the 210-second prefetch buffer intact. Plex also handles image-subtitle burn-in; Drive-In converts supported text subtitles to WebVTT and renders them in the browser.
 
+Subtitle choices belong to the Drive-In service, not browser storage. The runtime SQLite database remembers each video's selected tracks (including Off); new videos fall back to the most recent language and delivery preference. This is shared across Drive-In clients, not synchronized with other Plex apps. Text captions use self-hosted Chinese and Latin fonts, scale to the displayed picture, and stay above its bottom edge. Wrapping preserves authored lines without forcing every dialogue turn onto a new row or changing the source file or cue timestamps.
+
 Expired Plex sessions are detected through Plex's transcode inventory and rebuilt
 at the current position, preserving track choices and playback intent. See
 [Plex session recovery](docs/plex-session-recovery.md) for ownership and retry budgets.
