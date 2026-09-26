@@ -2,7 +2,7 @@ import { state } from "./state.js";
 import { initRouter, parseRoute, navigate } from "./router.js";
 import { initControls, updatePlayButton, updateVolumeButton } from "./controls.js";
 import { getPlaybackPosition, leavePlayback, play, stop, seekToTime, togglePlayPause, showStatus, initMediaSession, updateMediaSession, reportProgress, setPlayerCallbacks } from "./player.js";
-import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, toggleSubtitle, showBrowseFromEpisodes } from "./browse.js";
+import { loadBrowseScreen, openEpisodes, renderPlaylists, renderQueue, updateSubsUI, updateAudioUI, showBrowseFromEpisodes } from "./browse.js";
 import { loadSubtitleTrack, disableExternalSubtitle } from "./subtitles.js";
 import { plexPlaybackRequest, requestPlexPlayback } from "./plex-preferences.js";
 import { requestJson } from "./network.js";
@@ -452,14 +452,14 @@ function connect() {
         case "subtitlesAvailable":
           state.externalSubs = msg.subtitles || [];
           updateSubsUI();
-          try {
-            const prefs = JSON.parse(localStorage.getItem("preferred-sub-langs") || "[]");
-            for (const lang of prefs) {
-              if (state.externalSubs.find((s) => s.lang === lang)) {
-                toggleSubtitle(lang);
-              }
+          for (const lang of msg.selectedLanguages || []) {
+            const sub = state.externalSubs.find((s) => s.lang === lang);
+            if (sub?.url) {
+              state.activeExternalSubs.add(lang);
+              loadSubtitleTrack(lang, sub.url);
             }
-          } catch {}
+          }
+          updateSubsUI();
           break;
         case "subtitleSelect":
           if (msg.url && msg.lang) {
@@ -469,10 +469,6 @@ function connect() {
             disableExternalSubtitle();
             state.activeExternalSubs.clear();
           }
-          // Persist preference so next video auto-selects the same subtitles (CLI + UI)
-          try {
-            localStorage.setItem("preferred-sub-langs", JSON.stringify([...state.activeExternalSubs]));
-          } catch {}
           updateSubsUI();
           break;
         case "queueUpdated":

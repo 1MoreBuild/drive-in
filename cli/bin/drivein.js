@@ -331,8 +331,7 @@ program
       // Plex: re-request transcode with subtitle from current position
       const subId = langs[0] || null;
       const offsetMs = Math.floor(ctx.currentTime * 1000);
-      const body = { ratingKey: ctx.ratingKey, offset: offsetMs };
-      if (subId) body.subtitleStreamID = subId;
+      const body = { ratingKey: ctx.ratingKey, offset: offsetMs, subtitleStreamID: subId };
       const result = await api("POST", "/api/plex/play", body);
       if (jsonMode) return out(result);
       return out(subId ? `Subtitle: ${subId} (resuming at ${formatTime(ctx.currentTime)})` : "Subtitles off");

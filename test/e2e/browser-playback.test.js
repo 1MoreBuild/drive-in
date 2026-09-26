@@ -230,15 +230,99 @@ test("subtitle languages stack upward as compact background groups", async (t) =
   assert.equal(layout.overlay.display, "flex");
   assert.equal(layout.overlay.direction, "column-reverse");
   assert.equal(layout.overlay.gap, "4px");
-  assert.ok(Math.abs(layout.overlay.bottomInset - 104) < 0.5);
+  assert.ok(layout.overlay.bottomInset >= 24 && layout.overlay.bottomInset <= 96);
   assert.equal(layout.firstLanguageIsLower, true);
   assert.ok(Math.abs(layout.sameLanguageLineGap) < 0.5);
-  assert.equal(layout.trackBackground, "rgba(0, 0, 0, 0.78)");
+  assert.equal(layout.trackBackground, "rgba(0, 0, 0, 0.65)");
   assert.equal(layout.lineBackground, "rgba(0, 0, 0, 0)");
   assert.match(layout.englishFontFamily, /^"Noto Sans"/);
   assert.match(layout.chineseFontFamily, /^"Noto Sans SC"/);
   assert.match(layout.japaneseFontFamily, /^"Noto Sans JP"/);
   assert.match(layout.koreanFontFamily, /^"Noto Sans KR"/);
+});
+
+test("Plex bilingual captions use local Chinese glyphs and stay inside the movie at Tesla window sizes", async (t) => {
+  const { baseUrl } = await startDriveInServer(t);
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || (existsSync(macChrome) ? macChrome : undefined) });
+  t.after(() => browser.close());
+  const page = await createDriveInPage(browser, { width: 773, height: 601 });
+  await page.goto(baseUrl);
+  await page.waitForFunction(async () => (await import("/src/state.js")).state.ws?.readyState === 1);
+  await page.evaluate(async () => {
+    document.getElementById("overlay").classList.add("hidden");
+    document.getElementById("browse-screen").classList.add("hidden");
+    const canvas = document.createElement("canvas");
+    canvas.dataset.engine = "mediabunny";
+    canvas.width = 1280; canvas.height = 536;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#a0a7ab"; ctx.fillRect(0, 0, 1280, 536);
+    document.getElementById("player-container").append(canvas);
+    const text = "WEBVTT\n\n01:44:33.300 --> 01:44:37.410\n- He added an air-duct system... that can cut through the maze. - Good. Explain it to them.\n- 他加了一条穿过迷宫的通风管 - 好 快告诉他们\n";
+    const url = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+    const subs = await import("/src/subtitles.js");
+    await subs.loadSubtitleTrack("plex:80803", url);
+    subs.renderSubtitle(6274);
+    await document.fonts.ready;
+  });
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("DOM.enable");
+  await cdp.send("CSS.enable");
+  const { root } = await cdp.send("DOM.getDocument");
+  const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: '.subtitle-line[lang="zh-Hans"]' });
+  const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
+  // Some Noto subset binaries retain a "Thin" family suffix internally even
+  // though the served @font-face is the static 400 face.
+  assert.ok(fonts.some((font) => font.isCustomFont && font.familyName.startsWith("Noto Sans SC") && font.glyphCount > 0), JSON.stringify(fonts));
+  for (const viewport of [{ width: 773, height: 601 }, { width: 1280, height: 720 }, { width: 640, height: 360 }]) {
+    await page.setViewportSize(viewport);
+    await page.waitForFunction((width) => Math.abs(parseFloat(document.getElementById("subtitle-overlay").style.getPropertyValue("--subtitle-picture-width")) - width) < 1, viewport.width);
+    const result = await page.evaluate(() => {
+      const overlay = document.getElementById("subtitle-overlay");
+      const box = overlay.getBoundingClientRect();
+      const pictureBottom = (innerHeight + innerWidth * 536 / 1280) / 2;
+      const lines = [...overlay.querySelectorAll(".subtitle-line")];
+      return { gap: pictureBottom - box.bottom, fontSize: parseFloat(getComputedStyle(lines[1]).fontSize),
+        languages: lines.map((line) => line.lang), font: getComputedStyle(lines[1]).fontFamily,
+        width: box.width, height: box.height, overflow: lines.some((line) => line.scrollWidth > line.clientWidth),
+        localChineseFont: performance.getEntriesByType("resource").some((entry) => entry.name.includes("/lib/fonts/noto-sans-sc/files/") && entry.responseEnd > 0),
+      };
+    });
+    assert.deepEqual(result.languages, ["en", "zh-Hans"]);
+    assert.match(result.font, /^"Noto Sans SC"/);
+    assert.ok(result.localChineseFont);
+    assert.ok(result.fontSize >= 16 && result.fontSize <= 24);
+    if (viewport.width === 773) assert.ok(result.fontSize < 19);
+    assert.ok(result.gap >= 9 && result.gap <= 25, JSON.stringify(result));
+    assert.equal(result.overflow, false);
+    assert.ok(result.height < viewport.height / 2);
+  }
+});
+
+test("subtitle selection only changes after the service confirms it was saved", async (t) => {
+  const { baseUrl } = await startDriveInServer(t);
+  const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || (existsSync(macChrome) ? macChrome : undefined) });
+  t.after(() => browser.close());
+  const page = await createDriveInPage(browser, { width: 773, height: 601 });
+  let rejectSave = true;
+  await page.route("**/api/plex/subtitles/3993/selection", (route) => route.fulfill({
+    status: rejectSave ? 500 : 200, contentType: "application/json",
+    body: JSON.stringify(rejectSave ? { error: "Cannot save" } : { ok: true, subtitleStreamID: 8 }),
+  }));
+  await page.goto(baseUrl);
+  await page.waitForFunction(async () => (await import("/src/state.js")).state.ws?.readyState === 1);
+  await page.evaluate(async () => {
+    const { state } = await import("/src/state.js");
+    state.plexInfo = { ratingKey: "3993", activeSubtitleID: null,
+      subtitles: [{ id: 8, languageCode: "zho", delivery: "external" }],
+    };
+    (await import("/src/browse.js")).updateSubsUI();
+    document.querySelectorAll("#subs-list button")[1].click();
+  });
+  await page.waitForFunction(() => document.getElementById("status-text").textContent.includes("Could not save subtitle choice"));
+  assert.equal(await page.evaluate(async () => (await import("/src/state.js")).state.plexInfo.activeSubtitleID), null);
+  rejectSave = false;
+  await page.evaluate(() => document.querySelectorAll("#subs-list button")[1].click());
+  await page.waitForFunction(async () => (await import("/src/state.js")).state.plexInfo.activeSubtitleID === 8);
 });
 
 test("optimistic seek keeps the current frame visible while the new stream loads", async (t) => {

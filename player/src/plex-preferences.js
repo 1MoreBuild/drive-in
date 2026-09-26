@@ -1,11 +1,5 @@
 export function plexPlaybackRequest(ratingKey, extra = {}, { storage = globalThis.localStorage } = {}) {
-  let preferredSubtitleLanguages = [];
   let preferredAudioLanguage = null;
-
-  try {
-    const stored = JSON.parse(storage?.getItem("preferred-sub-langs") || "[]");
-    if (Array.isArray(stored)) preferredSubtitleLanguages = stored.map(String);
-  } catch {}
 
   try {
     preferredAudioLanguage = storage?.getItem("preferred-audio-lang") || null;
@@ -14,7 +8,6 @@ export function plexPlaybackRequest(ratingKey, extra = {}, { storage = globalThi
   return {
     ratingKey,
     ...extra,
-    ...(preferredSubtitleLanguages.length ? { preferredSubtitleLanguages } : {}),
     ...(preferredAudioLanguage ? { preferredAudioLanguage } : {}),
   };
 }

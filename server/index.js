@@ -76,6 +76,7 @@ import { registerQueuePlaylistApi } from "./queue-playlist-api.js";
 import { buildDashHlsSession, parseMp4Structure } from "./dash-hls.js";
 import { pipelineToResponse } from "./response-pipeline.js";
 import { runtimePath } from "./runtime-paths.js";
+import { SubtitlePreferences } from "./subtitle-preferences.js";
 import {
   buildPlexThumbnailUpstreamUrl,
   parsePlexThumbnailDimensions,
@@ -217,6 +218,11 @@ app.use(pinoHttp({
 
 const mediabunnyDist = resolve(__dirname, "../node_modules/mediabunny/dist/bundles");
 app.use("/lib/mediabunny", express.static(mediabunnyDist));
+// Fontsource's unicode-range CSS loads only the glyph subsets used by captions.
+// Keep fonts same-origin so Chinese subtitles work without Google Fonts access.
+for (const family of ["noto-sans", "noto-sans-sc"]) {
+  app.use(`/lib/fonts/${family}`, express.static(resolve(__dirname, `../node_modules/@fontsource/${family}`)));
+}
 
 // Serve player: use dist in production, source in dev
 const playerDist = resolve(__dirname, "../player/dist");
@@ -264,6 +270,7 @@ let latestStutterLog = null;
 // Current non-Plex subtitle tracks (from yt-dlp)
 let currentSubtitles = []; // [{ lang, name, url, auto, filename }]
 let currentSubsCacheKey = null;
+const subtitlePreferences = new SubtitlePreferences(process.env.DRIVEIN_DB || runtimePath(".drive-in.sqlite"));
 
 // --- Real-time metrics ----------------------------------------------
 
@@ -1070,9 +1077,21 @@ app.get("/api/subtitles", (req, res) => {
 
 // Select subtitle — tell player to load it
 app.post("/api/subtitles/select", (req, res) => {
-  const { lang } = req.body;
+  const { lang, langs } = req.body;
+  if (!state.url || state.url.startsWith("plex:")) return res.status(409).json({ error: "No URL video playing" });
+  if (Array.isArray(langs)) {
+    if (req.body.sourceUrl && req.body.sourceUrl !== state.url) return res.status(409).json({ error: "Video changed" });
+    if (langs.length > 10 || langs.some((value) => typeof value !== "string")) return res.status(400).json({ error: "Invalid subtitle languages" });
+    const selected = [...new Set(langs)].map((value) => currentSubtitles.find((sub) => sub.lang === value));
+    if (selected.some((sub) => !sub?.filename)) return res.status(404).json({ error: "Subtitle not available" });
+    subtitlePreferences.save(state.url, selected);
+    sendToPlayer({ type: "subtitleSelect", lang: null, url: null });
+    for (const sub of selected) sendToPlayer({ type: "subtitleSelect", lang: sub.lang, url: `/api/subs/${currentSubsCacheKey}/${sub.filename}` });
+    return res.json({ ok: true });
+  }
   if (!lang) {
     // Disable subtitles
+    if (state.url && !state.url.startsWith("plex:")) subtitlePreferences.save(state.url, []);
     sendToPlayer({ type: "subtitleSelect", url: null, lang: null });
     return res.json({ ok: true, lang: null });
   }
@@ -1083,6 +1102,8 @@ app.post("/api/subtitles/select", (req, res) => {
     return res.status(404).json({ error: `Subtitle '${lang}' not found. Available: ${available}` });
   }
   const url = `/api/subs/${currentSubsCacheKey}/${sub.filename}`;
+  const previous = subtitlePreferences.select(state.url, currentSubtitles) || [];
+  subtitlePreferences.save(state.url, [...previous.filter((track) => track.lang !== sub.lang), sub]);
   // Notify player to load the subtitle
   sendToPlayer({ type: "subtitleSelect", url, lang: sub.lang, name: sub.name });
   res.json({ ok: true, lang: sub.lang, name: sub.name, url });
@@ -3000,8 +3021,10 @@ async function playPlexNow({
   const subtitleLanguages = Array.isArray(preferredSubtitleLanguages)
     ? preferredSubtitleLanguages.map(String)
     : [];
-  const selectedSubtitleStreamID = (subtitleStreamID && String(subtitleStreamID) !== "0" ? subtitleStreamID : null)
-    || subtitleLanguages
+  const savedSubtitles = subtitlePreferences.select(`plex:${ratingKey}`, subtitles);
+  const selectedSubtitleStreamID = subtitleStreamID !== undefined
+    ? (subtitleStreamID && String(subtitleStreamID) !== "0" ? subtitleStreamID : null)
+    : savedSubtitles !== null ? savedSubtitles[0]?.id || null : subtitleLanguages
     .map((language) => subtitles.find((subtitle) => (
       [subtitle.language, subtitle.languageCode, subtitle.title, subtitle.displayTitle]
         .filter(Boolean)
@@ -3011,6 +3034,11 @@ async function playPlexNow({
   const selectedSubtitleIndex = subtitles.findIndex((subtitle) => (
     String(subtitle.id) === String(selectedSubtitleStreamID)
   ));
+  if (selectedSubtitleStreamID && selectedSubtitleIndex < 0) {
+    const error = new Error("Subtitle track is no longer available");
+    error.status = 400;
+    throw error;
+  }
   let selectedSubtitle = selectedSubtitleIndex >= 0 ? subtitles[selectedSubtitleIndex] : null;
   let burnSubtitleStreamID = selectedSubtitle?.delivery === "burn" ? selectedSubtitle.id : null;
   if (selectedSubtitle?.delivery === "external") {
@@ -3160,6 +3188,10 @@ async function playPlexNow({
     duration: meta.duration ? Math.round(meta.duration / 1000) : null,
   });
 
+  if (subtitleStreamID !== undefined && !recovery && reason !== "seek") {
+    subtitlePreferences.save(`plex:${ratingKey}`, selectedSubtitle ? [selectedSubtitle] : []);
+  }
+
   return { ok: true, title };
 }
 
@@ -3169,6 +3201,32 @@ app.post("/api/plex/play", async (req, res) => {
   } catch (e) {
     if (!isPlaybackSuperseded(e)) updateState({ status: "idle" });
     res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+const subtitleSelectionRequests = new Map();
+
+app.put("/api/plex/subtitles/:id/selection", async (req, res) => {
+  const { subtitleStreamID } = req.body;
+  if (subtitleStreamID === undefined || (subtitleStreamID !== null && !["string", "number"].includes(typeof subtitleStreamID))) {
+    return res.status(400).json({ error: "subtitleStreamID required (null means Off)" });
+  }
+  const source = `plex:${req.params.id}`;
+  const request = Symbol(source);
+  subtitleSelectionRequests.set(source, request);
+  try {
+    const data = await plexApi(`/library/metadata/${req.params.id}`);
+    const part = data.MediaContainer.Metadata[0].Media[0].Part[0];
+    const tracks = await listPlexSubtitles(req.params.id, plexSubtitleStreamsForPart(part));
+    const selected = subtitleStreamID && String(subtitleStreamID) !== "0"
+      ? tracks.find((track) => String(track.id) === String(subtitleStreamID)) : null;
+    if (subtitleStreamID && String(subtitleStreamID) !== "0" && !selected) return res.status(404).json({ error: "Subtitle not found" });
+    if (subtitleSelectionRequests.get(source) !== request) return res.status(409).json({ error: "Subtitle selection superseded" });
+    subtitlePreferences.save(source, selected ? [selected] : []);
+    res.json({ ok: true, subtitleStreamID: selected?.id || null });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+  finally {
+    if (subtitleSelectionRequests.get(source) === request) subtitleSelectionRequests.delete(source);
   }
 });
 
@@ -3602,6 +3660,7 @@ async function playUrlNow({
       if (subs.length) {
         sendToPlayer({
           type: "subtitlesAvailable",
+          selectedLanguages: (subtitlePreferences.select(url, subs) || []).map((sub) => sub.lang),
           subtitles: subs.map((s) => ({
             lang: s.lang, name: s.name, auto: s.auto,
             url: `/api/subs/${cacheK}/${s.filename}`,

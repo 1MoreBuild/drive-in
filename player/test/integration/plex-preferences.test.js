@@ -29,7 +29,7 @@ test("Plex playback requests return successful JSON", async () => {
   );
 });
 
-test("fixed-quality Plex requests include language choices but no obsolete throughput hint", () => {
+test("Plex requests leave subtitle preferences to the server even with stale local settings", () => {
   const values = new Map([
     ["preferred-sub-langs", JSON.stringify(["zh", "en"])],
     ["preferred-audio-lang", "ja"],
@@ -41,7 +41,6 @@ test("fixed-quality Plex requests include language choices but no obsolete throu
   assert.deepEqual(payload, {
     ratingKey: "42",
     autoplay: true,
-    preferredSubtitleLanguages: ["zh", "en"],
     preferredAudioLanguage: "ja",
   });
   assert.equal("estimatedThroughputKbps" in payload, false);

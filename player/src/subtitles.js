@@ -1,15 +1,32 @@
 // --- VTT subtitle renderer -------------------------------------------
 
 import { buildCueEndPrefix, parseVTT } from "./subtitle-cues.js";
-import { activeSubtitleGroups } from "./subtitle-layout.js";
+import { activeSubtitleGroups, subtitleLineLanguage, subtitlePictureBounds } from "./subtitle-layout.js";
 import { requestText } from "./network.js";
 
 export { parseVTT } from "./subtitle-cues.js";
 
 const subtitleOverlay = document.getElementById("subtitle-overlay");
+const playerContainer = document.getElementById("player-container");
 let subtitleTracks = []; // [{ lang, cues }]
 let lastRenderedSubtitle = "";
 const pendingTracks = new Map();
+
+function updateSubtitlePictureBounds() {
+  const canvas = playerContainer.querySelector('canvas[data-engine="mediabunny"]');
+  const bounds = subtitlePictureBounds(playerContainer.clientWidth, playerContainer.clientHeight,
+    canvas?.width || 0, canvas?.height || 0);
+  subtitleOverlay.style.setProperty("--subtitle-picture-width", `${bounds.width}px`);
+  subtitleOverlay.style.setProperty("--subtitle-picture-inset", `${bounds.bottom + Math.max(10, Math.min(24, bounds.height * 0.035))}px`);
+}
+
+// Geometry follows the actual contained image, including resize while paused.
+// Observers avoid layout reads in the per-frame subtitle rendering path.
+new ResizeObserver(updateSubtitlePictureBounds).observe(playerContainer);
+new MutationObserver(updateSubtitlePictureBounds).observe(playerContainer, {
+  childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height"],
+});
+updateSubtitlePictureBounds();
 
 function cancelPendingTrack(lang) {
   pendingTracks.get(lang)?.abort();
@@ -36,11 +53,12 @@ function renderSubtitleGroups(groups) {
   for (const group of groups) {
     const track = document.createElement("div");
     track.className = "subtitle-track";
-    track.lang = group.lang;
+    track.lang = subtitleLineLanguage(group.lines.join(" "), group.lang);
     track.dataset.lang = group.lang;
     for (const line of group.lines) {
       const lineElement = document.createElement("span");
       lineElement.className = "subtitle-line";
+      lineElement.lang = subtitleLineLanguage(line, group.lang);
       lineElement.textContent = line;
       track.append(lineElement);
     }
