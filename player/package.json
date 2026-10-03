@@ -26,6 +26,6 @@
   "dependencies": {
     "@fontsource/noto-sans": "5.3.0",
     "@fontsource/noto-sans-sc": "5.3.0",
-    "mediabunny": "1.55.6"
+    "mediabunny": "1.61.0"
   }
 }
